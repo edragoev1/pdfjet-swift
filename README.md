@@ -5,11 +5,32 @@ that makes PDF documents: text in the fonts it carries, tables that run across
 pages, charts, barcodes and QR codes, SVG and images, accessible PDF/UA and
 archival PDF/A. It runs on macOS, iOS, visionOS and Linux.
 
-This repository holds the Swift library alone, about 60 MB, copied from each
-release of [edragoev1/pdfjet](https://github.com/edragoev1/pdfjet) and tagged
-with the same version, so that SwiftPM does not clone the whole history of
-PDFjet's four ports. The examples, the tests, the documentation and the issues
-are there.
+## Why this repository exists
+
+PDFjet is developed in [edragoev1/pdfjet](https://github.com/edragoev1/pdfjet),
+one repository for its four ports: Java, C#, Go and Swift. That repository
+also keeps the examples with the PDFs they make, the test data and the fonts
+of every release, and its history is about 1 GB.
+
+SwiftPM always clones the whole history of a package's repository, not just
+the files of one version. An app that depended on edragoev1/pdfjet downloaded
+that 1 GB, and kept it in its build folder, to use 3 MB of Swift code and the
+fonts.
+
+This repository holds the Swift package alone: Package.swift, the library's
+sources, the fonts it carries, its license and the guide for AI coding
+assistants. A first download is about 50 MB, mostly fonts, and a new release
+adds only what changed in it.
+
+Nothing is developed here. Each release of PDFjet is copied in from its tag
+by `.packaging/package-swift.sh` of edragoev1/pdfjet, and tagged with the same
+version, v9.1.9 and on: the code is the same, byte for byte, and so are the
+PDFs it makes. Please open issues and pull requests in
+[edragoev1/pdfjet](https://github.com/edragoev1/pdfjet), where the examples,
+the tests and the documentation are.
+
+The package `https://github.com/edragoev1/pdfjet` keeps working for apps
+that use it; this one is the same library with a much smaller download.
 
 ## Installing
 
