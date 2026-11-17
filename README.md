@@ -41,15 +41,16 @@ In Xcode: File > Add Package Dependencies, and the address
 ## A first PDF
 
 ```swift
+import Foundation
 import PDFjet
 
-let pdf = try PDF(OutputStream(toFileAtPath: "hello.pdf", append: false)!)
+let pdf = PDF(OutputStream(toFileAtPath: "hello.pdf", append: false)!)
 let font = try Font(pdf, IBMPlexSans.Regular)
 font.setSize(14.0)
-let page = try Page(pdf, Letter.PORTRAIT)
+let page = Page(pdf, Letter.PORTRAIT)
 let line = TextLine(font, "Hello, PDF!")
 line.setLocation(50.0, 80.0)
-try line.drawOn(page)
+line.drawOn(page)
 try pdf.complete()
 ```
 
