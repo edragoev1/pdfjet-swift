@@ -1,0 +1,19 @@
+/**
+ * Executive.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
+///
+/// Used to specify PDF page with size **Executive**.
+///
+/// For more information about the page size classes - A3, A4, A5, B5, JISB5, Executive,
+/// Letter, Legal and Tabloid - see the Page class.
+///
+public class Executive {
+    /// The executive page size in portrait orientation.
+    public static let PORTRAIT = PageSize(522.0, 756.0)
+    /// The executive page size in landscape orientation.
+    public static let LANDSCAPE = PageSize(756.0, 522.0)
+}

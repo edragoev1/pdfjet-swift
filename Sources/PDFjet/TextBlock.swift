@@ -1,0 +1,1058 @@
+/**
+ * TextBlock.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+/// A block of text that wraps at its width, with an optional border, background
+/// and padding. Without a height the block is as tall as its text; with one the
+/// text that does not fit is cut, and the lines are aligned to the top, the
+/// center or the bottom of the block.
+///
+/// Use a TextBlock for one run of text in one font: a label, a note, a table
+/// cell or a paragraph in a box. It breaks words that do not fit on a line,
+/// wraps right to left and Thai text, highlights keywords and can be cut to a
+/// height. Use a TextColumn for paragraphs of TextLine objects that differ in
+/// font or color, for justified text or for a rotated column, and a TextFrame
+/// for text that flows from one frame to the next. See Example_01, 10 and 11.
+public class TextBlock : Drawable {
+    internal var x: Float = 0.0
+    internal var y: Float = 0.0
+    internal var width: Float = 500.0
+    internal var height: Float = 0.0
+    internal var font: Font
+    internal var fallbackFont: Font?
+    internal var fontSize: Float = 12.0
+    private var fallbackFontSize: Float = 0.0   // 0 is the font size
+    internal var textContent: String
+    internal var textPadding: Float = 0.0
+
+    private var fillColor: [Float]?
+    private var textColor: [Float] = [0.0, 0.0, 0.0]
+    private var borderColor: [Float]?
+    private var borderWidth: Float = 0.5
+    private var borderCornerRadius: Float = 0.0
+
+    private var language: String?
+    private var structureType = StructElem.P
+    private var uri: String?
+    private var textAlignment: Alignment = Alignment.LEFT
+    private var verticalAlignment: Alignment = Alignment.TOP
+    private var underline: Bool = false
+    private var strikeout: Bool = false
+    private var rightToLeft: Bool = false
+
+    private var lineSpacing: Float = 1.0
+
+    private var keywordHighlightColors: [String: Int32]?
+
+    /// Creates a text block with the specified font and text. The font is the fallback font too.
+    public init(_ font: Font, _ textContent: String) {
+        self.font = font
+        self.fallbackFont = font
+        self.fontSize = font.size
+        self.textContent = textContent
+    }
+
+    /// Sets the font of the text. The fallback font changes with it, unless a
+    /// different fallback font was set.
+    @discardableResult
+    public func setFont(_ font: Font) -> TextBlock {
+        if self.fallbackFont === self.font {
+            self.fallbackFont = font
+        }
+        self.font = font
+        return self
+    }
+
+    /// Sets the font used for characters the main font does not have.
+    @discardableResult
+    public func setFallbackFont(_ font: Font?) -> TextBlock {
+        self.fallbackFont = font
+        return self
+    }
+
+    /// Sets the font size of the text.
+    @discardableResult
+    public func setFontSize(_ size: Float) -> TextBlock {
+        self.fontSize = size
+        return self
+    }
+
+    /// Sets the size of the characters drawn in the fallback font. By default
+    /// they are drawn at the font size.
+    @discardableResult
+    public func setFallbackFontSize(_ size: Float) -> TextBlock {
+        self.fallbackFontSize = size
+        return self
+    }
+
+    /// Sets the text.
+    @discardableResult
+    public func setText(_ text: String) -> TextBlock {
+        self.textContent = text
+        return self
+    }
+
+    /// Returns the font of the text.
+    public func getFont() -> Font {
+        return font
+    }
+
+    /// Returns the text.
+    public func getText() -> String {
+        return textContent
+    }
+
+    /// Sets the location of the top left corner of this text block.
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x = x
+        self.y = y
+        return self
+    }
+
+    /// Returns the x and y coordinates of the top left corner of this text block.
+    public func getLocation() -> [Float] {
+        return [self.x, self.y]
+    }
+
+    /// Sets the size of this text block. With a height above 0 the block is
+    /// that tall: the lines that do not fit are cut, the last line that fits
+    /// ends with "...", and the lines are aligned by the vertical alignment.
+    /// A height of 0 is the height of the text.
+    @discardableResult
+    public func setSize(_ w: Float, _ h: Float) -> TextBlock {
+        self.width = w
+        self.height = h
+        return self
+    }
+
+    /// Sets the width of this text block and resets its height, so the height fits the text.
+    @discardableResult
+    public func setWidth(_ w: Float) -> TextBlock {
+        self.width = w
+        self.height = 0.0
+        return self
+    }
+
+    /// Sets the height of this text block. With a height above 0 the block is
+    /// that tall: the lines that do not fit are cut, the last line that fits
+    /// ends with "...", and the lines are aligned by the vertical alignment.
+    /// A height of 0 is the height of the text.
+    @discardableResult
+    public func setHeight(_ h: Float) -> TextBlock {
+        self.height = h
+        return self
+    }
+
+    /// Returns the width of this text block.
+    public func getWidth() -> Float {
+        return self.width
+    }
+
+    /// Returns the height of this text block as it is drawn: the height set with setHeight or setSize,
+    /// or the height of the text and padding without one.
+    public func getHeight() -> Float {
+        if height > 0.0 {
+            return height
+        }
+        let leading = (font.getAscent(fontSize) + font.getDescent(fontSize) + font.getLineGap(fontSize)) * lineSpacing
+        return Float(getTextLines().count) * leading + 2 * textPadding
+    }
+
+    /// Sets the radius of the border corners.
+    @discardableResult
+    public func setCornerRadius(_ radius: Float) -> TextBlock {
+        self.borderCornerRadius = radius
+        return self
+    }
+
+    /// Sets the space between the text and the border.
+    @discardableResult
+    public func setPadding(_ padding: Float) -> TextBlock {
+        self.textPadding = padding
+        return self
+    }
+
+    /// Returns the space between the text and the border.
+    public func getPadding() -> Float {
+        return self.textPadding
+    }
+
+    /// Sets the border width.
+    @discardableResult
+    public func setBorderWidth(_ borderWidth: Float) -> TextBlock {
+        self.borderWidth = borderWidth
+        return self
+    }
+
+    /// Returns the border width.
+    public func getBorderWidth() -> Float {
+        return self.borderWidth
+    }
+
+    /// Sets the text color as a 0xRRGGBB value. Color.transparent leaves the text color unchanged.
+    @discardableResult
+    public func setTextColor(_ color: Int32) -> TextBlock {
+        if color == Color.transparent {
+            return self
+        }
+        let r = Float(((color >> 16) & 0xff))/255.0
+        let g = Float(((color >>  8) & 0xff))/255.0
+        let b = Float(((color)       & 0xff))/255.0
+        self.textColor = [r, g, b]
+        return self
+    }
+
+    /// Sets the text color from an array of red, green and blue values.
+    @discardableResult
+    public func setTextColor(_ textColor: [Float]) -> TextBlock {
+        self.textColor = textColor
+        return self
+    }
+
+    /// Returns the text color.
+    public func getTextColor() -> [Float] {
+        return self.textColor
+    }
+
+    /// Sets the background color as a 0xRRGGBB value. Color.transparent removes the background.
+    @discardableResult
+    public func setBackgroundColor(_ color: Int32) -> TextBlock {
+        if color == Color.transparent {
+            self.fillColor = nil
+            return self
+        }
+        let r = Float(((color >> 16) & 0xff))/255.0
+        let g = Float(((color >>  8) & 0xff))/255.0
+        let b = Float(((color)       & 0xff))/255.0
+        self.fillColor = [r, g, b]
+        return self
+    }
+
+    /// Sets the background color from an array of red, green and blue values, or nil for no background.
+    @discardableResult
+    public func setBackgroundColor(_ backgroundColor: [Float]?) -> TextBlock {
+        self.fillColor = backgroundColor
+        return self
+    }
+
+    /// Returns the background color, or nil if there is none.
+    public func getBackgroundColor() -> [Float]? {
+        return self.fillColor
+    }
+
+    /// Sets the border color as a 0xRRGGBB value. Color.transparent removes the border.
+    @discardableResult
+    public func setBorderColor(_ color: Int32) -> TextBlock {
+        if color == Color.transparent {
+            self.borderColor = nil
+            return self
+        }
+        let r = Float(((color >> 16) & 0xff))/255.0
+        let g = Float(((color >>  8) & 0xff))/255.0
+        let b = Float(((color)       & 0xff))/255.0
+        self.borderColor = [r, g, b]
+        return self
+    }
+
+    /// Sets the border color from an array of red, green and blue values, or nil for no border.
+    @discardableResult
+    public func setBorderColor(_ borderColor: [Float]?) -> TextBlock {
+        self.borderColor = borderColor
+        return self
+    }
+
+    /// Returns the border color, or nil if there is none.
+    public func getBorderColor() -> [Float]? {
+        return self.borderColor
+    }
+
+    ///
+    /// Sets the colors used to highlight the specified keywords.
+    /// The keywords are matched ignoring case.
+    ///
+    /// - Parameter map: the keyword to color map.
+    ///
+    @discardableResult
+    public func setHighlightColors(_ map: [String: Int32]) -> TextBlock {
+        var colors = [String: Int32]()
+        for (key, value) in map {
+            colors[Util.lowerAsJava(key)] = value
+        }
+        self.keywordHighlightColors = colors
+        return self
+    }
+
+    /// Sets the line spacing as a multiple of the font's body height.
+    @discardableResult
+    public func setLineSpacing(_ lineSpacing: Float) -> TextBlock {
+        self.lineSpacing = lineSpacing
+        return self
+    }
+
+    /// Sets the horizontal alignment of the text.
+    @discardableResult
+    public func setTextAlignment(_ alignment: Alignment) -> TextBlock {
+        self.textAlignment = alignment
+        return self
+    }
+
+    /// Returns the horizontal alignment of the text.
+    public func getTextAlignment() -> Alignment {
+        return self.textAlignment
+    }
+
+    /// Sets the vertical alignment of the text in a block with a height:
+    /// Alignment.TOP, the default, Alignment.CENTER or Alignment.BOTTOM.
+    @discardableResult
+    public func setVerticalAlignment(_ alignment: Alignment) -> TextBlock {
+        self.verticalAlignment = alignment
+        return self
+    }
+
+    /// Returns the vertical alignment of the text.
+    public func getVerticalAlignment() -> Alignment {
+        return self.verticalAlignment
+    }
+
+    /// Sets the structure element type of this text block, for example
+    /// StructElem.P, the default, or StructElem.H1 for a heading, as a tagged
+    /// document, PDF/UA or a PDF/A of level A, tags it.
+    @discardableResult
+    public func setStructureType(_ structureType: StructElem) -> TextBlock {
+        self.structureType = structureType
+        return self
+    }
+
+    /// Sets the language of the text, for example "he", "ar" or "fa", as a BCP 47
+    /// language tag. The text is marked with it, for screen readers and text
+    /// extraction.
+    @discardableResult
+    public func setLanguage(_ language: String?) -> TextBlock {
+        self.language = language
+        return self
+    }
+
+    /// Sets whether the text is right to left, like Arabic and Hebrew text.
+    /// Each paragraph is wrapped at the width in logical order, and each line
+    /// is then reordered with Bidi.reorderVisually, which also shapes the
+    /// Arabic letters, and aligned to the right, unless the text alignment is
+    /// Alignment.CENTER.
+    @discardableResult
+    public func setRightToLeft(_ rightToLeft: Bool) -> TextBlock {
+        self.rightToLeft = rightToLeft
+        return self
+    }
+
+    // Splits the text at each of the character, by Unicode scalars, keeping
+    // the empty strings between two of them.
+    private static func split(_ text: String, _ separator: Unicode.Scalar) -> [String] {
+        return text.unicodeScalars.split(separator: separator, omittingEmptySubsequences: false).map(String.init)
+    }
+
+    func getTextLines() -> [TextLine] {
+        var textLines = [TextLine]()
+
+        // The padding can be wider than the block, and a text area narrower
+        // than nothing would break a word past its last character.
+        let textAreaWidth = self.textAreaWidth()
+        // Like String.split in Java: the trailing empty lines are dropped, but
+        // an empty text is one empty line.
+        // Literally: Foundation's search takes a \n or a \r\n before a combining
+        // mark for another character, and does not find it.
+        var lines = TextBlock.split(textContent.replacingOccurrences(of: "\r\n", with: "\n", options: .literal), "\n")
+        while lines.count > 1 && lines[lines.count - 1].isEmpty {
+            lines.removeLast()
+        }
+        for line in lines {
+            if rightToLeft {
+                addRightToLeftLines(&textLines, line, textAreaWidth)
+                continue
+            }
+            // A zero width space marks a place where the line may break in text
+            // without spaces between its words, like Thai text. It is not drawn.
+            let text = line.replacingOccurrences(of: "\u{200B}", with: "", options: .literal)
+            if stringWidth(text) <= textAreaWidth {
+                textLines.append(TextLine(font, text))
+            } else {
+                if text.isCJK() {
+                    var sb = ""
+                    for scalar in text.unicodeScalars {
+                        if stringWidth(sb + String(scalar)) <= textAreaWidth {
+                            sb.unicodeScalars.append(scalar)
+                        } else {
+                            if !sb.isEmpty {    // Don't emit an empty line
+                                let full = Array(sb.unicodeScalars)
+                                let end = cjkLineEnd(full, scalar)
+                                textLines.append(TextLine(font, String(String.UnicodeScalarView(full[0..<end]))))
+                                sb = String(String.UnicodeScalarView(full[end...]))
+                            }
+                            sb.unicodeScalars.append(scalar)
+                        }
+                    }
+                    if !sb.trim().isEmpty {
+                        textLines.append(TextLine(font, sb.trim()))
+                    }
+                } else {
+                    var sb = ""
+                    // The line is measured as it grows, a word at a time, by
+                    // the runs of the font, when it is drawn in the font
+                    // alone: the same width as the whole line measured again
+                    // for each word, which took most of the time of a text
+                    // block (13 November 2026).
+                    let byRuns = measuresByRuns(line)
+                    var sbRun = byRuns ? font.run("") : Font.Run()
+                    let space = byRuns ? font.run(" ") : Font.Run()
+                    for token in line.splitOnWhitespace() {
+                        // The words between the zero width spaces of a token
+                        // are joined with no space.
+                        let words = TextBlock.split(token, "\u{200B}")
+                        for (i, word) in words.enumerated() {
+                            let separator = (i == words.count - 1) ? " " : ""
+                            var word = word
+                            while true {
+                                var joined = Font.Run()
+                                var width: Float = -1.0
+                                if byRuns {
+                                    joined = font.joinRuns(sbRun, font.run(word))
+                                    width = font.runWidth(joined, fontSize)
+                                }
+                                let measured = width >= 0.0
+                                if !measured {
+                                    width = stringWidth(sb + word)
+                                }
+                                if width <= textAreaWidth {
+                                    sb.append(word)
+                                    sb.append(separator)
+                                    if byRuns {
+                                        sbRun = !measured ? font.run(sb)
+                                            : separator.isEmpty ? joined : font.joinRuns(joined, space)
+                                    }
+                                    break
+                                }
+                                // The word is broken at a soft hyphen, the line
+                                // ending with a hyphen, as far along as fits
+                                let line = sb
+                                if let (head, rest) = TextBlock.softHyphenBreak(word, textAreaWidth, {
+                                    self.stringWidth(line + $0)
+                                }) {
+                                    textLines.append(TextLine(font, line + head))
+                                    sb = ""
+                                    if byRuns {
+                                        sbRun = font.run("")
+                                    }
+                                    word = rest
+                                    continue
+                                }
+                                if !sb.isEmpty {
+                                    // Wrapped at a space, the line keeps it, drawn
+                                    // but not measured; at a zero width space it
+                                    // has none to keep.
+                                    let textLine = TextLine(font, line.trim())
+                                    // The last scalar: hasSuffix compares characters,
+                                    // and a prepended mark, such as U+0600, joins
+                                    // the space after it into one.
+                                    textLine.trailingSpace = line.unicodeScalars.last == " "
+                                    textLines.append(textLine)
+                                    sb = ""
+                                    if byRuns {
+                                        sbRun = font.run("")
+                                    }
+                                    continue
+                                }
+                                // A word too wide for a line by itself is broken.
+                                let rest = addBrokenWordLines(&textLines, word, textAreaWidth)
+                                if rest < word.unicodeScalars.count {
+                                    sb = TextBlock.string(Array(word.unicodeScalars)[rest...]) + separator
+                                    if byRuns {
+                                        sbRun = font.run(sb)
+                                    }
+                                }
+                                break
+                            }
+                        }
+                    }
+                    if !sb.trim().isEmpty {
+                        textLines.append(TextLine(font, sb.trim()))
+                    }
+                }
+            }
+        }
+
+        return textLines
+    }
+
+    /// Adds the lines of a word too wide for a line by itself, broken between its
+    /// characters, and returns the rest of the word, which fits on a line. No
+    /// line starts with a combining mark, or with a Thai or Lao vowel or sign
+    /// written after its consonant, and none ends with a Thai or Lao vowel
+    /// written before its consonant.
+    // Each line is found by measuring the word from the line's start to each
+    // character break until one does not fit, so a word of n characters is
+    // measured about n times a line's worth of characters, not n times
+    // itself: a word of 100,000 characters took 39 seconds when the rest of
+    // the word was measured before each line, and the word up to each break
+    // was copied to measure it.
+    // A right to left word is reordered and shaped once, whole (see
+    // ShapedWord), so that each measurement is a subtraction: reordering the
+    // word up to each break took time that grew with the square of the word,
+    // 27 seconds for 16,000 Arabic letters.
+    private func addBrokenWordLines(
+            _ textLines: inout [TextLine], _ word: String, _ textAreaWidth: Float) -> Int {
+        let scalars = Array(word.unicodeScalars)
+        let shaped = rightToLeft ? ShapedWord(self, word) : nil
+        // The width of the part of the word between two scalar offsets, and
+        // the part as it is drawn: a slice of a left to right word, a part of
+        // the shaped word of a right to left one.
+        func partWidth(_ from: Int, _ to: Int) -> Float {
+            if let shaped = shaped {
+                return shaped.width(from, to)
+            }
+            return stringWidth(TextBlock.string(scalars[from..<to]))
+        }
+        func partText(_ from: Int, _ to: Int) -> String {
+            if let shaped = shaped {
+                return shaped.text(from, to)
+            }
+            return TextBlock.string(scalars[from..<to])
+        }
+        var start = 0
+        while start < scalars.count {
+            // Each line gets at least one character, however narrow the block.
+            var end = TextBlock.nextCharacterBreak(scalars, start)
+            var next = end
+            while next < scalars.count && partWidth(start, next) <= textAreaWidth {
+                end = next
+                next = TextBlock.nextCharacterBreak(scalars, end)
+            }
+            if next == scalars.count && partWidth(start, scalars.count) <= textAreaWidth {
+                break       // The rest of the word fits on a line.
+            }
+            // A soft hyphen before the first break that does not fit is a
+            // better place to break: the line ends there, with a hyphen, as far
+            // along as fits, as TextFrame breaks each row. The rest of a word
+            // broken between characters, and a right to left word, were never
+            // broken at one (review of 12 October 2026, R17 and R18).
+            if let k = softHyphenLineEnd(scalars, start, next, textAreaWidth, { k in
+                if let shaped = shaped {
+                    return shaped.width(start, k) + self.stringWidth("-")
+                }
+                return self.stringWidth(TextBlock.string(scalars[start..<k]) + "-")
+            }) {
+                // The end of a right to left line is on its left.
+                textLines.append(TextLine(font, shaped != nil
+                        ? "-" + shaped!.text(start, k) : TextBlock.string(scalars[start..<k]) + "-"))
+                start = k + 1
+                continue
+            }
+            textLines.append(TextLine(font, partText(start, end)))
+            start = end
+        }
+        return start
+    }
+
+    // Returns the offset of the last soft hyphen of the word between the start
+    // and the first break that does not fit, where a line from the start ends
+    // with a hyphen that fits, or nil if there is none. As in softHyphenBreak,
+    // a soft hyphen with nothing but spaces before it, or with nothing after
+    // it, is no place to break.
+    private func softHyphenLineEnd(
+            _ scalars: [Unicode.Scalar], _ start: Int, _ next: Int, _ textAreaWidth: Float,
+            _ hyphenated: (Int) -> Float) -> Int? {
+        var k = min(next, scalars.count - 2)
+        while k > start {
+            if scalars[k].value == 0x00AD
+                    && !scalars[start..<k].allSatisfy({ $0.value == 0x00AD || $0.value <= 0x20 })
+                    && hyphenated(k) <= textAreaWidth {
+                return k
+            }
+            k -= 1
+        }
+        return nil
+    }
+
+    // A right to left word too wide for a line, reordered and shaped once,
+    // whole, so that a part of it is measured in constant time and made into
+    // a line in the time of its length. Its parts are parts of one word,
+    // shaped as one: the letter a line ends on keeps the form it has in the
+    // word. The width of a part is the sum of the widths of its characters,
+    // so it leaves out the kerning of a core font.
+    private struct ShapedWord {
+        let chars: [UInt32]     // The word in visual order, shaped, as scalar values
+        let order: [Int]        // The indexes of chars, in the order of the offset each came from
+        let first: [Int]        // For each scalar offset of the word, where the chars from it start in order
+        let widths: [Float]     // The width of the chars before each position of order, summed
+
+        init(_ block: TextBlock, _ word: String) {
+            let (chars, origins) = Bidi.reorderVisuallyOrigins(word)
+            self.chars = chars
+            // first[i] is how many chars came from before offset i, so that
+            // the chars from one offset to another are the positions of order
+            // between the two.
+            var first = [Int](repeating: 0, count: word.unicodeScalars.count + 2)
+            for origin in origins {
+                first[origin + 1] += 1
+            }
+            for i in 1..<first.count {
+                first[i] += first[i - 1]
+            }
+            var order = [Int](repeating: 0, count: chars.count)
+            var next = first
+            for (k, origin) in origins.enumerated() {
+                order[next[origin]] = k
+                next[origin] += 1
+            }
+            var widths = [Float](repeating: 0, count: chars.count + 1)
+            for (j, k) in order.enumerated() {
+                widths[j + 1] = widths[j] + block.stringWidth(String(Unicode.Scalar(chars[k])!))
+            }
+            self.order = order
+            self.first = first
+            self.widths = widths
+        }
+
+        // Returns the width of the part of the word from one offset to another.
+        func width(_ from: Int, _ to: Int) -> Float {
+            return widths[first[to]] - widths[first[from]]
+        }
+
+        // Returns the part of the word from one offset to another, in visual order.
+        func text(_ from: Int, _ to: Int) -> String {
+            let positions = order[first[from]..<first[to]].sorted()
+            var result = String.UnicodeScalarView()
+            for k in positions {
+                result.append(Unicode.Scalar(chars[k])!)
+            }
+            return String(result)
+        }
+    }
+
+    // Returns the part of the text from the scalar offset on, reordered and
+    // shaped in the context of the whole text if the text is right to left.
+    private func part(_ text: String, _ from: Int, _ to: Int) -> String {
+        if rightToLeft {
+            return Bidi.reorderVisually(text, from, to)
+        }
+        return TextBlock.string(Array(text.unicodeScalars)[from..<to])
+    }
+
+    // Returns the width of a line of text, measured after the line is reordered
+    // if the text is right to left.
+    private func lineWidth(_ text: String, _ from: Int) -> Float {
+        return stringWidth(part(text, from, text.unicodeScalars.count))
+    }
+
+    // Returns a line of text, reordered if the text is right to left.
+    private func newTextLine(_ text: String, _ from: Int) -> TextLine {
+        let scalars = Array(text.unicodeScalars)
+        var to = scalars.count
+        while to > from && String.isJavaWhitespace(scalars[to - 1]) {
+            to -= 1
+        }
+        return TextLine(font, part(text, from, to))
+    }
+
+    // Returns the size the characters in the fallback font are drawn at.
+    private func getFallbackFontSize() -> Float {
+        return (fallbackFontSize > 0.0) ? fallbackFontSize : fontSize
+    }
+
+    // Returns the width of the text as it is drawn, with the characters the
+    // font has no glyph for in the fallback font.
+    private func stringWidth(_ text: String?) -> Float {
+        return font.stringWidth(fallbackFont, fontSize, getFallbackFontSize(), text)
+    }
+
+    // Returns true if the line is measured by the runs of the font: a font of
+    // whole font units, and every character of the line, and the space, drawn
+    // in the font, as stringWidth measures it then, in the font alone.
+    private func measuresByRuns(_ line: String) -> Bool {
+        if !font.measuresByRuns() {
+            return false
+        }
+        guard let fallback = fallbackFont, !fallback.isCJK, fallback !== font else {
+            return true
+        }
+        // fontOf gives the font, not the fallback font, for the character,
+        // wherever it is
+        let inFont = { (c: Int) -> Bool in self.font.hasGlyph(c) || !fallback.hasGlyph(c) }
+        if !inFont(0x20) {
+            return false
+        }
+        for scalar in line.unicodeScalars where !inFont(Int(scalar.value)) {
+            return false
+        }
+        return true
+    }
+
+    // Returns the start of the word up to its last soft hyphen whose start,
+    // with a hyphen in place of the soft hyphen, is no wider than the width as
+    // measure measures it, that hyphen at its end, and the rest of the word
+    // after the soft hyphen: a line may break there, and only there is a soft
+    // hyphen drawn, as a hyphen (review of 11 October 2026, #21). A soft
+    // hyphen at the start or the end of the word is no place to break.
+    static func softHyphenBreak(
+            _ word: String,
+            _ width: Float,
+            _ measure: (String) -> Float) -> (head: String, rest: String)? {
+        // Most words have none, and a word of 200,000 characters is looked at
+        // for each row of TextFrame it is broken into: its UTF-8 is searched
+        // with memchr for the second byte of a soft hyphen first, which a
+        // loop over its characters made four times slower.
+        var word = word
+        if word.withUTF8({ $0.isEmpty || memchr($0.baseAddress!, 0xAD, $0.count) == nil }) {
+            return nil
+        }
+        let scalars = word.unicodeScalars
+        // A soft hyphen past the start of the word that is wider than the width
+        // has a start wider too: the word is looked at no further than that
+        // start, found by doubling, so that a word broken into thousands of rows
+        // is not searched, and measured, whole for each (16 times the time for 4
+        // times the word, in each port, review of 12 October 2026)
+        var end = scalars.endIndex
+        var n = 64
+        while let cut = scalars.index(scalars.startIndex, offsetBy: n, limitedBy: scalars.endIndex),
+                cut < scalars.endIndex {
+            if measure(String(scalars[..<cut])) > width {
+                end = cut
+                break
+            }
+            n *= 2
+        }
+        var i = end
+        while i > scalars.startIndex {
+            i = scalars.index(before: i)
+            let after = scalars.index(after: i)
+            if scalars[i].value != 0x00AD || after == scalars.endIndex {
+                continue
+            }
+            if scalars[..<i].allSatisfy({ $0.value == 0x00AD || $0.value <= 0x20 }) {
+                continue    // Nothing but soft hyphens and spaces before it
+            }
+            let head = String(scalars[..<i]) + "-"
+            if measure(head) <= width {
+                return (head, String(scalars[after...]))
+            }
+        }
+        return nil
+    }
+
+    private static func nextCharacterBreak(_ scalars: [Unicode.Scalar], _ start: Int) -> Int {
+        var ch = scalars[start]
+        var i = start + 1
+        while isLeadingVowel(ch.value) && i < scalars.count {
+            ch = scalars[i]
+            i += 1
+        }
+        while i < scalars.count && staysWithPrevious(scalars[i]) {
+            i += 1
+        }
+        return i
+    }
+
+    // The Thai and Lao vowels written before the consonant they follow in speech.
+    static func isLeadingVowel(_ ch: UInt32) -> Bool {
+        return (ch >= 0x0E40 && ch <= 0x0E44) || (ch >= 0x0EC0 && ch <= 0x0EC4)
+    }
+
+    // The combining marks, and the Thai and Lao vowels and signs written after
+    // a consonant, like SARA AA and MAI YAMOK, which do not start a line.
+    static func staysWithPrevious(_ ch: Unicode.Scalar) -> Bool {
+        if ch.value == 0x200C || ch.value == 0x200D {   // ZWNJ, ZWJ
+            return true
+        }
+        switch ch.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark:
+            return true
+        default:
+            let v = ch.value
+            return (v >= 0x0E2F && v <= 0x0E3A) || (v >= 0x0E45 && v <= 0x0E4E) ||
+                    (v >= 0x0EAF && v <= 0x0EBC) || (v >= 0x0EC6 && v <= 0x0ECE)
+        }
+    }
+
+    private static func string(_ scalars: ArraySlice<Unicode.Scalar>) -> String {
+        var str = ""
+        str.unicodeScalars.append(contentsOf: scalars)
+        return str
+    }
+
+    /// Wraps a paragraph of right to left text at the spaces between words and
+    /// at its zero width spaces, and adds its lines in visual order. The
+    /// paragraph is wrapped in logical order, so its first words go on the
+    /// first line, and each line is measured after it is reordered, since the
+    /// shaped Arabic letters differ in width from the letters they replace. A
+    /// word too wide for a line by itself is broken between its characters.
+    private func addRightToLeftLines(
+            _ textLines: inout [TextLine], _ paragraph: String, _ textAreaWidth: Float) {
+        // sb holds the words of the line in logical order. When the line starts
+        // with the rest of a word broken over the lines, sb holds the whole word
+        // and from is the scalar offset where the rest starts: the part before
+        // it is not drawn, but it is the context that gives the first letter
+        // of the rest its joined form.
+        var sb = ""
+        var from = 0
+        for token in paragraph.splitOnWhitespace() {
+            // The words between the zero width spaces of a token are joined
+            // with no space.
+            let words = TextBlock.split(token, "\u{200B}")
+            for (i, word) in words.enumerated() {
+                let separator = (i == words.count - 1) ? " " : ""
+                var word = word
+                while true {
+                    if lineWidth(sb + word, from) <= textAreaWidth {
+                        sb.append(word)
+                        sb.append(separator)
+                        break
+                    }
+                    // The word is broken at a soft hyphen, the line ending with
+                    // a hyphen, as far along as fits, as in left to right text:
+                    // it was cut between two characters (review of 12 October
+                    // 2026, R17)
+                    let pending = sb
+                    let lineFrom = from
+                    if let (head, rest) = TextBlock.softHyphenBreak(word, textAreaWidth, {
+                        self.lineWidth(pending + $0, lineFrom)
+                    }) {
+                        textLines.append(newTextLine(pending + head, from))
+                        sb = ""
+                        from = 0
+                        word = rest
+                        continue
+                    }
+                    if sb.unicodeScalars.count > from {
+                        textLines.append(newTextLine(sb, from))
+                        sb = ""
+                        from = 0
+                        continue
+                    }
+                    // A word too wide for a line by itself is broken.
+                    let rest = addBrokenWordLines(&textLines, word, textAreaWidth)
+                    if rest < word.unicodeScalars.count {
+                        sb = word + separator
+                        from = rest
+                    }
+                    break
+                }
+            }
+        }
+        textLines.append(newTextLine(sb, from))
+    }
+
+    /// Sets the URI opened when this text block is clicked.
+    @discardableResult
+    public func setURIAction(_ uri: String?) -> TextBlock {
+        self.uri = uri
+        return self
+    }
+
+    ///
+    /// Underlines the text of this text block.
+    ///
+    /// - Parameter underline: the underline flag.
+    ///
+    @discardableResult
+    public func setUnderline(_ underline: Bool) -> TextBlock {
+        self.underline = underline
+        return self
+    }
+
+    /// Returns whether the text is underlined.
+    public func getUnderline() -> Bool {
+        return self.underline
+    }
+
+    /// Strikes out the text of this text block.
+    @discardableResult
+    public func setStrikeout(_ strikeout: Bool) -> TextBlock {
+        self.strikeout = strikeout
+        return self
+    }
+
+    /// Returns whether the text is struck out.
+    public func getStrikeout() -> Bool {
+        return self.strikeout
+    }
+
+    // Returns the lines that fit in the height: all of them when the block has
+    // no height, else the first lines, with the last of them ending in "...".
+    private func linesThatFit(_ textLines: [TextLine], _ leading: Float) -> [TextLine] {
+        if leading <= 0 {
+            return textLines    // Lines that take no height all fit
+        }
+        var fit = Util.saturatingInt((height - 2 * textPadding) / leading)
+        if fit < 1 {
+            fit = 1     // At least one line is drawn
+        }
+        if fit >= textLines.count {
+            return textLines
+        }
+        var lines = Array(textLines[..<fit])
+        var last = Array(lines[fit - 1].text!.unicodeScalars)
+        // A line of right to left text is kept in the order it is drawn, so its
+        // end, where it is cut and the "..." goes, is at its left: cut at its
+        // right, the start of the line was lost and the "..." came first in the
+        // reading (review of 11 October 2026, #7)
+        if rightToLeft {
+            if last.count > 3 {
+                last.removeFirst(3)
+            }
+            lines[fit - 1] = TextLine(font, "..." + TextBlock.string(last[...]))
+            return lines
+        }
+        if last.count > 3 {
+            last.removeLast(3)
+        }
+        lines[fit - 1] = TextLine(font, TextBlock.string(last[...]) + "...")
+        return lines
+    }
+
+    // The offsets are from the left edge of the text, inside the padding.
+    private func rightAlignText(_ textLines: [TextLine]) {
+        let textAreaWidth = self.textAreaWidth()
+        for textLine in textLines {
+            textLine.xOffset = textAreaWidth - stringWidth(textLine.text)
+        }
+    }
+
+    private func centerText(_ textLines: [TextLine]) {
+        let textAreaWidth = self.textAreaWidth()
+        for textLine in textLines {
+            textLine.xOffset = (textAreaWidth - stringWidth(textLine.text)) / 2.0
+        }
+    }
+
+    // The width the text is laid out in, never narrower than nothing.
+    private func textAreaWidth() -> Float {
+        let textAreaWidth = self.width - 2 * self.textPadding
+        return (textAreaWidth > 0.0) ? textAreaWidth : 0.0
+    }
+
+    private func underlineText(_ textLines: [TextLine]) {
+        for textLine in textLines {
+            textLine.underline = true
+        }
+    }
+
+    private func strikeoutText(_ textLines: [TextLine]) {
+        for textLine in textLines {
+            textLine.strikeout = true
+        }
+    }
+
+    /// Lays out the lines as drawOn draws them, aligned and decorated, and
+    /// returns them with the top of the first line, the leading and the height
+    /// of the block, as the layout method of the Go port does.
+    func layout() -> (textLines: [TextLine], yText: Float, leading: Float, blockHeight: Float) {
+        let ascent = font.getAscent(fontSize)
+        let descent = font.getDescent(fontSize)
+        let leading = (ascent + descent + font.getLineGap(fontSize)) * lineSpacing
+        var textLines = getTextLines()
+        var blockHeight = Float(textLines.count) * leading + 2 * textPadding
+        var yText = y + textPadding
+        if height > 0.0 {
+            // The block is as tall as set; the lines that do not fit are cut
+            textLines = linesThatFit(textLines, leading)
+            blockHeight = height
+            let textHeight = Float(textLines.count) * leading
+            if verticalAlignment == Alignment.CENTER {
+                yText = y + (height - textHeight) / 2.0
+            } else if verticalAlignment == Alignment.BOTTOM {
+                yText = y + height - textPadding - textHeight
+            }
+        }
+
+        if textAlignment == Alignment.CENTER {
+            centerText(textLines)
+        } else if textAlignment == Alignment.RIGHT || rightToLeft {
+            rightAlignText(textLines)
+        }
+        if underline {
+            underlineText(textLines)
+        }
+        if strikeout {
+            strikeoutText(textLines)
+        }
+        return (textLines, yText, leading, blockHeight)
+    }
+
+    /// Draws this text block on the specified page.
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        let (textLines, yText, leading, blockHeight) = layout()
+        if page == nil {
+            return [x + width, y + blockHeight]
+        }
+        // A vertical alignment that is not one, as RIGHT, was taken as TOP
+        // without a word: refused, as a cell's is, complete() failing with
+        // the message (GitHub Discussion #5)
+        if verticalAlignment != .TOP && verticalAlignment != .CENTER && verticalAlignment != .BOTTOM {
+            page!.pdf.fail("The vertical alignment of a text block is top, center or bottom.")
+            return [x + width, y + blockHeight]
+        }
+        // A width of NaN drew a character on each line, and gave NaN as the
+        // corner (review of 17 October 2026)
+        if !width.isFinite {
+            page!.pdf.fail("The width of a text block is a finite number.")
+            return [x + width, y + blockHeight]
+        }
+
+        page!.saveGraphicsState()
+
+        if self.borderColor != nil || self.fillColor != nil {
+            let rect = Rect(x, y, width, blockHeight)
+            rect.setCornerRadius(borderCornerRadius)
+            if self.borderColor != nil {
+                rect.setBorderColor(self.borderColor)
+                rect.setBorderWidth(self.borderWidth)
+            }
+            if self.fillColor != nil {
+                rect.setFillColor(fillColor)
+            }
+            rect.drawOn(page)
+        }
+
+        page!.noteHeading(structureType, textContent, x, y)
+        page!.addBDC(structureType, language, textContent, "")
+        page!.drawTextBlock(
+            font,
+            fallbackFont,
+            fontSize,
+            getFallbackFontSize(),
+            textLines,
+            x + textPadding,
+            yText,
+            leading,
+            textColor,
+            keywordHighlightColors,
+            language)
+        page!.addEMC()
+
+        page!.restoreGraphicsState()
+
+        if !(uri ?? "").isEmpty {
+            page!.addAnnotation(Annotation(
+                    Annotation.Link,
+                    x,
+                    y,
+                    x + width,
+                    y + blockHeight,
+                    nil,    // Vertices
+                    nil,    // Fill Color
+                    0.0,    // Opacity
+                    nil,    // Title
+                    nil,    // Contents
+                    uri,
+                    nil,    // The destination name
+                    nil,
+                    nil,
+                    nil))
+        }
+
+        return [x + width, y + blockHeight]
+    }
+}

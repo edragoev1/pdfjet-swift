@@ -1,0 +1,32 @@
+/**
+ * ErrorCorrectionLevel.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ *
+ * Original author: Kazuhiko Arase, 2009
+ * URL: http://www.d-project.com/
+ * Licensed under MIT: http://www.opensource.org/licenses/mit-license.php
+ *
+ * The word "QR Code" is a registered trademark of
+ * DENSO WAVE INCORPORATED
+ * http://www.denso-wave.com/qrcode/faqpatent-e.html
+ *
+ * Modified and adapted for use in PDFjet by PDFjet Software
+ */
+import Foundation
+
+/**
+ * Used to specify the error correction level for QR Codes.
+ * The raw values are the bits of the level in the format information.
+ */
+public enum ErrorCorrectionLevel: Int {
+    /// Recovers about 7% of the data.
+    case L = 1
+    /// Recovers about 15% of the data.
+    case M = 0
+    /// Recovers about 25% of the data.
+    case Q = 3
+    /// Recovers about 30% of the data.
+    case H = 2
+}

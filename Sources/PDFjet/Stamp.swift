@@ -1,0 +1,704 @@
+//
+//  Stamp.swift
+//
+//  Copyright (c) 2026 PDFjet Software
+//  Licensed under the MIT License. See LICENSE file in the project root.
+//
+
+import Foundation
+
+///
+/// Content that is drawn once with the path and text methods of this class,
+/// written to the document as a PDF form XObject by complete, and placed on
+/// pages with drawOn, at a location, a rotation and a scale, as a Container
+/// is.
+///
+/// What a stamp is good at: the content is in the file once, and each
+/// placement is the q, the transform and the Do that name it -- 83 bytes for a
+/// 200 by 50 point box with two lines of text, against the 367 a Container
+/// writes into every page for the same drawing. From the fourth page on the
+/// stamp is the smaller of the two: over 100 pages it saves 12,855 bytes of a
+/// 104,530 byte file, and over 500 pages 66,052 of 275,553. The whole stamp is
+/// one structure element in a PDF/UA document, with the alternate description,
+/// the language and the actual text it is given, which is what a logo or a
+/// watermark wants. A stamp given neither is an artifact, decoration; but
+/// drawn between the addBDC and the addEMC of real content, such as a
+/// paragraph whose letters are stamps, each drawn once and placed wherever it
+/// appears, it is part of that content, read as its actual text.
+///
+/// What it costs: a stamp draws with the methods of this class -- moveTo,
+/// lineTo, curveTo, drawRect, fillRect and drawText -- and holds no
+/// drawable of its own, so it has no images, no annotations, no tables and no
+/// barcodes. Its text needs a font that is embedded in the document: a core
+/// font and a CJK font are refused, since a stamp has no map from their
+/// characters to their glyphs. It has to be completed before it is drawn, and
+/// completed once. On fewer than four pages it is the larger of the two, since
+/// its XObject costs about 300 bytes of its own.
+///
+/// Use a Container instead to group drawable elements -- Rect, TextLine,
+/// Image, Table, a chart, a barcode, an annotation -- that are moved, rotated
+/// and scaled together, and to lay a group out once for one page. A container
+/// can hold a stamp, so a header written once can be placed inside a group
+/// that is rotated with the rest of it.
+///
+/// Please see Example_31.
+///
+public class Stamp : Drawable {
+    internal var objNumber: Int?
+
+    // The document of this stamp, held weakly: the document holds its stamps
+    // once they are complete, and a strong reference back would keep both.
+    // The caller holds the PDF while it makes and draws its stamps.
+    private weak var document: PDF?
+    private var pdf: PDF {
+        guard let document = document else {
+            preconditionFailure("The PDF of this stamp was freed: keep the PDF while using its stamps.")
+        }
+        return document
+    }
+    private var x: Float = 0
+    private var y: Float = 0
+    private var width: Float = 0
+    private var height: Float = 0
+    private var drawn = false   // Whether its content is drawn, at the height it had
+    private var rotateDegrees: Float = 0
+    private var scaleX: Float = 1.0
+    private var scaleY: Float = 1.0
+    private(set) var buf = [UInt8]()
+    private var fonts: [Font] = []
+    private var language: String?
+    private var actualText: String?
+    private var altDescription: String?
+    private var completed = false
+
+    /// Creates a stamp for the specified document.
+    public init(_ pdf: PDF) {
+        self.document = pdf
+    }
+
+    /// Sets the size of this stamp, before anything is drawn on it: its y runs
+    /// down from its top.
+    @discardableResult
+    public func setSize(_ width: Float, _ height: Float) -> Stamp {
+        if drawn && height != self.height {
+            pdf.fail(Stamp.SIZE_FIRST)
+        }
+        self.width = width
+        self.height = height
+        return self
+    }
+
+    // The message of a stamp drawn on before its size is set.
+    static let SIZE_FIRST = "Set the size of the stamp before drawing on it: its y runs down from its top."
+
+    // Returns the y of the stamp's content of the y from its top. Drawn before
+    // the stamp had a size, the content was below it, and was not seen
+    // (review of 12 October 2026, F13).
+    private func stampY(_ y: Float) -> Float {
+        if height == 0 {
+            pdf.fail(Stamp.SIZE_FIRST)
+        }
+        drawn = true
+        return height - y
+    }
+
+    /// Adds a font used by the text on this stamp.
+    @discardableResult
+    public func addFont(_ font: Font) -> Stamp {
+        if let identity = font.pdfIdentity, identity != pdf.identity {
+            pdf.fail("The font belongs to another PDF.")
+            return self
+        }
+        font.referenced = true
+        if !fonts.contains(where: { $0 === font }) {
+            fonts.append(font)
+        }
+        return self
+    }
+
+    /// Sets the location of the top left corner of this stamp on the page.
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x = x
+        self.y = y
+        return self
+    }
+
+    /// Sets the language of this stamp, used for accessibility, for example "en-US".
+    @discardableResult
+    public func setLanguage(_ language: String) -> Stamp {
+        self.language = language
+        return self
+    }
+
+    /// Sets the alternate description of this stamp.
+    @discardableResult
+    public func setAltDescription(_ altDescription: String) -> Stamp {
+        self.altDescription = altDescription
+        return self
+    }
+
+    /// Sets the actual text for this stamp.
+    @discardableResult
+    public func setActualText(_ actualText: String) -> Stamp {
+        self.actualText = actualText
+        return self
+    }
+
+    /// Sets the fill color for the content drawn after it, from an array of red, green and blue values.
+    @discardableResult
+    public func setFillColor(_ rgbColor: [Float]) -> Stamp {
+        append(rgbColor[0])
+        append(" ")
+        append(rgbColor[1])
+        append(" ")
+        append(rgbColor[2])
+        append(" rg\n")
+        return self
+    }
+
+    /// Sets the fill color for the content drawn after it, as a 0xRRGGBB value.
+    /// Color.transparent leaves it unchanged.
+    @discardableResult
+    public func setFillColor(_ color: Int32) -> Stamp {
+        if color == Color.transparent {
+            return self
+        }
+        let r = Float((color >> 16) & 0xff) / 255.0
+        let g = Float((color >> 8) & 0xff) / 255.0
+        let b = Float(color & 0xff) / 255.0
+
+        append(r)
+        append(" ")
+        append(g)
+        append(" ")
+        append(b)
+        append(" rg\n")
+
+        return self
+    }
+
+    /// Sets the stroke color for the content drawn after it, from an array of red, green and blue values.
+    @discardableResult
+    public func setStrokeColor(_ rgbColor: [Float]) -> Stamp {
+        append(rgbColor[0])
+        append(" ")
+        append(rgbColor[1])
+        append(" ")
+        append(rgbColor[2])
+        append(" RG\n")
+        return self
+    }
+
+    /// Sets the stroke color for the content drawn after it, as a 0xRRGGBB value.
+    /// Color.transparent leaves it unchanged.
+    @discardableResult
+    public func setStrokeColor(_ color: Int32) -> Stamp {
+        if color == Color.transparent {
+            return self
+        }
+        let r = Float((color >> 16) & 0xff) / 255.0
+        let g = Float((color >> 8) & 0xff) / 255.0
+        let b = Float(color & 0xff) / 255.0
+
+        append(r)
+        append(" ")
+        append(g)
+        append(" ")
+        append(b)
+        append(" RG\n")
+
+        return self
+    }
+
+    /// Sets the stroke width for the content drawn after it.
+    @discardableResult
+    public func setStrokeWidth(_ width: Float) -> Stamp {
+        if width < 0.0 {
+            pdf.fail("The stroke width cannot be negative.")
+            return self
+        }
+        append(width)
+        append(" w\n")
+        return self
+    }
+
+    /// Begins a new path at the specified point.
+    @discardableResult
+    public func moveTo(_ x: Float, _ y: Float) -> Stamp {
+        append(x)
+        append(" ")
+        append(stampY(y))
+        append(" m\n")
+        return self
+    }
+
+    /// Adds a straight line from the current point to the specified point.
+    @discardableResult
+    public func lineTo(_ x: Float, _ y: Float) -> Stamp {
+        append(x)
+        append(" ")
+        append(stampY(y))
+        append(" l\n")
+        return self
+    }
+
+    /// Adds a cubic Bézier curve from the current point to x3, y3, using x1, y1 and x2, y2 as control points.
+    @discardableResult
+    public func curveTo(
+        _ x1: Float, _ y1: Float,
+        _ x2: Float, _ y2: Float,
+        _ x3: Float, _ y3: Float
+    ) -> Stamp {
+        append(x1)
+        append(" ")
+        append(stampY(y1))
+        append(" ")
+        append(x2)
+        append(" ")
+        append(stampY(y2))
+        append(" ")
+        append(x3)
+        append(" ")
+        append(stampY(y3))
+        append(" c\n")
+        return self
+    }
+
+    /// Strokes the current path.
+    @discardableResult
+    public func strokePath() -> Stamp {
+        append("S\n")
+        return self
+    }
+
+    /// Closes and strokes the current path.
+    @discardableResult
+    public func closePath() -> Stamp {
+        append("s\n")
+        return self
+    }
+
+    /// Fills the current path.
+    @discardableResult
+    public func fillPath() -> Stamp {
+        append("f\n")
+        return self
+    }
+
+    /// Closes, fills and strokes the current path.
+    @discardableResult
+    public func closeFillAndStrokePath() -> Stamp {
+        append("b\n")
+        return self
+    }
+
+    /// Draws the outline of a rectangle.
+    @discardableResult
+    public func drawRect(_ x: Float, _ y: Float, _ w: Float, _ h: Float) -> Stamp {
+        moveTo(x, y)
+        lineTo(x + w, y)
+        lineTo(x + w, y + h)
+        lineTo(x, y + h)
+        closePath()
+        return self
+    }
+
+    /// Draws a filled rectangle.
+    @discardableResult
+    public func fillRect(_ x: Float, _ y: Float, _ w: Float, _ h: Float) -> Stamp {
+        moveTo(x, y)
+        lineTo(x + w, y)
+        lineTo(x + w, y + h)
+        lineTo(x, y + h)
+        fillPath()
+        return self
+    }
+
+    /// Draws text using the font, font size, location and text in the parameters.
+    @discardableResult
+    public func drawText(_ parameters: TextParameters) -> Stamp {
+        guard let font = parameters.font, let text = parameters.text else {
+            pdf.fail("Stamp text needs a font and a text.")
+            return self
+        }
+
+        return drawText(
+            font,
+            parameters.fontSize,
+            parameters.x,
+            parameters.y,
+            text
+        )
+    }
+
+    /// Draws text on this stamp with an embedded font, which the stamp adds to its fonts.
+    @discardableResult
+    public func drawText(
+        _ font: Font,
+        _ fontSize: Float,
+        _ x: Float,
+        _ y: Float,
+        _ text: String
+    ) -> Stamp {
+        if font.isCoreFont || font.isCJK {
+            pdf.fail("A stamp draws text with an embedded font, not a core or CJK font.")
+            return self
+        }
+        if let identity = font.pdfIdentity, identity != pdf.identity {
+            // Refused, and not drawn, which would change the font of another
+            // PDF (review of 12 October 2026, C3)
+            pdf.fail("The font belongs to another PDF.")
+            return self
+        }
+        addFont(font)
+        append("BT\n")
+        append("/F\(font.objNumber)")
+        append(" ")
+        append(fontSize)
+        append(" Tf\n")
+        append(x)
+        append(" ")
+        append(stampY(y))
+        append(" Td\n")
+        append("<")
+        drawText(font, text)
+        append("> Tj\n")
+        append("ET\n")
+        return self
+    }
+
+    /// Rotates this stamp around its center: clockwise for a positive angle, as every rotation in
+    /// PDFjet turns, and counterclockwise for a negative angle.
+    @discardableResult
+    public func setRotation(_ degrees: Float) -> Stamp {
+        // The rotation of the page turns counterclockwise.
+        self.rotateDegrees = -degrees
+        return self
+    }
+
+    /// Scales this stamp around its center when it is placed on a page; 1 is its size.
+    @discardableResult
+    public func scaleBy(_ factor: Float) -> Stamp {
+        return scaleBy(factor, factor)
+    }
+
+    /// Scales this stamp around its center when it is placed on a page.
+    @discardableResult
+    public func scaleBy(_ sx: Float, _ sy: Float) -> Stamp {
+        self.scaleX = sx
+        self.scaleY = sy
+        return self
+    }
+
+    ///
+    /// Writes this stamp to the document as a form XObject.
+    /// Call it once, after drawing the content and before drawOn.
+    ///
+    public func complete() throws {
+        if completed {
+            let message = "complete() was already called on the stamp."
+            pdf.fail(message)
+            throw PDFjetError(message: message)
+        }
+        completed = true
+        pdf.newObj()
+        pdf.append(Token.beginDictionary)
+        pdf.append("/Type /XObject\n")
+        pdf.append("/Subtype /Form\n")
+
+        pdf.append("/BBox [0 0 ")
+        pdf.append(width)
+        pdf.append(" ")
+        pdf.append(height)
+        pdf.append("]\n")
+
+        pdf.append("/Resources <<\n")
+        if !fonts.isEmpty {
+            pdf.append("/Font <<\n")
+            for font in fonts {
+                pdf.append("/F\(font.objNumber) \(font.objNumber) 0 R\n")
+            }
+            pdf.append(">>\n")
+        }
+        pdf.append(">>\n")
+
+        // Encrypted as every other stream of an encrypted document, which the
+        // stamp's was not: a reader decrypted its plain bytes, and the stamp
+        // was lost (review of 11 October 2026, #1)
+        let content = pdf.encrypted(buf)
+        pdf.append("/Length \(content.count)\n")
+        pdf.append(Token.endDictionary)
+        pdf.append(Token.stream)
+        pdf.append(content)
+        pdf.append(Token.endStream)
+        pdf.endObj()
+
+        pdf.stamps.append(self)
+        objNumber = pdf.getObjNumber()
+    }
+
+    // A stamp of the outline of a glyph, which Page.drawGlyphs draws once and
+    // places wherever the glyph is drawn: the path in the units of the font,
+    // y up, filled in the color of the page it is placed on, the box of its
+    // points its bounding box, its content compressed. The placement scales
+    // the units to the size of the font.
+    static func ofGlyph(_ pdf: PDF, _ path: GlyphOutline.Path) -> Stamp {
+        let stamp = Stamp(pdf)
+        stamp.completed = true
+        stamp.width = Float(path.xMax - path.xMin)
+        stamp.height = Float(path.yMax - path.yMin)
+        var compressed = [UInt8]()
+        FlateEncode(&compressed, Array((path.operators + "f\n").utf8), pdf.flateMemory)
+        let content = pdf.encrypted(compressed)
+        pdf.newObj()
+        pdf.append("<<\n/Type /XObject\n/Subtype /Form\n/BBox [")
+        pdf.append(GlyphOutline.decimals(path.xMin.rounded(.down), 0))
+        pdf.append(" ")
+        pdf.append(GlyphOutline.decimals(path.yMin.rounded(.down), 0))
+        pdf.append(" ")
+        pdf.append(GlyphOutline.decimals(path.xMax.rounded(.up), 0))
+        pdf.append(" ")
+        pdf.append(GlyphOutline.decimals(path.yMax.rounded(.up), 0))
+        pdf.append("]\n/Resources <<>>\n/Filter /FlateDecode\n/Length ")
+        pdf.append(content.count)
+        pdf.append("\n>>\nstream\n")
+        pdf.append(content)
+        pdf.append("\nendstream\n")
+        pdf.endObj()
+        pdf.stamps.append(stamp)
+        stamp.objNumber = pdf.getObjNumber()
+        return stamp
+    }
+
+    // Places the stamp of a glyph on the page, by the matrix of the
+    // placement, its six numbers written: q, the matrix, Do and Q.
+    func placeGlyph(_ page: Page, _ matrix: String) {
+        page.append("q ")
+        page.append(matrix)
+        page.append(" cm ")
+        page.append(page.resourceName("/XObject", "/Fm", objNumber ?? 0, [], objNumber ?? 0))
+        page.append(" Do Q\n")
+    }
+
+    private func drawText(_ font: Font, _ str: String) {
+        let codePoints = str.unicodeScalars.map { Int($0.value) }
+        for (i, codePoint) in codePoints.enumerated() where !Stamp.notDrawn(font, codePoint) {
+            // The glyphs Page draws. The .notdef glyph of a character the font
+            // does not have is drawn in a marked content span with the
+            // character as its actual text, as on a page, and so is a glyph
+            // the ToUnicode map gives another character, and one with a joiner
+            // after it that the font has no glyph for, whose actual text has
+            // the joiner too: it was left out (review of 12 October 2026, R34).
+            let gid = Page.glyphOf(font, codePoint)
+            font.useGlyph(gid)
+            font.useChar(codePoint, gid)
+            let joiner = Stamp.joinerAfter(font, codePoints, i + 1)
+            if font.lacks(codePoint) || font.drawnAsAnother(codePoint) || joiner != 0 {
+                var text = Page.textOf(font, codePoint)
+                if joiner != 0 {
+                    text.unicodeScalars.append(Unicode.Scalar(UInt32(joiner))!)
+                }
+                append("> Tj\n/Span <</ActualText <")
+                append(Page.toUTF16Hex(text))
+                append(">>> BDC\n<")
+                appendCodePointAsHex(gid)
+                append("> Tj\n")
+                if joiner != 0 {
+                    // A space that takes no room stands in for the joiner, as
+                    // on a page, see Page.appendGlyphWithActualText.
+                    let space = font.unicodeToGID[0x0020]
+                    font.useGlyph(space)
+                    append("[<")
+                    appendCodePointAsHex(space)
+                    append("> ")
+                    append(1000.0 * Float(font.glyphAdvance(space)) / Float(font.unitsPerEm))
+                    append("] TJ\n")
+                }
+                append("EMC\n<")
+            } else {
+                appendCodePointAsHex(gid)
+            }
+        }
+    }
+
+    // Returns true for what Page leaves out, which a stamp leaves out too: the
+    // byte order mark, the marks of direction, a joiner the font has no glyph
+    // for, and what Unicode does not draw; each was drawn as a box, wider than
+    // stringWidth measured the text (review of 11 October 2026, #10).
+    private static func notDrawn(_ font: Font, _ c: Int) -> Bool {
+        return c == 0xFEFF || c == 0x200E || c == 0x200F || Font.isIgnorable(c) ||
+                ((c == 0x200C || c == 0x200D) && font.unicodeToGID[c] == 0)
+    }
+
+    // Returns the zero width non-joiner or joiner the font has no glyph for
+    // that goes with the glyph before the index, the last of them before the
+    // next character drawn, as on a page, or 0 if there is none.
+    private static func joinerAfter(_ font: Font, _ codePoints: [Int], _ start: Int) -> Int {
+        var joiner = 0
+        for c in codePoints[start...] {
+            if !notDrawn(font, c) {
+                break
+            }
+            if c == 0x200C || c == 0x200D {
+                joiner = c
+            }
+        }
+        return joiner
+    }
+
+    private func append(_ point: Point) {
+        append(point.x)
+        append(" ")
+        append(stampY(point.y))
+        append(" ")
+    }
+
+    ///
+    /// Draws a path through the points. Control points define Bézier curves.
+    /// Fewer than two points paint nothing. A path that ends on a control point,
+    /// whose curve has no end, is refused and nothing of it is drawn.
+    ///
+    public func drawPath(_ path: [Point], _ pathOperator: PathOperator) throws {
+        guard path.count >= 2 else {
+            return // A path needs two points to paint anything.
+        }
+        if let message = Page.pathError(path) {
+            pdf.fail(message)
+            return
+        }
+
+        var point = path[0]
+        moveTo(point.x, point.y)
+        var controlPoint: String = ""
+
+        for i in 1..<path.count {
+            point = path[i]
+            if !point.controlPoint.isEmpty {
+                controlPoint = point.controlPoint
+                append(point)
+            } else {
+                if !controlPoint.isEmpty {
+                    append(point)
+                    append(controlPoint)
+                    append("\n")
+                    controlPoint = ""
+                } else {
+                    lineTo(point.x, point.y)
+                }
+            }
+        }
+        append(pathOperator.rawValue)
+        append("\n")
+    }
+
+    private func appendCodePointAsHex(_ codePoint: Int) {
+        buf.append(Page.HEX[(codePoint >> 12) & 0xF])
+        buf.append(Page.HEX[(codePoint >> 8) & 0xF])
+        buf.append(Page.HEX[(codePoint >> 4) & 0xF])
+        buf.append(Page.HEX[codePoint & 0xF])
+    }
+
+    /// Draws this stamp on the specified page and returns the x and y coordinates of its bottom right corner.
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        guard let page = page else {
+            return [self.x + width, self.y + height]    // Measured, not drawn
+        }
+        if page.pdf !== pdf {
+            page.pdf.fail("The stamp belongs to another PDF.")
+            return [self.x + width, self.y + height]
+        }
+        if !completed {
+            page.pdf.fail("Call complete() on the stamp before drawing it.")
+            return [self.x + width, self.y + height]
+        }
+        if width == 0.0 || height == 0.0 || scaleX == 0.0 || scaleY == 0.0 {
+            return [self.x + width, self.y + height]    // Nothing to paint.
+        }
+
+        // Described, the stamp is read; otherwise it is decoration. Undescribed
+        // inside the real content of a tagged page, such as a paragraph whose
+        // letters are stamps, it is part of that content: marked as an artifact
+        // there it would break PDF/UA (ISO 14289-1, 7.1).
+        let partOfContent = (altDescription ?? "").isEmpty && (actualText ?? "").isEmpty
+                && page.insideTaggedContent()
+        if !partOfContent {
+            page.addShapeBDC(language, actualText, altDescription)
+        }
+        page.saveGraphicsState()
+
+        let drawX = self.x
+        let drawY = (page.height - self.height) - self.y
+
+        // 5. POSITION: move to desired location
+        page.append("1 0 0 1 ")
+        page.append(drawX)
+        page.append(" ")
+        page.append(drawY)
+        page.append(" cm\n")
+
+        // 4. MOVE BACK: after rotation
+        page.append("1 0 0 1 ")
+        page.append(width / 2)
+        page.append(" ")
+        page.append(height / 2)
+        page.append(" cm\n")
+
+        // 3. ROTATE: rotate around origin
+        let radians = Double(rotateDegrees) * (Double.pi / 180.0)
+        page.appendRotation(Float(cos(radians)), Float(sin(radians)))
+
+        // SCALE: around the center, like a Container
+        if scaleX != 1.0 || scaleY != 1.0 {
+            page.appendPrecise(scaleX)
+            page.append(" 0 0 ")
+            page.appendPrecise(scaleY)
+            page.append(" 0 0 cm\n")
+        }
+
+        // 2. MOVE: move center to origin
+        page.append("1 0 0 1 ")
+        page.append(-width / 2)
+        page.append(" ")
+        page.append(-height / 2)
+        page.append(" cm\n")
+
+        // 1. DRAW: draw the object
+        page.append(page.resourceName("/XObject", "/Fm", objNumber ?? 0, [], objNumber ?? 0) + " Do\n")
+
+        page.restoreGraphicsState()
+        if !partOfContent {
+            page.addEMC()
+        }
+
+        return [self.x + width, self.y + height]
+    }
+
+    private func append(_ value: Float) {
+        if !notCompleted() {
+            return
+        }
+        if !FastFloat.isWritable(value) {
+            pdf.fail(FastFloat.NOT_WRITABLE)
+        }
+        self.buf.append(contentsOf: FastFloat.toByteArray(value))
+    }
+
+    private func append(_ str: String) {
+        if !notCompleted() {
+            return
+        }
+        self.buf.append(contentsOf: str.utf8)
+    }
+
+    // The content drawn after complete() would be lost: records the misuse and
+    // returns false after complete().
+    private func notCompleted() -> Bool {
+        if completed {
+            pdf.fail("The stamp was already completed.")
+            return false
+        }
+        return true
+    }
+}

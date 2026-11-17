@@ -1,0 +1,1076 @@
+/**
+ * Image.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Used to create image objects and draw them on a page.
+/// The image type can be one of the following:
+/// ImageType.JPG, ImageType.PNG or ImageType.BMP
+///
+/// Please see Example_32 and Example_14.
+///
+public class Image : Drawable {
+    var objNumber: Int?
+    // The identity of the PDF the image was added to, or nil for an image of an existing PDF.
+    var pdfIdentity: UUID?
+
+    var x: Float = 0.0      // Position of the image on the page
+    var y: Float = 0.0
+    var w: Float?           // Image width
+    var h: Float?           // Image height
+    // The pixels of the image across and down, which the image object is
+    // written with: a Float holds every whole number only up to 2^24.
+    private var pixelWidth = 0
+    private var pixelHeight = 0
+
+    var uri: String?
+    var key: String?
+
+    private var degrees = 0
+    private var flipUpsideDown = false
+    // The Exif orientation of a JPEG, 2 to 8, or 0; w and h are its size as seen.
+    private var orientation = 0
+    // True for a CMYK JPEG that Adobe software wrote, with its inks inverted.
+    private var invertedInks = false
+    // The /Mask of the transparent color of a grayscale or truecolor PNG, or
+    // nil.
+    private var colorKeyMask: [Int]?
+    // The colors of a pixel of a PNG whose stream is its IDAT data, for the
+    // /DecodeParms that undo the PNG filters of its rows, or 0.
+    private var decodeColors = 0
+    // The colors of the /Indexed color space of a palette PNG, or nil.
+    private var palette: [UInt8]?
+
+    private var language: String?
+    private var altDescription: String?
+    private var actualText: String?
+
+    enum ImageError: Error {
+    case format(String)
+        case rotation(String)
+    }
+
+    ///
+    /// The main constructor for the Image class.
+    ///
+    /// - Parameter pdf: the PDF to which we add this image.
+    /// - Parameter filePath: the path to the image file.
+    ///
+    public convenience init(_ pdf: PDF, _ filePath: String) throws {
+        guard let stream = InputStream(fileAtPath: filePath),
+                FileManager.default.fileExists(atPath: filePath) else {
+            throw PDFjetError(message: "File not found: " + filePath)
+        }
+        try self.init(pdf, stream)
+    }
+
+    ///
+    /// The main constructor for the Image class.
+    ///
+    /// - Parameter pdf: the PDF to which we add this image.
+    /// - Parameter stream: the input stream to read the image from.
+    ///
+    public convenience init(_ pdf: PDF, _ stream: InputStream) throws {
+        try self.init(pdf, try Content.getFromStream(stream))
+    }
+
+    ///
+    /// Creates an image from the bytes of a PNG, JPEG or BMP file already in
+    /// memory, without reading them from a stream. The image is written to
+    /// the PDF before the initializer returns.
+    ///
+    /// - Parameter pdf: the PDF to which we add this image.
+    /// - Parameter bytes: the bytes of the image file.
+    ///
+    public init(_ pdf: PDF, _ bytes: [UInt8]) throws {
+        self.pdfIdentity = pdf.identity
+        let imageType = try Image.typeOf(bytes)
+        if imageType == ImageType.JPG {
+            let jpg = try JPGImage(bytes)
+            setPixels(Int(jpg.getWidth()), Int(jpg.getHeight()))
+            if jpg.getColorComponents() == 1 {
+                addImage(pdf, jpg.getData(), [UInt8](), imageType, "DeviceGray", 8)
+            } else if jpg.getColorComponents() == 3 {
+                addImage(pdf, jpg.getData(), [UInt8](), imageType, "DeviceRGB", 8)
+            } else if jpg.getColorComponents() == 4 {
+                invertedInks = jpg.isAdobe()
+                addImage(pdf, jpg.getData(), [UInt8](), imageType, "DeviceCMYK", 8)
+            }
+            setPhysicalSize(jpg.getPhysicalWidth(), jpg.getPhysicalHeight())
+            setOrientation(jpg.orientation)
+        } else if imageType == ImageType.PNG {
+            let png = try PNGImage(InputStream(data: Data(bytes)))
+            setPixels(png.getWidth(), png.getHeight())
+            colorKeyMask = png.getColorKeyMask()
+            decodeColors = png.decodeColors
+            palette = png.palette
+            let (colorSpace, bitsPerComponent) = png.getColorSpace()
+            addImage(pdf, png.stream, png.getAlpha() ?? [UInt8](), imageType, colorSpace, bitsPerComponent)
+            setPhysicalSize(png.getPhysicalWidth(), png.getPhysicalHeight())
+        } else if imageType == ImageType.BMP {
+            let bmp = try BMPImage(InputStream(data: Data(bytes)))
+            setPixels(bmp.getWidth(), bmp.getHeight())
+            addImage(pdf, bmp.getData(), bmp.getAlpha() ?? [UInt8](), imageType, "DeviceRGB", 8)
+            setPhysicalSize(bmp.getPhysicalWidth(), bmp.getPhysicalHeight())
+        }
+    }
+
+    ///
+    /// Constructor used to attach images to existing PDF.
+    ///
+    /// - Parameter objects: the map to which we add this image.
+    /// - Parameter stream: the input stream to read the image from.
+    ///
+    public convenience init(_ objects: inout [PDFobj], _ stream: InputStream) throws {
+        try self.init(&objects, try Content.getFromStream(stream))
+    }
+
+    private init(_ objects: inout [PDFobj], _ bytes: [UInt8]) throws {
+        let imageType = try Image.typeOf(bytes)
+        var data: [UInt8]
+        var alpha = [UInt8]()
+        if imageType == ImageType.JPG {
+            let jpg = try JPGImage(bytes)
+            data = jpg.getData()
+            setPixels(Int(jpg.getWidth()), Int(jpg.getHeight()))
+            if jpg.getColorComponents() == 1 {
+                addImageToObjects(&objects, &data, &alpha, imageType, "DeviceGray", 8)
+            } else if jpg.getColorComponents() == 3 {
+                addImageToObjects(&objects, &data, &alpha, imageType, "DeviceRGB", 8)
+            } else if jpg.getColorComponents() == 4 {
+                invertedInks = jpg.isAdobe()
+                addImageToObjects(&objects, &data, &alpha, imageType, "DeviceCMYK", 8)
+            }
+            setPhysicalSize(jpg.getPhysicalWidth(), jpg.getPhysicalHeight())
+            setOrientation(jpg.orientation)
+        } else if imageType == ImageType.PNG {
+            let png = try PNGImage(InputStream(data: Data(bytes)))
+            data = png.stream
+            alpha = png.getAlpha() ?? [UInt8]()
+            setPixels(png.getWidth(), png.getHeight())
+            colorKeyMask = png.getColorKeyMask()
+            decodeColors = png.decodeColors
+            palette = png.palette
+            let (colorSpace, bitsPerComponent) = png.getColorSpace()
+            addImageToObjects(&objects, &data, &alpha, imageType, colorSpace, bitsPerComponent)
+            setPhysicalSize(png.getPhysicalWidth(), png.getPhysicalHeight())
+        } else if imageType == ImageType.BMP {
+            let bmp = try BMPImage(InputStream(data: Data(bytes)))
+            data = bmp.getData()
+            alpha = bmp.getAlpha() ?? [UInt8]()
+            setPixels(bmp.getWidth(), bmp.getHeight())
+            addImageToObjects(&objects, &data, &alpha, imageType, "DeviceRGB", 8)
+            setPhysicalSize(bmp.getPhysicalWidth(), bmp.getPhysicalHeight())
+        }
+    }
+
+    // Returns the filters as the value of /Filter: a name, or an array of names
+    // for more than one. A /Filter that is an object of its own was written as
+    // its number, and the image could not be decoded.
+    static func filterValue(_ filters: [String]) -> String {
+        if filters.count < 2 {
+            return filters.joined()
+        }
+        return "[" + filters.joined(separator: " ") + "]"
+    }
+
+    // Writes the key and its value, when it has one
+    private static func appendIfAny(_ pdf: PDF, _ key: String, _ value: String) {
+        if !value.isEmpty {
+            pdf.append(key + " " + value + "\n")
+        }
+    }
+
+    /// Creates an image from an image object read from an existing PDF. Its
+    /// soft mask, the alpha of a PNG, and its mask, a color key or a stencil,
+    /// are copied with it.
+    public init(_ pdf: PDF, _ obj: PDFobj) throws {
+        self.pdfIdentity = pdf.identity
+        setPixels(Image.pixels(try Image.sizeOf(obj, "/Width")), Image.pixels(try Image.sizeOf(obj, "/Height")))
+        // They were left out, and a logo on a transparent background was
+        // drawn on a solid box (22 October 2026)
+        // A PDF/A document refuses a copied image it cannot hold, as it does
+        // an image made from a file: a soft mask went into PDF/A-1 once masks
+        // were copied, and a CMYK image, or one of 16 bits, always had (the
+        // review of 28 October 2026)
+        // A JPEG 2000 image with its alpha in its data has transparency too.
+        let softMaskTokens = obj.valueTokens("/SMask")
+        let smaskInData = try Image.copiedSMaskInData(obj)
+        let hasSoftMask = (!softMaskTokens.isEmpty && softMaskTokens != ["/None"])
+                || (!smaskInData.isEmpty && smaskInData != "0")
+        if !isPDFA(pdf, hasSoftMask ? [0] : [],
+                obj.valueTokens("/ColorSpace").contains("/DeviceCMYK") ? "DeviceCMYK" : "",
+                Int(try Image.copiedBitsPerComponent(obj)) ?? 0) {
+            return
+        }
+        if try !Image.copiedFiltersArePDFA(pdf, obj) {
+            return
+        }
+        let softMask = try Image.copiedMask(pdf, obj, "/SMask")
+        var mask = 0
+        var maskArray = obj.valueTokens("/Mask")
+        if maskArray.contains("R") {
+            mask = try Image.copiedMask(pdf, obj, "/Mask")
+            maskArray = []
+        }
+        try Image.appendImageObject(pdf, obj, softMask, mask, maskArray)
+        pdf.images.append(self)
+        objNumber = pdf.getObjNumber()
+    }
+
+    // Copies the image that the key of the image refers to, its soft mask or
+    // its stencil mask, from the PDF it was read from, and returns its number
+    // in this PDF, or 0 when the image has none.
+    private static func copiedMask(_ pdf: PDF, _ obj: PDFobj, _ key: String) throws -> Int {
+        let tokens = obj.valueTokens(key)
+        if tokens.isEmpty || tokens == ["/None"] {
+            return 0
+        }
+        guard tokens.count == 3, tokens[2] == "R", let number = Int(tokens[0]) else {
+            throw PDFjetError(message: "The " + key + " of the image is not a reference to an image: "
+                    + tokens.joined(separator: " "))
+        }
+        guard let mask = obj.masks[number] ?? (number == obj.number ? obj : obj.readObjects?.object(number)) else {
+            throw PDFjetError(message: "The image refers to another object of the PDF it was read from, "
+                    + "which is not copied with it: " + key + " " + tokens.joined(separator: " "))
+        }
+        if mask.getValue("/Subtype") != "/Image" {
+            throw PDFjetError(message: "The " + key + " of the image is not an image: "
+                    + tokens.joined(separator: " "))
+        }
+        if !mask.valueTokens("/SMask").isEmpty || !mask.valueTokens("/Mask").isEmpty {
+            throw PDFjetError(message: "The " + key + " of the image has a mask of its own.")
+        }
+        _ = try sizeOf(mask, "/Width")
+        _ = try sizeOf(mask, "/Height")
+        try appendImageObject(pdf, mask, 0, 0, [])
+        return pdf.getObjNumber()
+    }
+
+    // Writes an image object copied from another PDF, with the numbers of its
+    // soft mask and its stencil mask in this PDF, or 0, or the array of its
+    // color key mask.
+    private static func appendImageObject(
+            _ pdf: PDF, _ obj: PDFobj, _ softMask: Int, _ mask: Int, _ maskArray: [String]) throws {
+        // The values copied as they are, but for their strings, encrypted when
+        // the document is, as the palette of an /Indexed color space; and the
+        // stream, encrypted too (review of 11 October 2026, #11)
+        let colorSpace = obj.valueTokens("/ColorSpace")
+        let decodeParms = obj.copiedDecodeParms()
+        let decode = obj.valueTokens("/Decode")
+        let matte = obj.valueTokens("/Matte")
+        for tokens in [colorSpace, decodeParms, decode, matte, maskArray] where tokens.contains("R") {
+            throw PDFjetError(message: "The image refers to another object of the PDF it was read from, "
+                    + "which is not copied with it: " + tokens.joined(separator: " "))
+        }
+        // A /Filter in an object that cannot be read was written as no filter,
+        // and the compressed samples taken for the image's own
+        if let k = obj.dict.firstIndex(of: "/Filter"), PDF.isReference(obj.dict, k + 1),
+                obj.readObjects?.object(Int(obj.dict[k + 1]) ?? 0) == nil {
+            throw PDFjetError(message: "The image refers to another object of the PDF it was read from, "
+                    + "which is not copied with it: " + obj.dict[(k + 1)..<(k + 4)].joined(separator: " "))
+        }
+        // An image object with no stream is refused before anything of it is
+        // written: it was half written, and complete() then wrote a corrupt
+        // PDF; and /Filter and /BitsPerComponent are written only when it has
+        // them, an empty value took the next key for its own (review of 17
+        // October 2026)
+        guard obj.stream != nil else {
+            throw PDFjetError(message: "The image object has no stream.")
+        }
+        let filters = filterValue(try copiedFilters(obj))
+        let width = pixels(try sizeOf(obj, "/Width"))
+        let height = pixels(try sizeOf(obj, "/Height"))
+        let bitsPerComponent = try copiedBitsPerComponent(obj)
+        let imageMask = try copiedEntry(obj, "/ImageMask", "true", "false")
+        let smaskInData = try copiedSMaskInData(obj)   // The alpha of a JPEG 2000 image
+        pdf.newObj()
+        pdf.append(Token.beginDictionary)
+        pdf.append("/Type /XObject\n")
+        pdf.append("/Subtype /Image\n")
+        appendIfAny(pdf, "/Filter", filters)
+        pdf.append("/Width ")
+        pdf.append(width)
+        pdf.append("\n")
+        pdf.append("/Height ")
+        pdf.append(height)
+        pdf.append("\n")
+        appendCopiedValue(pdf, "/ColorSpace", colorSpace)
+        appendIfAny(pdf, "/BitsPerComponent", bitsPerComponent)
+        appendCopiedValue(pdf, "/DecodeParms", decodeParms)
+        appendCopiedValue(pdf, "/Decode", decode)
+        appendCopiedValue(pdf, "/Matte", matte)
+        appendIfAny(pdf, "/ImageMask", imageMask)
+        appendIfAny(pdf, "/SMaskInData", smaskInData)
+        if softMask != 0 {
+            pdf.append("/SMask ")
+            pdf.append(softMask)
+            pdf.append(" 0 R\n")
+        }
+        if mask != 0 {
+            pdf.append("/Mask ")
+            pdf.append(mask)
+            pdf.append(" 0 R\n")
+        }
+        appendCopiedValue(pdf, "/Mask", maskArray)
+        let stream = pdf.encrypted(obj.stream ?? [])
+        pdf.append("/Length ")
+        pdf.append(stream.count)
+        pdf.append("\n")
+        pdf.append(Token.endDictionary)
+        pdf.append(Token.stream)
+        pdf.append(stream, 0, stream.count)
+        pdf.append(Token.endStream)
+        pdf.endObj()
+    }
+
+    // Appends the key and the tokens of its value, read from another PDF, if
+    // it has one: its strings, literal or hexadecimal, as hexadecimal strings
+    // encrypted when the document is.
+    private static func appendCopiedValue(_ pdf: PDF, _ key: String, _ tokens: [String]) {
+        if tokens.isEmpty {
+            return
+        }
+        pdf.append(key)
+        for token in tokens {
+            pdf.append(" ")
+            if pdf.encryption != nil &&
+                    (token.hasPrefix("(") || (token.hasPrefix("<") && token != "<<")) {
+                pdf.appendByteString(Decryptor.toBytes(token))
+            } else {
+                pdf.append(token)
+            }
+        }
+        pdf.append("\n")
+    }
+
+    // Sets the pixels of the image across and down, which it is drawn at, a
+    // pixel to a point, unless the file asks for another size.
+    // Returns the number of pixels of the value, as Java's (int) takes it: 0
+    // for what is not a number, and the largest or smallest Int32 for one past
+    // them. Int() of NaN or of 1e19 stopped the program (review of 12 October
+    // 2026, R12).
+    // The number of the key, which is a number in decimal, with an exponent
+    // or not, in the four ports: Java read 100f and hex, C# white space and
+    // Infinity, Go inf, and Swift took any other text for 0 (review of
+    // 17 October 2026). One past a double is its infinity. It is a pixel or
+    // more: -5 and 0 were written as they were.
+    private static func sizeOf(_ obj: PDFobj, _ key: String) throws -> Double {
+        let value = try copiedValue(obj, key)
+        guard Util.isDecimalNumber(value), let number = Double(value) else {
+            throw PDFjetError(message: "The \(key) of the image object is not a number: \(value)")
+        }
+        if pixels(number) < 1 {
+            throw PDFjetError(message: "The \(key) of the image object is not a positive number: \(value)")
+        }
+        return number
+    }
+
+    // The value of the key of the image object, read from the object it
+    // refers to when it is a reference, which ISO 32000-1 7.3.10 allows:
+    // /Width 4 0 R was taken for 4.
+    private static func copiedValue(_ obj: PDFobj, _ key: String) throws -> String {
+        var tokens = obj.valueTokens(key)
+        if PDF.isReference(tokens, 0) {
+            guard let value = obj.readObjects?.object(Int(tokens[0]) ?? 0) else {
+                throw PDFjetError(message: "The image refers to another object of the PDF it was read from, "
+                        + "which is not copied with it: " + key + " " + tokens.joined(separator: " "))
+            }
+            tokens = PDF.valueOf(value)
+        }
+        return tokens.joined(separator: " ")
+    }
+
+    // The value of the key of the image object, one of the values it can
+    // have, or "" when it has none: a value that is not one, as
+    // /BitsPerComponent ], was written as it was read.
+    private static func copiedEntry(_ obj: PDFobj, _ key: String, _ values: String...) throws -> String {
+        let value = try copiedValue(obj, key)
+        if !value.isEmpty && !values.contains(value) {
+            throw PDFjetError(message: "The " + key + " of the image object is not "
+                    + values.dropLast().joined(separator: ", ") + " or " + values[values.count - 1] + ": " + value)
+        }
+        return value
+    }
+
+    // The /BitsPerComponent of the image object, or "" when it has none.
+    private static func copiedBitsPerComponent(_ obj: PDFobj) throws -> String {
+        return try copiedEntry(obj, "/BitsPerComponent", "1", "2", "4", "8", "16")
+    }
+
+    // The /SMaskInData of the image object, which says a JPEG 2000 image has
+    // its alpha in its data, or "" when it has none.
+    private static func copiedSMaskInData(_ obj: PDFobj) throws -> String {
+        return try copiedEntry(obj, "/SMaskInData", "0", "1", "2")
+    }
+
+    // The filters of the image object, which are names: a string was written
+    // as it was read, not encrypted when the document is.
+    private static func copiedFilters(_ obj: PDFobj) throws -> [String] {
+        let filters = obj.getFilters()
+        for filter in filters where !filter.hasPrefix("/") {
+            throw PDFjetError(message: "The /Filter of the image object is not a name or an array of names: "
+                    + filters.joined(separator: " "))
+        }
+        return filters
+    }
+
+    // The filters of ISO 32000-1 Table 6 that a PDF/A document can hold: not
+    // LZWDecode, which ISO 19005 forbids, or Crypt.
+    private static let pdfAFilters = ["/ASCIIHexDecode", "/ASCII85Decode", "/FlateDecode", "/RunLengthDecode",
+            "/CCITTFaxDecode", "/JBIG2Decode", "/DCTDecode", "/JPXDecode"]
+
+    // Whether a PDF/A document can hold the filters of the image object and
+    // of its masks; it fails the document when it cannot: an image of
+    // LZWDecode, which older scans have, was copied into it as it was. The
+    // image is not decoded and compressed again, as PDFjet does not decode
+    // LZW.
+    private static func copiedFiltersArePDFA(_ pdf: PDF, _ obj: PDFobj) throws -> Bool {
+        let level = pdf.compliance
+        if level == Compliance.PDF_1_7 || level == Compliance.PDF_UA_1 {
+            return true
+        }
+        var images = [obj]
+        for key in ["/SMask", "/Mask"] {
+            let tokens = obj.valueTokens(key)
+            if PDF.isReference(tokens, 0), let number = Int(tokens[0]),
+                    let mask = obj.masks[number] ?? obj.readObjects?.object(number) {
+                images.append(mask)
+            }
+        }
+        for image in images {
+            for filter in try copiedFilters(image) where !pdfAFilters.contains(filter) {
+                pdf.fail("A document of \(level) cannot hold an image compressed with \(filter): "
+                        + "PDF/A forbids LZWDecode, Crypt and the filters that are not standard.")
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func pixels(_ number: Double) -> Int {
+        return Int(Swift.min(Swift.max(number, Double(Int32.min)), Double(Int32.max)))
+    }
+
+    private func setPixels(_ width: Int, _ height: Int) {
+        pixelWidth = width
+        pixelHeight = height
+        w = Float(width)
+        h = Float(height)
+    }
+
+    ///
+    // Draws the image at the size the file asks for, when it asks for one: the
+    // pHYs chunk of a PNG, the JFIF density of a JPEG or the pixels per metre
+    // of a BMP.
+    // The width and the height are the pixels of the image until here, which
+    // is what the image object of the PDF is written with, and are the size it
+    // is drawn at from here on.
+    private func setPhysicalSize(_ width: Float, _ height: Float) {
+        if width > 0.0 && height > 0.0 {
+            self.w = width
+            self.h = height
+        }
+    }
+
+    // Keeps the Exif orientation of a JPEG, which is drawn as it is meant to be
+    // seen: turned a quarter of the way (5 to 8), its size as seen is its
+    // height by its width. 1, upright as stored, is drawn as without one.
+    private func setOrientation(_ orientation: Int) {
+        if orientation < 2 || orientation > 8 {
+            return
+        }
+        self.orientation = orientation
+        if orientation >= 5 {
+            swap(&self.w, &self.h)
+        }
+    }
+
+    // Turn or flip the unit square of an image as stored into the image as
+    // seen, for the Exif orientations 2 to 8.
+    private static let orientationMatrices = [
+        "",
+        "",
+        "-1 0 0 1 1 0 cm\n",
+        "-1 0 0 -1 1 1 cm\n",
+        "1 0 0 -1 0 1 cm\n",
+        "0 -1 -1 0 1 1 cm\n",
+        "0 -1 1 0 0 1 cm\n",
+        "0 1 1 0 0 0 cm\n",
+        "0 1 -1 0 1 0 cm\n",
+    ]
+
+    /// Sets the location of this image on the page to (x, y).
+    ///
+    /// - Parameter x: the x coordinate of the top left corner of the image.
+    /// - Parameter y: the y coordinate of the top left corner of the image.
+    ///
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x = x
+        self.y = y
+        return self
+    }
+
+    ///
+    /// Scales this image by the specified factor.
+    ///
+    /// - Parameter factor: the factor used to scale the image.
+    ///
+    @discardableResult
+    public func scaleBy(_ factor: Float) -> Image {
+        return self.scaleBy(factor, factor)
+    }
+
+    ///
+    /// Scales this image by the specified width and height factor.
+    ///
+    /// *Author:* **Pieter Libin**, pieter@emweb.be
+    ///
+    /// - Parameter widthFactor: the factor used to scale the width of the image
+    /// - Parameter heightFactor: the factor used to scale the height of the image
+    ///
+    @discardableResult
+    public func scaleBy(_ widthFactor: Float, _ heightFactor: Float) -> Image {
+        self.w! *= widthFactor
+        self.h! *= heightFactor
+        return self
+    }
+
+    /// Scales this image proportionally to the specified width.
+    @discardableResult
+    public func resizeWidth(_ width: Float) -> Image {
+        let factor = width / getWidth()
+        return self.scaleBy(factor, factor)
+    }
+
+    /// Scales this image proportionally to the specified height.
+    @discardableResult
+    public func resizeHeight(_ height: Float) -> Image {
+        let factor = height / getHeight()
+        return self.scaleBy(factor, factor)
+    }
+
+    ///
+    /// Sets the URI for the "click box" action.
+    ///
+    /// - Parameter uri: the URI
+    ///
+    @discardableResult
+    public func setURIAction(_ uri: String) -> Image {
+        self.uri = uri
+        return self
+    }
+
+    ///
+    /// Sets the destination key for the action.
+    ///
+    /// - Parameter key: the destination name.
+    ///
+    @discardableResult
+    public func setGoToAction(_ key: String) -> Image {
+        self.key = key
+        return self
+    }
+
+    /// Rotates this image clockwise by 0, 90, 180 or 270 degrees, as every rotation in PDFjet turns.
+    @discardableResult
+    public func setRotation(_ degrees: Int) throws -> Image {
+        if degrees != 0 && degrees != 90 && degrees != 180 && degrees != 270 {
+            throw ImageError.rotation("The rotation angle must be 0, 90, 180 or 270")
+        }
+        self.degrees = degrees
+        return self
+    }
+
+    ///
+    /// Sets the alternate description of this image.
+    ///
+    /// - Parameter altDescription: the alternate description of the image.
+    /// - Returns: this Image.
+    ///
+    @discardableResult
+    public func setAltDescription(_ altDescription: String) -> Image {
+        self.altDescription = altDescription
+        return self
+    }
+
+    ///
+    /// Sets the actual text for this image.
+    ///
+    /// - Parameter actualText: the actual text for the image.
+    /// - Returns: this Image.
+    ///
+    @discardableResult
+    public func setActualText(_ actualText: String) -> Image {
+        self.actualText = actualText
+        return self
+    }
+
+    ///
+    /// Sets the language of this image.
+    ///
+    /// - Parameter language: the language, for example "en-US".
+    /// - Returns: this Image.
+    ///
+    @discardableResult
+    public func setLanguage(_ language: String) -> Image {
+        self.language = language
+        return self
+    }
+
+    ///
+    /// Draws this image on the specified page.
+    ///
+    /// - Parameter page: the page to draw this image on.
+    /// - Returns: x and y coordinates of the bottom right corner of this component.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        // The corner of the image as it is drawn, turned or not: an image
+        // turned a quarter of the way gave its corner unturned, and in a table
+        // cell ran over the rows after it (review of 12 October 2026, F3)
+        let corner = [x + getWidth(), y + getHeight()]
+        guard let page = page else {
+            return corner               // Measured, not drawn
+        }
+        if let identity = pdfIdentity, identity != page.pdf.identity {
+            page.pdf.fail("The image belongs to another PDF.")
+            return corner
+        }
+        if w! == 0.0 || h! == 0.0 {
+            return corner               // A zero size image paints nothing.
+        }
+        guard let objNumber = objNumber else {
+            return corner               // The PDF refused the image, and has failed.
+        }
+        // A linked image is a Figure in the Link its annotation joins
+        var link: StructElement?
+        if uri != nil || key != nil {
+            link = page.beginLink()
+        }
+        page.addBDC(StructElem.FIGURE, language, actualText, altDescription)
+        page.saveGraphicsState()
+
+        if degrees == 0 {
+            page.append(w!)
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(h!)
+            page.append(Token.space)
+            page.append(x)
+            page.append(Token.space)
+            page.append(page.height - (y + h!))
+            page.append(" cm\n")
+        } else if degrees == 90 {
+            page.append(h!)
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(w!)
+            page.append(Token.space)
+            page.append(x)
+            page.append(Token.space)
+            page.append(page.height - y)
+            page.append(" cm\n")
+            page.append("0 -1 1 0 0 0 cm\n")
+        } else if degrees == 180 {
+            page.append(w!)
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(h!)
+            page.append(Token.space)
+            page.append(x + w!)
+            page.append(Token.space)
+            page.append(page.height - y)
+            page.append(" cm\n")
+            page.append("-1 0 0 -1 0 0 cm\n")
+        } else if degrees == 270 {
+            page.append(h!)
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(Float(0.0))
+            page.append(Token.space)
+            page.append(w!)
+            page.append(Token.space)
+            page.append(x + h!)
+            page.append(Token.space)
+            page.append(page.height - (y + w!))
+            page.append(" cm\n")
+            page.append("0 1 -1 0 0 0 cm\n")
+        }
+
+        if flipUpsideDown {
+            page.append("1 0 0 -1 0 1 cm\n")
+        }
+        if orientation != 0 {
+            page.append(Image.orientationMatrices[orientation])
+        }
+
+        page.append("/Im")
+        page.append(objNumber)
+        page.append(" Do\n")
+
+        page.restoreGraphicsState()
+
+        // Turned a quarter of the way, the image is as wide as it is tall unturned
+        if degrees == 90 || degrees == 270 {
+            page.setFigureBoundingBox(x, y, h!, w!)
+        } else {
+            page.setFigureBoundingBox(x, y, w!, h!)
+        }
+        page.addEMC()
+
+        page.endLink(link)
+        if uri != nil || key != nil {
+            // The link covers the image as it is drawn, turned or not.
+            let turned = degrees == 90 || degrees == 270
+            page.addAnnotation(Annotation(
+                    Annotation.Link,
+                    x,
+                    y,
+                    x + (turned ? h! : w!),
+                    y + (turned ? w! : h!),
+                    nil,    // Vertices
+                    nil,    // Fill Color
+                    0.0,    // Opacity
+                    nil,    // Title
+                    nil,    // Contents
+                    uri,
+                    key,    // The destination name
+                    language,
+                    actualText,
+                    altDescription).joining(link))
+        }
+
+        return corner
+    }
+
+    ///
+    /// Returns the width of this image when drawn on the page, its height
+    /// before it is turned when it is turned a quarter of the way.
+    /// The scaling is take into account.
+    ///
+    /// - Returns: w - the width of this image.
+    ///
+    public func getWidth() -> Float {
+        return (degrees == 90 || degrees == 270) ? self.h! : self.w!
+    }
+
+    ///
+    /// Returns the height of this image when drawn on the page, its width
+    /// before it is turned when it is turned a quarter of the way.
+    /// The scaling is take into account.
+    ///
+    /// - Returns: h - the height of this image.
+    ///
+    public func getHeight() -> Float {
+        return (degrees == 90 || degrees == 270) ? self.w! : self.h!
+    }
+
+    private func addSoftMask(
+            _ pdf: PDF,
+            _ alpha: [UInt8],
+            _ colorSpace: String,
+            _ bitsPerComponent: Int) {
+        pdf.newObj()
+        pdf.append(Token.beginDictionary)
+        pdf.append("/Type /XObject\n")
+        pdf.append("/Subtype /Image\n")
+        pdf.append("/Filter /FlateDecode\n")
+        pdf.append("/Width ")
+        pdf.append(pixelWidth)
+        pdf.append(Token.newline)
+        pdf.append("/Height ")
+        pdf.append(pixelHeight)
+        pdf.append(Token.newline)
+        pdf.append("/ColorSpace /")
+        pdf.append(colorSpace)
+        pdf.append(Token.newline)
+        pdf.append("/BitsPerComponent ")
+        pdf.append(bitsPerComponent)
+        pdf.append(Token.newline)
+        let buf = pdf.encrypted(alpha)
+        pdf.append("/Length ")
+        pdf.append(buf.count)
+        pdf.append(Token.newline)
+        pdf.append(Token.endDictionary)
+        pdf.append(Token.stream)
+        pdf.append(buf, 0, buf.count)
+        pdf.append(Token.endStream)
+        pdf.endObj()
+        objNumber = pdf.getObjNumber()
+    }
+
+    private func addImage(
+            _ pdf: PDF,
+            _ data: [UInt8],
+            _ alpha: [UInt8],
+            _ imageType: ImageType,
+            _ colorSpace: String,
+            _ bitsPerComponent: Int)  {
+        if !isPDFA(pdf, alpha, colorSpace, bitsPerComponent) {
+            return
+        }
+        if alpha.count > 0 {
+            addSoftMask(pdf, alpha, "DeviceGray", 8)
+        }
+
+        pdf.newObj()
+        pdf.append(Token.beginDictionary)
+        pdf.append("/Type /XObject\n")
+        pdf.append("/Subtype /Image\n")
+        if imageType == ImageType.JPG {
+            pdf.append("/Filter /DCTDecode\n")
+        } else {
+            pdf.append("/Filter /FlateDecode\n")
+            if alpha.count > 0 {
+                pdf.append("/SMask ")
+                pdf.append(objNumber!)
+                pdf.append(" 0 R\n")
+            } else if let mask = colorKeyMask {
+                pdf.append("/Mask [" + mask.map { String($0) }.joined(separator: " ") + "]\n")
+            }
+        }
+        pdf.append("/Width ")
+        pdf.append(pixelWidth)
+        pdf.append(Token.newline)
+        pdf.append("/Height ")
+        pdf.append(pixelHeight)
+        pdf.append(Token.newline)
+        if let palette = palette {
+            pdf.append("/ColorSpace [/Indexed /DeviceRGB ")
+            pdf.append(palette.count/3 - 1)
+            pdf.append(" <")
+            pdf.append(pdf.toHex(pdf.encrypted(palette)))
+            pdf.append(">]\n")
+        } else {
+            pdf.append("/ColorSpace /")
+            pdf.append(colorSpace)
+            pdf.append(Token.newline)
+        }
+        pdf.append("/BitsPerComponent ")
+        pdf.append(bitsPerComponent)
+        pdf.append(Token.newline)
+        if colorSpace == "DeviceCMYK" && invertedInks {
+            // Adobe software, Photoshop among them, stores the inks inverted.
+            pdf.append("/Decode [1.0 0.0 1.0 0.0 1.0 0.0 1.0 0.0]\n")
+        }
+        if decodeColors != 0 {
+            // The rows of a PNG, each with the filter type of its PNG filter.
+            pdf.append("/DecodeParms <</Predictor 15 /Colors ")
+            pdf.append(decodeColors)
+            pdf.append(" /BitsPerComponent ")
+            pdf.append(bitsPerComponent)
+            pdf.append(" /Columns ")
+            pdf.append(pixelWidth)
+            pdf.append(">>\n")
+        }
+        let buf = pdf.encrypted(data)
+        pdf.append("/Length ")
+        pdf.append(buf.count)
+        pdf.append(Token.newline)
+        pdf.append(Token.endDictionary)
+        pdf.append(Token.stream)
+        pdf.append(buf, 0, buf.count)
+        pdf.append(Token.endStream)
+        pdf.endObj()
+        pdf.images.append(self)
+        self.objNumber = pdf.getObjNumber()
+    }
+
+    // Returns true if a PDF/A document can hold the image, and fails the
+    // document when it cannot. Its output intent is sRGB, an RGB profile, so
+    // its images are gray or RGB and not CMYK, as ISO 19005 asks of a device
+    // color space. PDF/A-1 is PDF 1.4, which has no soft masks, and 8 bits per
+    // component at most. Any other document holds any image.
+    private func isPDFA(
+            _ pdf: PDF,
+            _ alpha: [UInt8],
+            _ colorSpace: String,
+            _ bitsPerComponent: Int) -> Bool {
+        let level = pdf.compliance
+        if level == Compliance.PDF_1_7 || level == Compliance.PDF_UA_1 {
+            return true
+        }
+        let pdfA1 = level == Compliance.PDF_A_1A || level == Compliance.PDF_A_1B
+        if colorSpace == "DeviceCMYK" {
+            pdf.fail("A document of \(level) cannot hold a CMYK image: "
+                    + "its output intent is sRGB, so its images are gray or RGB.")
+            return false
+        }
+        if pdfA1 && !alpha.isEmpty {
+            pdf.fail("A document of \(level) cannot hold an image with transparency: "
+                    + "PDF/A-1 has no soft masks, so its images are opaque.")
+            return false
+        }
+        if pdfA1 && bitsPerComponent > 8 {
+            pdf.fail("A document of \(level) cannot hold an image of "
+                    + "\(bitsPerComponent) bits per component: PDF/A-1 has 8 at most.")
+            return false
+        }
+        return true
+    }
+
+    private func addSoftMask2(
+            _ objects: inout [PDFobj],
+            _ data: inout [UInt8],
+            _ colorSpace: String,
+            _ bitsPerComponent: Int) {
+        let obj = PDFobj()
+        obj.dict.append("<<")
+        obj.dict.append("/Type")
+        obj.dict.append("/XObject")
+        obj.dict.append("/Subtype")
+        obj.dict.append("/Image")
+        obj.dict.append("/Filter")
+        obj.dict.append("/FlateDecode")
+        obj.dict.append("/Width")
+        obj.dict.append(String(pixelWidth))
+        obj.dict.append("/Height")
+        obj.dict.append(String(pixelHeight))
+        obj.dict.append("/ColorSpace")
+        obj.dict.append("/" + colorSpace)
+        obj.dict.append("/BitsPerComponent")
+        obj.dict.append(String(bitsPerComponent))
+        obj.dict.append("/Length")
+        obj.dict.append(String(data.count))
+        obj.dict.append(">>")
+        obj.setStream(&data)
+        obj.number = objects.count + 1
+        objects.append(obj)
+        objNumber = obj.number
+    }
+
+    func addImageToObjects(
+            _ objects: inout [PDFobj],
+            _ data: inout [UInt8],
+            _ alpha: inout [UInt8],
+            _ imageType: ImageType,
+            _ colorSpace: String,
+            _ bitsPerComponent: Int) {
+        if !alpha.isEmpty {
+            addSoftMask2(&objects, &alpha, "DeviceGray", 8)
+        }
+
+        let obj = PDFobj()
+        obj.dict.append("<<")
+        obj.dict.append("/Type")
+        obj.dict.append("/XObject")
+        obj.dict.append("/Subtype")
+        obj.dict.append("/Image")
+        if imageType == ImageType.JPG {
+            obj.dict.append("/Filter")
+            obj.dict.append("/DCTDecode")
+        } else if imageType == ImageType.PNG ||
+                imageType == ImageType.BMP {
+            obj.dict.append("/Filter")
+            obj.dict.append("/FlateDecode")
+            if !alpha.isEmpty {
+                obj.dict.append("/SMask")
+                obj.dict.append(String(objNumber!))
+                obj.dict.append("0")
+                obj.dict.append("R")
+            } else if let mask = colorKeyMask {
+                obj.dict.append("/Mask")
+                obj.dict.append("[")
+                obj.dict.append(contentsOf: mask.map { String($0) })
+                obj.dict.append("]")
+            }
+        }
+        obj.dict.append("/Width")
+        obj.dict.append(String(pixelWidth))
+        obj.dict.append("/Height")
+        obj.dict.append(String(pixelHeight))
+        obj.dict.append("/ColorSpace")
+        if let palette = palette {
+            obj.dict.append(contentsOf: ["[", "/Indexed", "/DeviceRGB"])
+            obj.dict.append(String(palette.count/3 - 1))
+            obj.dict.append("<" + palette.map { String(format: "%02x", $0) }.joined() + ">")
+            obj.dict.append("]")
+        } else {
+            obj.dict.append("/" + colorSpace)
+        }
+        obj.dict.append("/BitsPerComponent")
+        obj.dict.append(String(bitsPerComponent))
+        if colorSpace == "DeviceCMYK" && invertedInks {
+            // Adobe software, Photoshop among them, stores the inks inverted.
+            obj.dict.append("/Decode")
+            obj.dict.append("[")
+            obj.dict.append("1.0")
+            obj.dict.append("0.0")
+            obj.dict.append("1.0")
+            obj.dict.append("0.0")
+            obj.dict.append("1.0")
+            obj.dict.append("0.0")
+            obj.dict.append("1.0")
+            obj.dict.append("0.0")
+            obj.dict.append("]")
+        }
+        if decodeColors != 0 {
+            // The rows of a PNG, each with the filter type of its PNG filter.
+            obj.dict.append(contentsOf: ["/DecodeParms", "<<"])
+            obj.dict.append(contentsOf: ["/Predictor", "15"])
+            obj.dict.append(contentsOf: ["/Colors", String(decodeColors)])
+            obj.dict.append(contentsOf: ["/BitsPerComponent", String(bitsPerComponent)])
+            obj.dict.append(contentsOf: ["/Columns", String(pixelWidth)])
+            obj.dict.append(">>")
+        }
+        obj.dict.append("/Length")
+        obj.dict.append(String(data.count))
+        obj.dict.append(">>")
+        obj.setStream(&data)
+        obj.number = objects.count + 1
+        objects.append(obj)
+
+        objNumber = obj.number
+    }
+
+    /// Scales this image to fit between its location and the bottom right corner of the page.
+    public func resizeToFit(_ page: Page, keepAspectRatio: Bool) {
+        // The page fits the image as it is drawn, turned or not
+        let across = (page.width - self.x) / getWidth()
+        let down = (page.height - self.y) / getHeight()
+        if keepAspectRatio {
+            self.scaleBy(min(across, down))
+        } else if degrees == 90 || degrees == 270 {
+            self.scaleBy(down, across)
+        } else {
+            self.scaleBy(across, down)
+        }
+    }
+
+    /// Sets whether this image is drawn upside down.
+    @discardableResult
+    public func setFlipUpsideDown(_ flipUpsideDown: Bool) -> Image {
+        self.flipUpsideDown = flipUpsideDown
+        return self
+    }
+
+    /// Returns the type of the image from its first bytes.
+    static func typeOf(_ bytes: [UInt8]) throws -> ImageType {
+        if bytes.count >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 {
+            return ImageType.PNG
+        }
+        if bytes.count >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+            return ImageType.JPG
+        }
+        if bytes.count >= 2 && bytes[0] == 0x42 && bytes[1] == 0x4D {
+            return ImageType.BMP
+        }
+        throw ImageError.format("The image is not a PNG, JPEG or BMP file.")
+    }
+}   // End of Image.swift

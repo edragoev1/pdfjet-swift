@@ -1,0 +1,1285 @@
+/**
+ * Font.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Used to create font objects.
+/// The font objects must be added to the PDF before they can be used to draw text.
+///
+public class Font {
+    var name: String = ""
+    var info: String = ""
+    var objNumber = 0
+    // The identity of the PDF the font was added to, or nil for a font of an existing PDF.
+    var pdfIdentity: UUID?
+    // The compliance of the PDF the font was added to, which is set before
+    // fonts are added, or PDF_1_7 for a font of an existing PDF.
+    var compliance = Compliance.PDF_1_7
+    var fontID: String?
+
+    // The object number of the embedded font file
+    var fileObjNumber = 0
+    var fontDescriptorObjNumber = 0
+    var cidFontDictObjNumber = 0
+    var toUnicodeCMapObjNumber = 0
+    var cidSetObjNumber = 0             // The CIDSet of a subset in PDF/A-1
+    var baseFont = ""                   // The name it is embedded under, with the tag of a subset
+    var program: Subset.Program?        // A TrueType font program, until complete()
+    var kept: [Bool]?                   // The glyphs its subset keeps
+    // Whether drawGlyphs drew with the font, which it draws as outlines, and
+    // whether anything draws with it as a font, text or a stamp's: a font
+    // drawGlyphs alone drew with is not written into the document.
+    var drawnAsOutlines = false
+    var referenced = false
+
+    // Font attributes
+    var unitsPerEm = 1000
+    var fontAscent: Int16 = 0
+    var fontDescent: Int16 = 0
+    var fontLineGap: Int16 = 0     // The space the font puts between its lines.
+    var italicAngle: Int32 = 0     // The italic angle of the post table, as a 16.16 fixed number.
+    var bBoxLLx: Int16 = 0
+    var bBoxLLy: Int16 = 0
+    var bBoxURx: Int16 = 0
+    var bBoxURy: Int16 = 0
+    var firstChar = 32
+    var lastChar = 255
+    var capHeight: Int16 = 0
+    var fontUnderlinePosition: Int16 = 0
+    var fontUnderlineThickness: Int16 = 0
+    var advanceWidth: [UInt16] = []
+    var unicodeToGID = GlyphMap()
+    var unicodeOf: [Int32] = []     // The character of each glyph, see FontWriter.unicodeOfGlyphs
+    // The glyph and the advance width of each printable ASCII character,
+    // U+0020 to U+007E, that the font has, from setASCIIGlyphs: glyph 0 for one
+    // it lacks, which is looked up as any other character. Most text is
+    // these characters, and they skip the tests that glyphOf and
+    // advanceWidthOf make: a table of 2,546 pages took 37% longer in 9.0.7
+    // than in 9.0.1 (15 October 2026).
+    var asciiGID = [UInt16](repeating: 0, count: 95)
+    var asciiAdvance = [UInt16](repeating: 0, count: 95)
+    // asciiPlain is true for a printable ASCII character drawn once already,
+    // with its own glyph, so that it is not drawn as another character the
+    // next time either: the first character drawn with a glyph never changes.
+    var asciiPlain = [Bool](repeating: false, count: 95)
+    // The glyphs the font draws for more than one character, by glyph number:
+    // the only ones whose characters are recorded and looked at in plain text.
+    // Every character went through useChars and drawsAnyAsAnother, which made
+    // a 500-page Greek and Cyrillic text in Swift 30% slower, 113 ms where it
+    // took 87 (review #8 of 11 October; found 20 October 2026). Made when a
+    // character other than printable ASCII is first drawn.
+    lazy var sharedGlyph: [Bool] = unicodeToGID.sharedGlyphs()
+    // Where the marks go, from the GPOS table of the font, read when a mark
+    // is first drawn, or nil for a font without one.
+    var gpos: GPOS?
+    // How far apart pairs of glyphs go, from the GPOS table of the font, read
+    // when the kerning is turned on, or nil for a font without one.
+    var kernTables: Kerning?
+    var cff: Bool = false
+    var metrics: [[Int16]]?
+    // Tells the font program this font was read from apart from every other,
+    // so that a PDF embeds each one once.
+    var checksum: UInt64 = 0
+
+    // Don't change the following default values!
+    var size: Float = 12.0
+    var isCoreFont = false
+    var isCJK = false
+    var skew15 = false
+    var kernPairs = false
+    // True for Symbol and ZapfDingbats, whose characters are the codes of
+    // their own encodings, not WinAnsi.
+    private var symbolic = false
+
+    var ascent: Float = 0.0
+    var descent: Float = 0.0
+    var bodyHeight: Float = 0.0
+    var underlinePosition: Float = 0.0
+    var underlineThickness: Float = 0.0
+
+    ///
+    /// Constructor for the 14 standard fonts.
+    /// Creates a font object and adds it to the PDF.
+    ///
+    /// Examples:
+    ///
+    /// ```swift
+    /// let font1 = Font(pdf, CoreFont.HELVETICA)
+    /// let font2 = Font(pdf, CoreFont.TIMES_ITALIC)
+    /// let font3 = Font(pdf, CoreFont.ZAPF_DINGBATS)
+    /// ```
+    ///
+    /// - Parameter pdf: the PDF to add this font to.
+    /// - Parameter coreFont: the core font. Must be one the names defined in the CoreFont class.
+    /// - Throws: PDFjetError when the number is not one of the fourteen core fonts.
+    ///
+    public init(_ pdf: PDF, _ coreFont: Int) throws {
+        self.pdfIdentity = pdf.identity
+        self.compliance = pdf.compliance
+        let font = try CoreFont(coreFont)
+        self.isCoreFont = true
+        self.name = font.name!
+        self.bBoxLLx = font.bBoxLLx!
+        self.bBoxLLy = font.bBoxLLy!
+        self.bBoxURx = font.bBoxURx!
+        self.bBoxURy = font.bBoxURy!
+        self.metrics = font.metrics
+        self.symbolic = font.name == "Symbol" || font.name == "ZapfDingbats"
+        self.fontUnderlinePosition = Int16(font.underlinePosition!)
+        self.fontUnderlineThickness = Int16(font.underlineThickness!)
+        self.fontAscent = Int16(font.bBoxURy!)
+        self.fontDescent = Int16(font.bBoxLLy!)
+        setSize(size)
+
+        pdf.newObj()
+        pdf.append("<<\n")
+        pdf.append("/Type /Font\n")
+        pdf.append("/Subtype /Type1\n")
+        pdf.append("/BaseFont /")
+        pdf.append(self.name)
+        pdf.append("\n")
+        if self.name != "Symbol" && self.name != "ZapfDingbats" {
+            pdf.append("/Encoding /WinAnsiEncoding\n")
+        }
+        pdf.append(">>\n")
+        pdf.endObj()
+        self.objNumber = pdf.getObjNumber()
+
+        pdf.fonts.append(self)
+    }
+
+    // Used by PDFobj
+    init(_ coreFont: Int) throws {
+        let font = try CoreFont(coreFont)
+        self.isCoreFont = true
+        self.name = font.name!
+        self.bBoxLLx = font.bBoxLLx!
+        self.bBoxLLy = font.bBoxLLy!
+        self.bBoxURx = font.bBoxURx!
+        self.bBoxURy = font.bBoxURy!
+        self.metrics = font.metrics
+        self.symbolic = font.name == "Symbol" || font.name == "ZapfDingbats"
+        self.fontUnderlinePosition = Int16(font.underlinePosition!)
+        self.fontUnderlineThickness = Int16(font.underlineThickness!)
+        self.fontAscent = Int16(font.bBoxURy!)
+        self.fontDescent = Int16(font.bBoxLLy!)
+        setSize(size)
+    }
+
+    ///
+    /// Constructor for CJK - Chinese, Japanese and Korean fonts. The font is
+    /// not embedded: the PDF names it and the viewer supplies it, so a document
+    /// in it is a few kilobytes, where an embedded CJK font adds hundreds. The
+    /// viewer needs the Adobe Asian font pack, or a font of its own in its
+    /// place, and the text takes the shapes of the font it finds; Latin letters
+    /// and spaces are drawn full width; and a PDF with it cannot be PDF/A or
+    /// PDF/UA. See Example_05. To ship the glyphs with the document, use an
+    /// embedded font, such as IBM Plex Sans JP, KR, SC or TC: see Example_02
+    /// and Example_03.
+    ///
+    /// - Parameter pdf: the PDF to add this font to.
+    /// - Parameter font: the Chinese, Japanese or Korean font.
+    ///
+    public init(_ pdf: PDF, _ font: CJKFont) {
+        self.pdfIdentity = pdf.identity
+        self.compliance = pdf.compliance
+        var fontName: String?
+        if (font == CJKFont.ADOBE_MING_STD_LIGHT) {             // Chinese (Traditional) font
+            fontName = "AdobeMingStd-Light"
+        } else if (font == CJKFont.ST_HEITI_SC_LIGHT) {         // Chinese (Simplified) font
+            fontName = "STHeitiSC-Light"
+        } else if (font == CJKFont.KOZ_MIN_PRO_VI_REGULAR) {    // Japanese font
+            fontName = "KozMinProVI-Regular"
+        } else if (font == CJKFont.ADOBE_MYUNGJO_STD_MEDIUM) {  // Korean font
+            fontName = "AdobeMyungjoStd-Medium"
+        }
+        self.name = fontName!
+        self.isCJK = true
+        self.firstChar = 0x0020
+        self.lastChar = 0xFFEE
+        self.ascent = self.size
+        self.descent = self.ascent/4.0
+        self.bodyHeight = self.ascent + self.descent
+
+        // Font Descriptor
+        pdf.newObj()
+        pdf.append("<<\n")
+        pdf.append("/Type /FontDescriptor\n")
+        pdf.append("/FontName /")
+        pdf.append(fontName!)
+        pdf.append("\n")
+        pdf.append("/Flags 4\n")
+        pdf.append("/FontBBox [0 0 0 0]\n")
+        pdf.append(">>\n")
+        pdf.endObj()
+
+        // CIDFont Dictionary
+        pdf.newObj()
+        pdf.append("<<\n")
+        pdf.append("/Type /Font\n")
+        pdf.append("/Subtype /CIDFontType0\n")
+        pdf.append("/BaseFont /")
+        pdf.append(fontName!)
+        pdf.append("\n")
+        pdf.append("/FontDescriptor ")
+        pdf.append(pdf.getObjNumber() - 1)
+        pdf.append(" 0 R\n")
+        let ordering: String
+        let supplement: String
+        if fontName!.hasPrefix("AdobeMingStd") {
+            (ordering, supplement) = ("CNS1", "4")
+        } else if fontName!.hasPrefix("AdobeSongStd")
+                || fontName!.hasPrefix("STHeitiSC") {
+            (ordering, supplement) = ("GB1", "4")
+        } else if fontName!.hasPrefix("KozMinPro") {
+            (ordering, supplement) = ("Japan1", "4")
+        } else if fontName!.hasPrefix("AdobeMyungjoStd") {
+            (ordering, supplement) = ("Korea1", "1")
+        } else {
+            fatalError("Unsupported font: " + fontName!)
+        }
+        pdf.append("/CIDSystemInfo <<\n")
+        pdf.append("/Registry ")
+        pdf.appendLiteralString("Adobe")
+        pdf.append("\n")
+        pdf.append("/Ordering ")
+        pdf.appendLiteralString(ordering)
+        pdf.append("\n")
+        pdf.append("/Supplement ")
+        pdf.append(supplement)
+        pdf.append("\n")
+        pdf.append(">>\n")
+        pdf.append(">>\n")
+        pdf.endObj()
+
+        // Type0 Font Dictionary
+        pdf.newObj()
+        pdf.append("<<\n")
+        pdf.append("/Type /Font\n")
+        pdf.append("/Subtype /Type0\n")
+        pdf.append("/BaseFont /")
+        if fontName!.hasPrefix("AdobeMingStd") {
+            pdf.append(fontName! + "-UniCNS-UTF16-H\n")
+            pdf.append("/Encoding /UniCNS-UTF16-H\n")
+        } else if fontName!.hasPrefix("AdobeSongStd")
+                || fontName!.hasPrefix("STHeitiSC") {
+            pdf.append(fontName! + "-UniGB-UTF16-H\n")
+            pdf.append("/Encoding /UniGB-UTF16-H\n")
+        } else if fontName!.hasPrefix("KozMinPro") {
+            pdf.append(fontName! + "-UniJIS-UCS2-H\n")
+            pdf.append("/Encoding /UniJIS-UCS2-H\n")
+        } else if fontName!.hasPrefix("AdobeMyungjoStd") {
+            pdf.append(fontName! + "-UniKS-UCS2-H\n")
+            pdf.append("/Encoding /UniKS-UCS2-H\n")
+        } else {
+            fatalError("Unsupported font: " + fontName!)
+        }
+        pdf.append("/DescendantFonts [")
+        pdf.append(pdf.getObjNumber() - 1)
+        pdf.append(" 0 R]\n")
+        pdf.append(">>\n")
+        pdf.endObj()
+        self.objNumber = pdf.getObjNumber()
+
+        pdf.fonts.append(self)
+    }
+
+    /// Creates a font from an OpenType or TrueType font, a .otf or a .ttf, and
+    /// adds it to the objects of an existing PDF. It is embedded as a subset of
+    /// the glyphs drawn, when the objects are added to the PDF, unless
+    /// setSubset(false) keeps it whole.
+    public init(_ objects: inout [PDFobj], _ stream: InputStream) throws {
+        let bytes = try Content.getFromStream(stream)
+        try OpenTypeFont.register(&objects, self, bytes)
+        setSize(size)
+    }
+
+    ///
+    /// Constructor for OpenType and TrueType fonts, .otf and .ttf.
+    ///
+    /// - Parameter pdf: the PDF object that requires this font.
+    /// - Parameter stream: the input stream to read this font from.
+    ///
+    public init(_ pdf: PDF, _ stream: InputStream) throws {
+        self.pdfIdentity = pdf.identity
+        self.compliance = pdf.compliance
+        let bytes = try Content.getFromStream(stream)
+        try OpenTypeFont.register(pdf, self, bytes)
+        setSize(size)
+    }
+
+    /// Creates a font from an OpenType or TrueType font file, a .otf or a .ttf,
+    /// and adds it to the objects of an existing PDF. A path to one of the
+    /// fonts PDFjet carries, such as the constants of the font structs, is
+    /// read from the library when there is no such file, as by the
+    /// initializer that takes a PDF and a path.
+    ///
+    /// - Parameter objects: the objects of the PDF.
+    /// - Parameter fontPath: the font path.
+    /// - Throws: an error if the font cannot be read.
+    ///
+    public init(_ objects: inout [PDFobj], _ fontPath: String) throws {
+        let bytes = try Font.open(fontPath)
+        try OpenTypeFont.register(&objects, self, bytes)
+        setSize(size)
+    }
+
+    ///
+    /// Constructor for OpenType and TrueType fonts, .otf and .ttf files. A path
+    /// to one of the fonts PDFjet carries, such as the constants of the font
+    /// structs, fonts/IBMPlexSans/IBMPlexSans-Regular.otf for one, is read,
+    /// when there is no such file, from the folder resources/fonts of the
+    /// working directory, or else from the bundle of PDFjetFonts, which PDFjet
+    /// depends on; the fonts of the other scripts than the European ones, such
+    /// as IBMPlexSansJP.Regular and IBMPlexSansArabic.Regular, from
+    /// resources/fonts/world, or else from the product PDFjetFontsWorld, which
+    /// an app that draws in them adds, and such a font not found says so. The
+    /// fonts PDFjet carries are .otf files: a path to a .ttf of one of them,
+    /// such as fonts/IBMPlexSans/IBMPlexSans-Regular.ttf, that is not a file
+    /// throws, and names the .otf path and the constant to write.
+    ///
+    /// - Parameter pdf: the pdf object.
+    /// - Parameter fontPath: the font path.
+    /// - Throws: an error if the font cannot be read.
+    ///
+    public init(_ pdf: PDF, _ fontPath: String) throws {
+        self.pdfIdentity = pdf.identity
+        self.compliance = pdf.compliance
+        let bytes = try Font.open(fontPath)
+        try OpenTypeFont.register(pdf, self, bytes)
+        setSize(size)
+    }
+
+    // Returns the bytes of the font file of the path, in one read, as Java, C#
+    // and Go read it, or, when there is no such file, of the font of that
+    // name that PDFjet carries, from resources/fonts or the bundle of
+    // PDFjetFonts, or of PDFjetFontsWorld for a font of resources/fonts/world;
+    // a font it does not carry throws, and so does a font of
+    // resources/fonts/world of an app without PDFjetFontsWorld, saying to add
+    // it.
+    static func open(_ fontPath: String) throws -> [UInt8] {
+        if !FileManager.default.fileExists(atPath: fontPath) {
+            if let url = BundledFonts.url(fontPath), let data = try? Data(contentsOf: url) {
+                return [UInt8](data)
+            }
+            if let message = BundledFonts.otfInstead(fontPath) {
+                throw PDFjetError(message: message)
+            }
+            if let message = BundledFonts.worldMissing(fontPath) {
+                throw PDFjetError(message: message)
+            }
+            let path = fontPath.replacingOccurrences(of: "\\", with: "/")
+            if path.hasPrefix("fonts/") || path.contains("/fonts/") {
+                throw PDFjetError(message: notCarried(fontPath))
+            }
+        }
+        guard let data = FileManager.default.contents(atPath: fontPath) else {
+            throw PDFjetError(message: "Font file not found: " + fontPath)
+        }
+        return [UInt8](data)
+    }
+
+    // The message of a font path that is not a file, nor a font in
+    // resources/fonts or the bundles of the fonts PDFjet carries.
+    static func notCarried(_ fontPath: String) -> String {
+        return fontPath + " is not a file, nor one of the fonts PDFjet carries: use a font file of your own."
+    }
+
+    // Returns a number that identifies the font program: the units it is drawn
+    // in, its advance widths and its character map, which say what its glyphs
+    // are and which glyph each character has. Two fonts of one name that give
+    // the same number are the same program, whether it was read from a .otf
+    // or a .ttf file, and the PDF embeds it once and writes one
+    // descriptor, one CID font and one ToUnicode map for both. The name is
+    // not enough on its own: PDFjet ships subsets of the Noto CJK fonts under
+    // the name of the whole font, and the text of the one embedded second was
+    // drawn with the glyphs of the first.
+    static func checksumOf(_ font: Font) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        hash = fold(hash, font.unitsPerEm)
+        hash = fold(hash, font.advanceWidth.count)
+        for width in font.advanceWidth {
+            hash = fold(hash, Int(width))
+        }
+        // Each block of 256 characters the font has glyphs in, its number and
+        // the glyph of each character, 0 for those the font has not; the
+        // blocks it has none in, most of them, are left out
+        return font.unicodeToGID.fold(hash, fold)
+    }
+
+    // One step of the FNV-1a hash, which is the same in the four ports.
+    static func fold(_ hash: UInt64, _ value: Int) -> UInt64 {
+        return (hash ^ UInt64(UInt32(truncatingIfNeeded: value))) &* 0x100000001b3
+    }
+
+    ///
+    /// Sets the size of this font.
+    ///
+    /// - Parameter fontSize: specifies the size of this font.
+    /// - Returns: the font.
+    ///
+    @discardableResult
+    public func setSize(_ fontSize: Float) -> Font {
+        self.size = fontSize
+        if (isCJK) {
+            self.ascent = size
+            self.descent = ascent/4
+            self.bodyHeight = self.ascent + self.descent
+            return self
+        }
+        self.ascent = Float(fontAscent) * size / Float(unitsPerEm)
+        self.descent = -Float(fontDescent) * size / Float(unitsPerEm)
+        self.bodyHeight = self.ascent + self.descent
+        self.underlineThickness =
+                (Float(fontUnderlineThickness) * size / Float(unitsPerEm))
+        self.underlinePosition =
+                -(Float(fontUnderlinePosition) * size / Float(unitsPerEm)) + Float(underlineThickness) / 2.0
+        return self
+    }
+
+    ///
+    /// Returns the current font size.
+    ///
+    /// - Returns: the current size of the font.
+    ///
+    public func getSize() -> Float {
+        return self.size
+    }
+
+    /// Returns the name of this font.
+    public func getName() -> String {
+        return self.name
+    }
+
+    ///
+    /// Turns the kerning of the font on or off: the pairs of letters that go
+    /// closer together or further apart, as AV and To. A standard font kerns
+    /// with the pairs of its metrics; an OpenType or TrueType font with the
+    /// kern feature of its GPOS table. Off by default, as text that does not
+    /// ask for it is as fast as it was. A kerned font measures its text as it
+    /// draws it: stringWidth, the wrapping and the alignment of TextLine,
+    /// TextBlock and the table cells count the pairs. Right to left text and
+    /// marks are not kerned.
+    ///
+    /// - Parameter kernPairs: if 'true' the kerning for this font is enabled.
+    ///
+    @discardableResult
+    public func setKernPairs(_ kernPairs: Bool) -> Font {
+        // The pairs are read now, so that measuring text does not change the font
+        if kernPairs {
+            kernTables?.readTables(self)
+        }
+        self.kernPairs = kernPairs
+        return self
+    }
+
+    // Returns true if the font is an embedded font whose kerning is on and
+    // that has pairs to kern with, from its GPOS table.
+    func kerns() -> Bool {
+        return kernPairs && kernTables != nil && !isCoreFont && !isCJK
+    }
+
+    // Returns how far the second glyph moves after the first, in font units,
+    // when both are drawn one after the other: 0 for a pair with a mark or a
+    // right to left letter, which shaping places, and for a glyph of no
+    // character, as .notdef.
+    func glyphKerning(_ first: Int, _ second: Int) -> Int {
+        return kernTables!.glyphPair(first, second)
+    }
+
+    // Returns the glyph the character is drawn with, or -1 when it is not
+    // drawn: an RLM, LRM, byte order mark or a character isIgnorable returns
+    // true for is not, nor a ZWNJ or ZWJ the font has no glyph for. Page draws
+    // the glyphs it gives, and the kerning measures the pairs of the same
+    // glyphs, so the two decide it in this one place.
+    func drawnGlyph(_ codePoint: Int) -> Int {
+        if codePoint >= 0x20 && codePoint < 0x7F && asciiGID[codePoint - 0x20] != 0 {
+            return Int(asciiGID[codePoint - 0x20])
+        }
+        if codePoint == 0x200E || codePoint == 0x200F || codePoint == 0xFEFF || Font.isIgnorable(codePoint) {
+            return -1
+        }
+        if (codePoint == 0x200C || codePoint == 0x200D) && unicodeToGID[codePoint] == 0 {
+            return -1
+        }
+        return Page.glyphOf(self, codePoint)
+    }
+
+    // What stringWidth sums of a text, kept so that TextBlock can measure a
+    // line as it grows, a word at a time, rather than the whole line again for
+    // each word: its advances and its kerning in font units, and the first and
+    // last glyph drawn, between which the kerning of two texts joined is.
+    struct Run {
+        var advance = 0
+        var kerning = 0
+        var first = -1
+        var last = -1
+    }
+
+    // Returns true if stringWidth of this font sums whole font units, so that
+    // a width can be made of runs: a font read from a .ttf or an .otf.
+    func measuresByRuns() -> Bool {
+        return !isCoreFont && !isCJK
+    }
+
+    // Returns the run of the text, what stringWidth sums of it.
+    func run(_ text: String) -> Run {
+        var r = Run()
+        for scalar in text.unicodeScalars {
+            let codePoint = Int(scalar.value)
+            if codePoint >= 0x20 && codePoint < 0x7F && asciiGID[codePoint - 0x20] != 0 {
+                r.advance += Int(asciiAdvance[codePoint - 0x20])
+            } else {
+                r.advance += advanceWidthOf(codePoint)
+            }
+        }
+        let kerned = kerns()
+        for scalar in text.unicodeScalars {
+            let gid = drawnGlyph(Int(scalar.value))
+            if gid < 0 {
+                continue
+            }
+            if r.first < 0 {
+                r.first = gid
+            } else if kerned {
+                r.kerning += glyphKerning(r.last, gid)
+            }
+            r.last = gid
+        }
+        return r
+    }
+
+    // Returns the run of two texts, one after the other.
+    func joinRuns(_ a: Run, _ b: Run) -> Run {
+        var r = Run(advance: a.advance + b.advance, kerning: a.kerning + b.kerning,
+                first: a.first >= 0 ? a.first : b.first, last: b.last >= 0 ? b.last : a.last)
+        if kerns() && a.last >= 0 && b.first >= 0 {
+            r.kerning += glyphKerning(a.last, b.first)
+        }
+        return r
+    }
+
+    // Returns the width of the run at the font size, the width stringWidth
+    // gives of its text to the bit, or -1 when its units are too many to be
+    // made a Float exactly: stringWidth sums them as an Int and makes the sum
+    // a Float, exact below 2^24.
+    func runWidth(_ r: Run, _ fontSize: Float) -> Float {
+        let units = r.advance + r.kerning
+        if r.advance >= (1 << 24) || r.kerning >= (1 << 24) || r.kerning <= -(1 << 24)
+                || units >= (1 << 24) || units <= -(1 << 24) {
+            return -1.0
+        }
+        var width = Float(r.advance)
+        if kerns() {
+            width += Float(r.kerning)
+        }
+        return width * fontSize / Float(self.unitsPerEm)
+    }
+
+    // Returns the kerning of the text, in font units: the sum of the pairs of
+    // the glyphs drawn one after the other.
+    func textKerning(_ text: String) -> Int {
+        var total = 0
+        var previous = -1
+        for scalar in text.unicodeScalars {
+            let gid = drawnGlyph(Int(scalar.value))
+            if gid < 0 {
+                continue
+            }
+            if previous >= 0 {
+                total += glyphKerning(previous, gid)
+            }
+            previous = gid
+        }
+        return total
+    }
+
+    /// Sets whether this font is embedded as a subset, the outlines of the
+    /// glyphs the document does not draw left out, which is the default for a
+    /// .ttf or a .otf. A font whose license does not allow subsetting, by the
+    /// fsType of its OS/2 table, is embedded whole. Fonts read from one file are
+    /// one font program in the PDF: kept whole for one, the program is whole for
+    /// all of them. It must be called before complete(), and for a font added to
+    /// the objects of an existing PDF, before the objects are added to the PDF.
+    ///
+    /// - Parameter subset: false to embed the font whole.
+    ///
+    @discardableResult
+    public func setSubset(_ subset: Bool) -> Font {
+        program?.whole = !subset
+        return self
+    }
+
+    // Whether the font is not written into the document: drawGlyphs alone
+    // drew with it, as outlines, which need no font.
+    func outlinesOnly() -> Bool {
+        return drawnAsOutlines && !referenced
+    }
+
+    // Records that the glyph is drawn with the font.
+    func useGlyph(_ gid: Int) {
+        program?.used.add(gid)
+    }
+
+    // Marks the glyphs used, as useGlyph marks each, in one access to the
+    // program's table.
+    func useGlyphs(_ gids: [Int]) {
+        program?.used.add(gids)
+    }
+
+    // Records that the glyph is drawn for the character, so that the ToUnicode
+    // map gives the glyph the character the document drew, where the font
+    // draws several characters with one glyph: it gave the glyph the lowest of
+    // them, and a Persian ۱ was copied as an Arabic ١ (review of 11 October
+    // 2026, #8). The first character drawn with the glyph is kept; the others
+    // drawn with it are given their own as actual text, see drawnAsAnother.
+    func useChar(_ c: Int, _ gid: Int) {
+        if let program = program, gid > 0, unicodeToGID[c] == gid {
+            program.chars.use(gid, c)
+        }
+    }
+
+    // Records the characters drawn with the glyphs, as useChar records each,
+    // in one access to the font's table and the program's.
+    func useChars(_ codePoints: [Int], _ gids: [Int]) {
+        guard let program = program else {
+            return
+        }
+        let table = unicodeToGID
+        var chars = program.chars
+        program.chars = GlyphChars()    // So that chars is not copied when changed
+        for (c, gid) in zip(codePoints, gids) where gid > 0 && table[c] == gid {
+            chars.use(gid, c)
+        }
+        program.chars = chars
+    }
+
+    // Returns true if the glyph of the character is drawn for another
+    // character too, which the ToUnicode map gives the glyph: the character is
+    // then drawn in a span with itself as its actual text. A document that drew
+    // "١٢٣" and then "۱۲۳" copied the second as "١۲٣" (review of 12 October
+    // 2026, R15). A character copied as the other is not, as an Arabic letter
+    // and its form: ل and its isolated form both copy as ل, and Arabic text
+    // had three times the spans it needed, its content 27% larger (review of
+    // 12 October 2026, T2).
+    func drawnAsAnother(_ c: Int) -> Bool {
+        guard let first = program?.chars.first(unicodeToGID[c]) else {
+            return false
+        }
+        return first >= 0 && first != c && !Font.sameLetters(first, c)
+    }
+
+    // Returns true if the two characters copy as the same text: the letters of
+    // a presentation form, as the ToUnicode map gives them.
+    static func sameLetters(_ a: Int, _ b: Int) -> Bool {
+        let la = Bidi.lettersOf(UInt32(a)) ?? [UInt32(a)]
+        let lb = Bidi.lettersOf(UInt32(b)) ?? [UInt32(b)]
+        return la == lb
+    }
+
+    // Returns true if drawnAsAnother is true for one of the characters, in one
+    // access to the font's table and the program's.
+    func drawsAnyAsAnother(_ codePoints: [Int]) -> Bool {
+        guard let chars = program?.chars, !chars.isEmpty else {
+            return false
+        }
+        let table = unicodeToGID
+        for c in codePoints {
+            let first = chars.first(table[c])
+            if first >= 0, first != c, !Font.sameLetters(first, c) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Returns the width of the string at the current font size.
+    public func stringWidth(_ str: String?) -> Float {
+        return stringWidth(self.size, str)
+    }
+
+    ///
+    /// Returns the width of the specified string when drawn with this font at the specified font size.
+    ///
+    /// - Parameter fontSize: the font size.
+    /// - Parameter str: the specified string.
+    ///
+    /// - Returns: the width of the string.
+    ///
+    public func stringWidth(_ fontSize: Float, _ str: String?) -> Float {
+        var width: Int = 0
+        if str == nil || str == "" {
+            return 0.0
+        }
+
+        if isCJK {
+            // Every glyph of a CJK font is as wide as the font size, and the
+            // characters not drawn take no width.
+            let drawn = str!.unicodeScalars.reduce(0) { $0 + (Font.isNotDrawn($1.value) ? 0 : 1) }
+            return Float(drawn) * fontSize
+        }
+
+        // The characters are gone through as they are, with no array of them
+        // made for each string that is measured.
+        if self.isCoreFont {
+            var previous = -1
+            for scalar in str!.unicodeScalars {
+                if notDrawn(scalar.value) {
+                    continue    // See withoutIgnorables
+                }
+                let c1 = coreFontCode(scalar.value)
+                width += Int(metrics![c1 - 32][1])
+                if self.kernPairs && previous != -1 {
+                    width += kerning(previous, c1)
+                }
+                previous = c1
+            }
+        } else {
+            // The font's tables read once, not for each character, the
+            // widths those advanceWidthOf gives
+            let table = unicodeToGID
+            let widths = advanceWidth
+            let first = firstChar
+            let last = lastChar
+            let asciiGIDs = asciiGID
+            let asciiWidths = asciiAdvance
+            var missing = -1    // The glyph of a character the font lacks, looked up once
+            for scalar in str!.unicodeScalars {
+                let codePoint = Int(scalar.value)
+                if codePoint >= 0x20 && codePoint < 0x7F && asciiGIDs[codePoint - 0x20] != 0 {
+                    width += Int(asciiWidths[codePoint - 0x20])
+                    continue
+                }
+                if Font.isJoinerOrRLM(scalar.value) || codePoint == 0xFEFF || Font.isIgnorable(codePoint) {
+                    continue
+                }
+                var gid: Int
+                if Font.isControl(codePoint) {
+                    gid = table[0x0020]
+                } else if codePoint < first || codePoint > last || table[codePoint] == 0 {
+                    if missing < 0 {
+                        missing = missingGlyph()
+                    }
+                    gid = missing
+                } else {
+                    gid = table[codePoint]
+                }
+                width += Int(widths[min(gid, widths.count - 1)])
+            }
+            if kerns() {
+                width += textKerning(str!)
+            }
+        }
+
+        return Float(width) * fontSize / Float(self.unitsPerEm)
+    }
+
+    // Returns the advance width, in font units, of the glyph that Page draws
+    // for the character, the one glyphOf gives: none for an RLM, LRM, ZWNJ,
+    // ZWJ or byte order mark, which are not drawn, that of a space for a
+    // control character and that of the glyph missingGlyph gives for a
+    // character the font does not have.
+    private func advanceWidthOf(_ codePoint: Int) -> Int {
+        if Font.isJoinerOrRLM(UInt32(codePoint)) || codePoint == 0xFEFF || Font.isIgnorable(codePoint) {
+            return 0
+        }
+        return glyphAdvance(Page.glyphOf(self, codePoint))
+    }
+
+    // Reads the glyph and the advance width of each printable ASCII character
+    // the font has into asciiGID and asciiAdvance, once its character map and
+    // its widths are read. They are those glyphOf and advanceWidthOf give:
+    // none of these characters is a control character, an ignorable one or a
+    // mark.
+    func setASCIIGlyphs() {
+        if advanceWidth.isEmpty {
+            return
+        }
+        for c in 0x20..<0x7F where !lacks(c) {
+            let gid = unicodeToGID[c]
+            asciiGID[c - 0x20] = UInt16(gid)
+            asciiAdvance[c - 0x20] = UInt16(glyphAdvance(gid))
+        }
+    }
+
+    // Returns the advance width of the glyph, in font units. A font can list
+    // fewer advance widths than it has glyphs, and the glyphs past the end have
+    // the width of the last one, as OpenType says and the PDF font's /DW does.
+    func glyphAdvance(_ gid: Int) -> Int {
+        return Int(advanceWidth[min(gid, advanceWidth.count - 1)])
+    }
+
+    // Returns true if the font has a glyph for the character, so that it is
+    // not drawn with .notdef and the fallback font is not needed for it. A
+    // character past the end of the glyph table of the font, like an emoji,
+    // has none. A control character is drawn as a space, and a core font has
+    // the characters of its encoding.
+    func hasGlyph(_ codePoint: Int) -> Bool {
+        let codePoint = Font.isControl(codePoint) ? 0x20 : codePoint
+        if isCoreFont {
+            return codePoint == 32 || coreFontCode(UInt32(codePoint)) != 32
+        }
+        return !isCJK && !lacks(codePoint)
+    }
+
+    // Returns true if the font has no glyph for the character, which is not a
+    // control character. The character map of the font is read from its first
+    // to its last character, so a character outside that range has no glyph.
+    func lacks(_ codePoint: Int) -> Bool {
+        if Font.isControl(codePoint) {
+            return false
+        }
+        return codePoint < firstChar || codePoint > lastChar || unicodeToGID[codePoint] == 0
+    }
+
+    // Returns the glyph a character the font does not have is drawn with:
+    // .notdef, glyph 0, in a document of no compliance. PDF/UA and PDF/A
+    // forbid .notdef -- ISO 14289-1 7.21.8 and ISO 19005-2 6.2.11.8 -- so a
+    // compliant document draws the replacement character U+FFFD of the font,
+    // or a question mark, or a space, the first the font has, and the
+    // character is its actual text. A font of a PDF that was read is of no
+    // compliance.
+    func missingGlyph() -> Int {
+        if compliance == Compliance.PDF_1_7 {
+            return 0
+        }
+        for codePoint in [0xFFFD, 0x3F, 0x20] where !lacks(codePoint) {
+            return unicodeToGID[codePoint]
+        }
+        return 0
+    }
+
+    // Returns the font, of the font and its fallback font, that draws the
+    // character at index i of the scalars, when the character before it is
+    // drawn with the active font: the font when it has a glyph for the
+    // character, else the fallback font when that has one, else the font. A
+    // combining mark stays with the character before it when that font has it,
+    // and an RLM, LRM, ZWNJ or ZWJ goes with the character after it.
+    static func fontOf(
+            _ font: Font,
+            _ fallbackFont: Font,
+            _ active: Font,
+            _ scalars: String.UnicodeScalarView,
+            _ i: String.UnicodeScalarView.Index) -> Font {
+        var scalar = scalars[i]
+        if i > scalars.startIndex && scalar.properties.generalCategory == .nonspacingMark &&
+                active.hasGlyph(Int(scalar.value)) {
+            return active
+        }
+        let after = scalars.index(after: i)
+        if Font.isJoinerOrRLM(scalar.value) && after < scalars.endIndex {
+            scalar = scalars[after]
+        }
+        if font.hasGlyph(Int(scalar.value)) || !fallbackFont.hasGlyph(Int(scalar.value)) {
+            return font
+        }
+        return fallbackFont
+    }
+
+    ///
+    /// Returns the ascent of this font.
+    ///
+    /// - Returns: the ascent of the font.
+    ///
+    public func getAscent() -> Float {
+        return self.ascent
+    }
+
+    ///
+    /// Returns the descent of this font.
+    ///
+    /// - Returns: the descent of the font.
+    ///
+    public func getDescent() -> Float {
+        return self.descent
+    }
+
+    /// Returns the ascent at the specified font size.
+    public func getAscent(_ fontSize: Float) -> Float {
+        if isCJK {
+            return fontSize
+        }
+        return Float(fontAscent) * fontSize / Float(unitsPerEm)
+    }
+
+    /// Returns the descent at the specified font size.
+    public func getDescent(_ fontSize: Float) -> Float {
+        if isCJK {
+            return fontSize/4
+        }
+        return -Float(fontDescent) * fontSize / Float(unitsPerEm)
+    }
+
+    /// Returns the line gap of this font at the specified size: the space the
+    /// font puts between the descent of a line and the ascent of the next one.
+    /// It is 0 for most fonts, which leave that space in their ascent and
+    /// descent, and 1 em for the Japanese and Chinese IBM Plex fonts, whose
+    /// ascent and descent add up to 1 em.
+    public func getLineGap(_ fontSize: Float) -> Float {
+        if isCJK {
+            return 0.0
+        }
+        return Float(fontLineGap) * fontSize / Float(unitsPerEm)
+    }
+
+    ///
+    /// Returns the height of the body of this font at its current size.
+    ///
+    /// - Returns: the height of the body of the font.
+    ///
+    public func getBodyHeight() -> Float {
+        return self.bodyHeight
+    }
+
+    /// Returns the ascent plus the descent at the specified font size.
+    public func getBodyHeight(_ fontSize: Float) -> Float {
+        return getAscent(fontSize) + getDescent(fontSize)
+    }
+
+    /// Returns the underline thickness at the specified font size.
+    public func getUnderlineThickness(_ fontSize: Float) -> Float {
+        return Float(fontUnderlineThickness) * fontSize / Float(unitsPerEm)
+    }
+
+    /// Returns the underline position at the specified font size.
+    public func getUnderlinePosition(_ fontSize: Float) -> Float {
+        return -(Float(fontUnderlinePosition) * fontSize / Float(unitsPerEm))
+                + getUnderlineThickness(fontSize) / 2.0
+    }
+
+    /// Returns the underline thickness at the current font size.
+    public func getUnderlineThickness() -> Float {
+        return self.underlineThickness
+    }
+
+    /// Returns the underline position at the current font size.
+    public func getUnderlinePosition() -> Float {
+        return self.underlinePosition
+    }
+
+    ///
+    /// Returns the number of characters from the specified string that will fit within the specified width.
+    /// They are counted in Unicode scalars, so that the first n of str.unicodeScalars are the text that
+    /// fits; Java and C# count UTF-16 chars, where a character outside the Basic Multilingual Plane is two.
+    ///
+    /// - Parameter str: the specified string.
+    /// - Parameter width: the specified width.
+    ///
+    /// - Returns: the number of characters that will fit.
+    ///
+    public func getFitChars(
+            _ str: String,
+            _ width: Float) -> Int {
+        // Text of no size has no width, and all of it fits in any width.
+        if size <= 0 {
+            return width < 0 ? 0 : str.unicodeScalars.count
+        }
+        var w = width * Float(unitsPerEm) / size
+        if isCJK {
+            // Every glyph of a CJK font is as wide as the font size. Int() of a
+            // NaN or infinite width stopped the program (review of 12 October
+            // 2026, R12).
+            // The characters not drawn take no width.
+            let fit = width / size
+            if !(fit > 0) {
+                return 0
+            }
+            let scalars = Array(str.unicodeScalars)
+            if fit >= Float(scalars.count) {
+                return scalars.count
+            }
+            var room = Int(fit)
+            var i = 0
+            while i < scalars.count {
+                if !Font.isNotDrawn(scalars[i].value) {
+                    if room == 0 {
+                        break
+                    }
+                    room -= 1
+                }
+                i += 1
+            }
+            return i
+        }
+        if isCoreFont {
+            return getCoreFontFitChars(str, w)
+        }
+        if kerns() {
+            return getKernedFitChars(str, w)
+        }
+        var i = 0
+        for scalar in str.unicodeScalars {
+            w -= Float(advanceWidthOf(Int(scalar.value)))
+            if w < 0 {
+                break
+            }
+            i += 1
+        }
+        return i
+    }
+
+    // Returns the number of characters that fit in the width, in font units,
+    // of a kerned font: each with its kerning with the character drawn before
+    // it, as stringWidth measures it. A pair kerned wider takes its room only
+    // when its second character is there.
+    private func getKernedFitChars(_ str: String, _ width: Float) -> Int {
+        var w = width
+        var previous = -1
+        var i = 0
+        for scalar in str.unicodeScalars {
+            var advance = advanceWidthOf(Int(scalar.value))
+            let gid = drawnGlyph(Int(scalar.value))
+            if gid >= 0 {
+                if previous >= 0 {
+                    advance += glyphKerning(previous, gid)
+                }
+                previous = gid
+            }
+            w -= Float(advance)
+            if w < 0 {
+                break
+            }
+            i += 1
+        }
+        return i
+    }
+
+    private func getCoreFontFitChars(
+            _ str: String,
+            _ width: Float) -> Int {
+        var w: Float = width
+        let scalars = Array(str.unicodeScalars)
+        var previous = -1
+        var i: Int = 0
+        while i < scalars.count {
+            if notDrawn(scalars[i].value) {
+                i += 1
+                continue
+            }
+            let c1 = coreFontCode(scalars[i].value)
+            var advance = Float(metrics![c1 - 32][1])
+            // The kerning is with the character drawn before, as
+            // stringWidth's is, and takes its room only when this one is there.
+            if kernPairs && previous >= 0 {
+                advance += Float(kerning(previous, c1))
+            }
+            previous = c1
+            w -= advance
+            if w < 0 {
+                return i
+            }
+            i += 1
+        }
+        return i
+    }
+
+    // Returns the characters without those a core font of WinAnsi does not
+    // draw or measure, as no font does: the soft hyphen, as WinAnsi has a
+    // hyphen at its code, and a line broken at a soft hyphen ends with a hyphen
+    // of its own (review of 11 October 2026, #21), and the other characters not
+    // drawn, the marks of direction, the joiners, the byte order mark and those
+    // isIgnorable returns true for, which were drawn as spaces (review of 12
+    // October 2026, R14). Symbol and ZapfDingbats keep theirs, their codes
+    // being their characters.
+    func withoutIgnorables(_ scalars: [Unicode.Scalar]) -> [Unicode.Scalar] {
+        if !scalars.contains(where: { notDrawn($0.value) }) {
+            return scalars
+        }
+        return scalars.filter { !notDrawn($0.value) }
+    }
+
+    // Returns true for a character that a core font of WinAnsi does not draw
+    // or measure, see withoutIgnorables.
+    private func notDrawn(_ value: UInt32) -> Bool {
+        return !symbolic && Font.isNotDrawn(value)
+    }
+
+    // Returns true for a character a font that is not embedded, a core font of
+    // WinAnsi or a CJK font, does not draw or measure: the marks of direction,
+    // the joiners, the byte order mark and those isIgnorable returns true for, the
+    // soft hyphen among them. A CJK font drew each 1 em wide (review of 12
+    // October 2026, R20).
+    static func isNotDrawn(_ value: UInt32) -> Bool {
+        return Font.isIgnorable(Int(value)) || Font.isJoinerOrRLM(value) || value == 0xFEFF
+    }
+
+    /// Returns the code of the character in the encoding of this core font:
+    /// WinAnsi, which puts ’ at 146, “ and ” at 147 and 148, the dashes at 150
+    /// and 151 and € at 128, or, for Symbol and ZapfDingbats, the character
+    /// itself. A character that is not in the encoding is drawn as a space.
+    func coreFontCode(_ scalar: UInt32) -> Int {
+        var cp = Int(scalar)
+        if !symbolic {
+            cp = Font.winAnsiCode(cp)
+        }
+        return (cp < 32 || cp > 255) ? 32 : cp
+    }
+
+    // The WinAnsi code of the character: the character itself below 127 and
+    // from 160 to 255, the code of the character WinAnsi puts from 128 to 159,
+    // and a space for any other character, the controls U+007F to U+009F too.
+    // WinAnsi draws a bullet at 127, ISO 32000, Annex D, where the widths of
+    // the core fonts have a space.
+    private static func winAnsiCode(_ cp: Int) -> Int {
+        if cp < 0x7F || (cp >= 0xA0 && cp <= 0xFF) {
+            return cp
+        }
+        switch cp {
+        case 0x20AC: return 128    // €
+        case 0x201A: return 130    // ‚
+        case 0x0192: return 131    // ƒ
+        case 0x201E: return 132    // „
+        case 0x2026: return 133    // …
+        case 0x2020: return 134    // †
+        case 0x2021: return 135    // ‡
+        case 0x02C6: return 136    // ˆ
+        case 0x2030: return 137    // ‰
+        case 0x0160: return 138    // Š
+        case 0x2039: return 139    // ‹
+        case 0x0152: return 140    // Œ
+        case 0x017D: return 142    // Ž
+        case 0x2018: return 145    // ‘
+        case 0x2019: return 146    // ’
+        case 0x201C: return 147    // “
+        case 0x201D: return 148    // ”
+        case 0x2022: return 149    // •
+        case 0x2013: return 150    // –
+        case 0x2014: return 151    // —
+        case 0x02DC: return 152    // ˜
+        case 0x2122: return 153    // ™
+        case 0x0161: return 154    // š
+        case 0x203A: return 155    // ›
+        case 0x0153: return 156    // œ
+        case 0x017E: return 158    // ž
+        case 0x0178: return 159    // Ÿ
+        default: return 32
+        }
+    }
+
+    /// Returns the kerning of a pair of characters of this core font, in 1/1000
+    /// of the font size: negative when the second character moves closer to the
+    /// first, and 0 when the font has no kerning for the pair.
+    func kerning(_ c1: Int, _ c2: Int) -> Int {
+        let row = metrics![c1 - 32]
+        var j = 2
+        while j < row.count {
+            if Int(row[j]) == c2 {
+                return Int(row[j + 1])
+            }
+            j += 2
+        }
+        return 0
+    }
+
+    ///
+    /// Sets the skew15 private variable.
+    /// When the variable is set to 'true' all glyphs in the font are skewed on 15 degrees.
+    /// This makes a regular font look like an italic type font.
+    /// Use this method when you don't have real italic font in the font family,
+    /// or when you want to generate smaller PDF files.
+    /// For example you could embed only the Regular and Bold fonts and synthesize the RegularItalic and BoldItalic.
+    ///
+    /// - Parameter skew15: the skew flag.
+    ///
+    @discardableResult
+    public func setItalic(_ skew15: Bool) -> Font {
+        self.skew15 = skew15
+        return self
+    }
+
+    ///
+    /// Returns the width of the string at the current font size,
+    /// using the fallback font for characters this font does not have.
+    ///
+    public func stringWidth(_ fallbackFont: Font?, _ str: String?) -> Float {
+        return stringWidth(fallbackFont, self.size, str)
+    }
+
+    ///
+    /// Returns the width of a string drawn using two fonts.
+    ///
+    /// - Parameter fallbackFont: the fallback font.
+    /// - Parameter fontSize: the font size.
+    /// - Parameter str: the string.
+    /// - Returns: the width.
+    ///
+    public func stringWidth(_ fallbackFont: Font?, _ fontSize: Float, _ str: String?) -> Float {
+        return stringWidth(fallbackFont, fontSize, fontSize, str)
+    }
+
+    // Returns the width of a string drawn using two fonts, with the characters
+    // in the fallback font at the fallback font size.
+    func stringWidth(_ fallbackFont: Font?, _ fontSize: Float, _ fallbackFontSize: Float, _ str: String?) -> Float {
+        var width: Float = 0.0
+        // A fallback font that is the font itself measures every character
+        // with the font, as with no fallback font
+        if str == nil || self.isCJK || fallbackFont == nil || fallbackFont!.isCJK ||
+                (fallbackFont === self && fallbackFontSize == fontSize) {
+            return stringWidth(fontSize, str)
+        }
+        var activeFont = self
+        var activeSize = fontSize
+        // The runs of text drawn with one font are the pieces of the string
+        // between the characters that switch fonts, so measuring them copies
+        // nothing per character: a string that is all in the primary font is
+        // one piece, the string itself.
+        let scalars = str!.unicodeScalars
+        var start = scalars.startIndex
+        var i = scalars.startIndex
+        while i < scalars.endIndex {
+            let charFont = Font.fontOf(self, fallbackFont!, activeFont, scalars, i)
+            if charFont !== activeFont {
+                width += activeFont.stringWidth(activeSize, String(scalars[start..<i]))
+                start = i
+                activeFont = charFont
+                activeSize = (activeFont === self) ? fontSize : fallbackFontSize
+            }
+            i = scalars.index(after: i)
+        }
+        if start == scalars.startIndex {
+            return width + activeFont.stringWidth(activeSize, str!)
+        }
+        return width + activeFont.stringWidth(activeSize, String(scalars[start...]))
+    }
+
+    // Returns true for the right-to-left and left-to-right marks and the zero
+    // width non-joiner and joiner, which are not drawn: Page gives the glyph
+    // before or after them an actual text.
+    static func isJoinerOrRLM(_ value: UInt32) -> Bool {
+        return value == 0x200F || value == 0x200E || value == 0x200C || value == 0x200D
+    }
+
+    // Returns true for a character that Unicode says is not drawn when a font
+    // has no glyph for it, Default_Ignorable_Code_Point, but those that Page
+    // treats on their own: the marks of direction, the joiners and the byte
+    // order mark. A variation selector after ™ or ©, as text pasted from a
+    // phone has, a zero width space or a word joiner was drawn as a box with a
+    // width (review of 11 October 2026, #9); it takes no width, and nothing is
+    // drawn for it. The soft hyphen is one too: a line broken at it ends with
+    // a hyphen that TextBlock, TextFrame and a table's cells put there, and it
+    // was drawn as a hyphen wherever it was (#21).
+    static func isIgnorable(_ ch: Int) -> Bool {
+        if ch == 0x00AD {
+            return true
+        }
+        if ch < 0x034F || (ch > 0x034F && ch < 0x061C) || (ch > 0x3164 && ch < 0xFE00) {
+            return false    // Greek, Cyrillic, Hebrew, the CJK ideographs and Hangul at once
+        }
+        return ch == 0x034F || ch == 0x061C || ch == 0x115F || ch == 0x1160 || ch == 0x17B4 || ch == 0x17B5 ||
+                (ch >= 0x180B && ch <= 0x180F) || ch == 0x200B || (ch >= 0x202A && ch <= 0x202E) ||
+                (ch >= 0x2060 && ch <= 0x206F) || ch == 0x3164 || (ch >= 0xFE00 && ch <= 0xFE0F) || ch == 0xFFA0 ||
+                (ch >= 0xFFF0 && ch <= 0xFFF8) || (ch >= 0x1BCA0 && ch <= 0x1BCA3) ||
+                (ch >= 0x1D173 && ch <= 0x1D17A) || (ch >= 0xE0000 && ch <= 0xE0FFF)
+    }
+
+    // Returns true for the C0 and C1 control characters and DEL, U+0000 to
+    // U+001F and U+007F to U+009F, which have no glyph to draw: they are drawn
+    // as a space.
+    static func isControl(_ ch: Int) -> Bool {
+        return ch < 0x20 || (ch >= 0x7F && ch <= 0x9F)
+    }
+}   // End of Font.swift

@@ -1,0 +1,102 @@
+/**
+ * UserAccess.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
+///
+/// Represents the user access permissions for an encrypted PDF document as
+/// defined in ISO 32000-2 (PDF 2.0) Table 22. Permissions are stored as flags
+/// in a 32-bit integer, whose bit positions are numbered from 1, the
+/// low-order bit. The values combine with `|`, as in C# and Go.
+///
+public struct UserAccess: OptionSet, Sendable {
+    /// The permission bits.
+    public let rawValue: Int
+
+    ///
+    /// Creates the permissions of the specified bits.
+    ///
+    /// - Parameter rawValue: the permission bits.
+    ///
+    public init(rawValue: Int) {
+        self.rawValue = rawValue
+    }
+
+    /// No permissions are granted. This is the default state.
+    public static let NONE: UserAccess = []
+
+    /// Permission to print the document (possibly not at the highest quality
+    /// level, depending on whether PRINT_HIGH_QUALITY is also set).
+    /// (Bit position: 3)
+    public static let PRINT = UserAccess(rawValue: 1 << 2)                  // 4
+
+    /// Permission to modify the contents of the document by operations other
+    /// than those controlled by MODIFY_ANNOTATIONS, FILL_FORM_FIELDS, and
+    /// ASSEMBLE_DOCUMENT.
+    /// (Bit position: 4)
+    public static let MODIFY_CONTENTS = UserAccess(rawValue: 1 << 3)        // 8
+
+    /// Permission to copy or otherwise extract text and graphics from the
+    /// document, including for accessibility purposes.
+    /// (Bit position: 5)
+    public static let COPY_CONTENTS = UserAccess(rawValue: 1 << 4)          // 16
+
+    /// Permission to add, modify, or delete text annotations and interactive
+    /// form fields. Note: This permission is not used in PDF 2.0 but is
+    /// retained for legacy support.
+    /// (Bit position: 6)
+    public static let MODIFY_ANNOTATIONS = UserAccess(rawValue: 1 << 5)     // 32
+
+    /// Permission to fill existing interactive form fields (including
+    /// signature fields), even if MODIFY_CONTENTS is not set.
+    /// (Bit position: 9)
+    public static let FILL_FORM_FIELDS = UserAccess(rawValue: 1 << 8)       // 256
+
+    /// Permission to extract text and graphics (in support of accessibility
+    /// to users with disabilities or for other purposes).
+    /// (Bit position: 10)
+    public static let EXTRACT_CONTENTS_FOR_ACCESSIBILITY = UserAccess(rawValue: 1 << 9)  // 512
+
+    /// Permission to assemble the document: insert, rotate, or delete pages
+    /// and create bookmarks or thumbnail images.
+    /// (Bit position: 11)
+    public static let ASSEMBLE_DOCUMENT = UserAccess(rawValue: 1 << 10)     // 1024
+
+    /// Permission to print the document to a representation from which a
+    /// faithful digital copy of the PDF content could be generated. When this
+    /// bit is clear (and PRINT is set), printing is limited to a low-level
+    /// representation of the appearance, possibly of degraded quality.
+    /// (Bit position: 12)
+    public static let PRINT_HIGH_QUALITY = UserAccess(rawValue: 1 << 11)    // 2048
+
+    ///
+    /// Returns the bit mask of these permissions.
+    ///
+    /// - Returns: the bit mask.
+    ///
+    public func getValue() -> Int {
+        return rawValue
+    }
+
+    ///
+    /// Checks if this permission is in the given permissions. NONE is in all
+    /// of them.
+    ///
+    /// - Parameter access: the permissions, as Permissions.getAccess returns them.
+    /// - Returns: true if this permission is in the permissions.
+    ///
+    public func isSetIn(_ access: UserAccess) -> Bool {
+        return access.contains(self)
+    }
+
+    ///
+    /// Combines the permissions.
+    ///
+    /// - Returns: the permissions in either operand.
+    ///
+    public static func | (lhs: UserAccess, rhs: UserAccess) -> UserAccess {
+        return lhs.union(rhs)
+    }
+}   // End of UserAccess.swift

@@ -1,0 +1,4158 @@
+/**
+ * Page.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+/// The error that PDFjet throws, with a message that describes the problem.
+public struct PDFjetError: Error, CustomStringConvertible {
+    /// The message that describes the problem.
+    public let message: String
+
+    /// The message.
+    public var description: String {
+        return message
+    }
+}
+
+///
+/// Used to create PDF page objects.
+///
+/// Please note:
+///
+/// - The coordinate (0.0, 0.0) is the top left corner of the page.
+/// - Page sizes are in points; 1 point is 1/72 inch.
+///
+public class Page {
+    /// Pass to the Page initializer to create a page that is not added to the PDF right away.
+    public static let DETACHED = false
+
+    /// Index of the horizontal scale in an Android Matrix value array.
+    public static let MSCALE_X = 0
+    /// Index of the horizontal skew in an Android Matrix value array.
+    public static let MSKEW_X = 1
+    /// Index of the horizontal translation in an Android Matrix value array.
+    public static let MTRANS_X = 2
+    /// Index of the vertical skew in an Android Matrix value array.
+    public static let MSKEW_Y = 3
+    /// Index of the vertical scale in an Android Matrix value array.
+    public static let MSCALE_Y = 4
+    /// Index of the vertical translation in an Android Matrix value array.
+    public static let MTRANS_Y = 5
+
+    // The message of a path whose last curve has no end.
+    static let PATH_ENDS_ON_CONTROL_POINT =
+            "A path cannot end on a control point: a curve needs a point to end at after its control points."
+    // The most glyphs of a string of PDF/A, of two bytes each, and the message
+    // of a text of more.
+    static let MAX_PDFA_STRING_GLYPHS = 16383
+    static let PDFA_STRING_TOO_LONG =
+            "A text of more than 16383 characters is a string longer than PDF/A allows, 32767 bytes: draw it as several lines."
+    // The message of a curve of the wrong control points.
+    static let CURVE_CONTROL_POINTS =
+            "A curve of a path has two \"c\" control points, or one \"v\" or \"y\" control point, before the point it ends at."
+    // Returns the error of the control points of the path, or nil: a curve has
+    // two "c" control points, or one "v" or "y" one, and a point to end at. A
+    // "c" curve of one control point wrote "c" with four numbers, not six,
+    // which readers refused (review of 12 October 2026, F11).
+    static func pathError(_ path: [Point]) -> String? {
+        var run = 0
+        var op = ""
+        for point in path.dropFirst() {
+            if !point.controlPoint.isEmpty {
+                if run > 0 && point.controlPoint != op {
+                    return CURVE_CONTROL_POINTS
+                }
+                op = point.controlPoint
+                run += 1
+            } else if run > 0 {
+                if (op == "c") != (run == 2) || run > 2 {
+                    return CURVE_CONTROL_POINTS
+                }
+                run = 0
+            }
+        }
+        return (run > 0) ? PATH_ENDS_ON_CONTROL_POINT : nil
+    }
+
+    // The message of a color of fewer than three components.
+    static let RGB_COUNT = "An RGB color needs a red, a green and a blue value."
+    // The message of a transform of fewer than six values.
+    static let TRANSFORM_COUNT = "A transform needs six values: the scale, the skew and the translation of x and y."
+
+    // The document of this page. The document holds its pages, so the page
+    // holds it weakly: were both strong, neither would ever be freed, and a
+    // program writing many documents would keep every one of them. A caller
+    // draws on a page while it holds the PDF, as it must to complete it; a
+    // page whose PDF was freed has no document to draw for, and using it stops
+    // the program with a message that says so, not a crash further on.
+    private weak var document: PDF?
+    internal var pdf: PDF {
+        guard let document = document else {
+            preconditionFailure("The PDF of this page was freed: keep the PDF while drawing on its pages.")
+        }
+        return document
+    }
+    internal var pageObj: PDFobj?
+    // On a page that was read: what the names of the resources of the PDF are
+    // raised by, past the names it holds, and the resources drawn with
+    private var resourceBase = 0
+    private var readResources = [ReadResource]()
+    internal var objNumber = 0
+    internal var renderingMode = 0
+    // Whether a text rendering mode other than 0 was written
+    private var renderingModeSet = false
+    internal var width: Float = 0.0
+    internal var height: Float = 0.0
+    internal var rotateDegrees: Float = 0.0
+    internal var contents = [Int]()
+    internal var annots: [Annotation] = []
+    internal var destinations: [Destination] = []
+    internal var structures = [StructElement]()
+    // The object number of the element of each marked content, which the
+    // parent tree is written from. The elements themselves are written with
+    // the page and let go of.
+    internal var mcidNumbers = [Int]()
+    internal var buf = [UInt8]()
+
+    internal var cropBox: [Float]?
+    internal var bleedBox: [Float]?
+    internal var trimBox: [Float]?
+    internal var artBox: [Float]?
+
+    internal var tmx: [Float] = [1.0, 0.0, 0.0, 1.0]
+    private var textFontSize: Float = 0.0   // The font size of the text drawn last
+    private var textRise: Float = 0.0
+    // The font of the string of glyphs being drawn when it kerns, and the
+    // glyph drawn last, or -1: appendGlyph puts the kerning of each pair
+    // between the two glyphs. For a core font, the code of the character
+    // drawn last.
+    private var kernFont: Font?
+    private var kernPrevious = -1
+    // True while colored text is drawn, word by word: the kerning goes on from
+    // the last glyph of a word to the first of the next, as stringWidth
+    // measures the whole text.
+    private var kernChain = false
+    // The bytes of the text matrix, written for every string while the page
+    // has a text rotation. setTextRotation fills them, and drawString reads
+    // them only where tmx is not the identity, which is only after it ran.
+    internal var tm0 = [UInt8]()
+    internal var tm1 = [UInt8]()
+    internal var tm2 = [UInt8]()
+    internal var tm3 = [UInt8]()
+
+    private var penColor: [Float] = [0.0, 0.0, 0.0]
+    private var brushColor: [Float] = [0.0, 0.0, 0.0]
+    // True when the content has set the brush or the pen to the RGB color above,
+    // so setting it again writes nothing. False on a new page, whose colors are
+    // not written yet, and after a CMYK color. The pen width and the font of the
+    // text are kept the same way, and q and Q save and restore all of them, as
+    // they save and restore the graphics state of the PDF.
+    private var brushColorWritten = false
+    private var penColorWritten = false
+    private var penWidthWritten = false
+    private var writtenFont: Font?          // The font of the last Tf, or nil
+    private var writtenFontSize: Float = 0.0
+    // The size was written as it is, for SVG text, not rounded to two places
+    private var writtenFontPrecise = false
+
+    private var penWidth: Float = 1.0   // The PDF default, as no w is written first
+
+    var lineCapStyle = CapStyle.BUTT
+    var lineJoinStyle = JoinStyle.MITER
+    var strokeDashPattern: String = "[] 0"
+    // The borders of the cells of the table being drawn on the page, which
+    // the table writes as continuous lines, or nil.
+    var tableLines: TableLines? = nil
+    // Counts the calls that set the pen, so that the table can tell whether
+    // the pen was set after the borders of the last cell it kept.
+    var penChanges = 0
+    // The states that saveGraphicsState saved and restoreGraphicsState restores.
+    private var savedStates = [State]()
+    // The addBDC and addArtifactBMC calls that addEMC has not ended yet.
+    private var markedContentDepth = 0
+    // The markedContentDepth of the outermost artifact or figure, whose
+    // content is marked no further, or 0 outside of both.
+    // Content inside an artifact is not tagged, so an addBDC there writes
+    // nothing, and neither does its addEMC.
+    private var artifactDepth = 0
+    // The structure element that the elements of addBDC and addAnnotation
+    // become the kids of, like a table cell, or nil for the Document element.
+    internal var structParent: StructElement?
+    // The elements that beginStructElement was called for and endStructElement
+    // has not been called for yet, innermost last.
+    internal var structElementStack = [StructElement?]()
+    // While this is set, the marked content of what is drawn belongs to it
+    // rather than to an element of its own: a paragraph is one element,
+    // however many words it is drawn one at a time.
+    internal var mcidParent: StructElement?
+    // The element of the text line with an alternate description that is being
+    // drawn among the words of mcidParent; see describedWords.
+    private var words: StructElement?
+    // The figure addBDC began last, whose bounding box setFigureBoundingBox
+    // sets, or nil.
+    private var figure: StructElement?
+    // The text line that the text line being drawn is a piece of, or nil; and
+    // the text line of the Figure that addBDC made last, with the Figure. See
+    // figurePiece.
+    internal var pieceOf: TextLine?
+    private var pieces: TextLine?
+    private var piecesFigure: StructElement?
+    // The transform of the containers that what is drawn is in, which moves,
+    // turns and scales it with its cm operators, or nil outside of one: a
+    // point x, y of the drawing is at t[0]*x + t[2]*y + t[4], t[1]*x +
+    // t[3]*y + t[5] on the page, from its top left corner. The rectangles of
+    // the links and the bounding boxes of the figures drawn in a container
+    // are moved with it, as the content stream does not move them.
+    private var transform: [Float]?
+    // True once the page is added to its PDF.
+    internal var added = false
+    // True once the content of the page is written to the PDF.
+    internal var written = false
+    // The dictionary of a page merged from a document that was read, with the
+    // object numbers of this document, or nil for a page drawn with PDFjet.
+    internal var mergedDict: [String]?
+    private var mcid = 0
+    private let hexadecimal = Hexadecimal()
+
+    ///
+    /// Creates page object and add it to the PDF document.
+    ///
+    /// Please note:
+    ///
+    /// - The coordinate (0.0, 0.0) is the top left corner of the page.
+    /// - Page sizes are in points; 1 point is 1/72 inch.
+    ///
+    /// - Parameter pdf: the pdf object.
+    /// - Parameter pageSize: the page size of this page.
+    /// - Parameter addPageToPDF: Bool flag.
+    ///
+    public init(
+            _ pdf: PDF,
+            _ pageSize: PageSize,
+            _ addPageToPDF: Bool) {
+        self.document = pdf
+        self.annots = [Annotation]()
+        self.destinations = [Destination]()
+        self.width = pageSize.getWidth()
+        self.height = pageSize.getHeight()
+        if pdf.completed {
+            pdf.fail("The PDF was already completed.")
+        }
+        // The page size limits of the PDF specification, in Annex C.
+        if !(width >= 3.0 && width <= 14400.0 && height >= 3.0 && height <= 14400.0) {
+            pdf.fail("A page must be from 3 to 14400 points wide and high.")
+        }
+        pdf.pagesCreated += 1
+        if addPageToPDF {
+            pdf.addPage(self)
+        }
+    }
+
+    /// Creates a page from a page object read from an existing PDF.
+    public init(_ pdf: PDF, _ pageObj: PDFobj) {
+        self.document = pdf
+        self.pageObj = Page.removeComments(pageObj)
+        let pageSize = self.pageObj!.getPageSize()
+        self.width = pageSize.getWidth()
+        self.height = pageSize.getHeight()
+        self.resourceBase = self.pageObj!.maxResourceNumber()
+        saveGraphicsState()
+        let origin = self.pageObj!.mediaBoxOrigin()
+        if origin.x != 0 || origin.y != 0 {
+            // The page starts at the corner of its /MediaBox: at 0, 0 of a box
+            // of [100 100 712 892] the drawing was outside the page (review of
+            // 12 October 2026, F2)
+            append("1 0 0 1 ")
+            append(origin.x)
+            append(" ")
+            append(origin.y)
+            append(" cm\n")
+        }
+        if pageObj.gsNumber != -1 {
+            append("/GS")
+            append(pageObj.gsNumber + 1)
+            append(" gs\n")
+        }
+    }
+
+    /// Finishes a page read from an existing PDF by adding its new content to the objects.
+    public func complete(_ objects: inout [PDFobj]) {
+        // The content of the page is drawn first, in a q and a Q of its own,
+        // so that what it leaves set, a scale or a text rendering mode, does
+        // not change what is drawn after it; and a page with no content gets
+        // this one (review of 12 October 2026, F2).
+        restoreGraphicsState()
+        checkBalanced()
+        for resource in readResources {
+            var value = resource.value
+            if resource.number != 0 {
+                let written = PDFobj()
+                written.setNumber(objects.count + 1)
+                written.writtenNumber = resource.number
+                objects.append(written)
+                value = [String(written.getNumber()), "0", "R"]
+            }
+            pageObj!.addResourceEntry(resource.category, resource.name, value, &objects)
+        }
+        if !pageObj!.wrapContents(Array("q\n".utf8), Array("Q\n".utf8) + self.buf, &objects) {
+            pdf.fail("The /Contents of the page is not a stream or an array of streams: nothing can be drawn on it.")
+        }
+    }
+
+    // Returns the name for a resource of the PDF on this page, and keeps it for
+    // complete on a page that was read: the resources of the PDF do not reach
+    // that page, whose own resources have to name it, and its own names stay as
+    // they are. The graphics states, stamps and optional content drawn on such
+    // a page had no resource: the alpha was lost, and a stamp did not draw
+    // (review of 30 October 2026, B2).
+    final func resourceName(
+            _ category: String, _ prefix: String, _ n: Int, _ value: [String], _ number: Int) -> String {
+        if pageObj == nil {
+            return prefix + String(n)
+        }
+        let name = prefix + String(resourceBase + n)
+        if !readResources.contains(where: { $0.name == name }) {
+            readResources.append(ReadResource(category: category, name: name, value: value, number: number))
+        }
+        return name
+    }
+
+    /// Checks that every saveGraphicsState has its restoreGraphicsState and every
+    /// addBDC or addArtifactBMC its addEMC, before the page content is written.
+    func checkBalanced() {
+        if !savedStates.isEmpty {
+            pdf.fail("A page ends with a saveGraphicsState that has no restoreGraphicsState.")
+        }
+        if markedContentDepth != 0 {
+            pdf.fail("A page ends with an addBDC or addArtifactBMC that has no addEMC.")
+        }
+    }
+
+    // A page merged from a document that was read. Its dictionary is written
+    // when the PDF is completed, under the object number reserved for it, and
+    // nothing can be drawn on it.
+    init(_ pdf: PDF, _ objNumber: Int, _ mergedDict: [String]) {
+        self.document = pdf
+        self.objNumber = objNumber
+        self.mergedDict = mergedDict
+        self.added = true
+        self.written = true
+    }
+
+    private static func removeComments(_ obj: PDFobj) -> PDFobj {
+        var list = [String]()
+        var comment: Bool = false
+        for token in obj.dict {
+            if token == "%" {
+                comment = true
+            } else {
+                if token.hasPrefix("/") {
+                    comment = false
+                    list.append(token)
+                } else {
+                    if !comment {
+                        list.append(token)
+                    }
+                }
+            }
+        }
+        obj.dict = list
+        return obj
+    }
+
+    ///
+    /// Creates page object and add it to the PDF document.
+    ///
+    /// Please note:
+    ///
+    /// - The coordinate (0.0, 0.0) is the top left corner of the page.
+    /// - Page sizes are in points; 1 point is 1/72 inch.
+    ///
+    /// - Parameter pdf: the pdf object.
+    /// - Parameter pageSize: the page size of this page.
+    ///
+    public convenience init(_ pdf: PDF, _ pageSize: PageSize) {
+        self.init(pdf, pageSize, true)
+    }
+
+    /// Adds a core font to the resources of this page and returns the font.
+    /// The objects are the objects of the document, which get the font object.
+    /// - Throws: PDFjetError when the number is not one of the fourteen core fonts.
+    public func addResource(_ coreFont: Int, _ objects: inout [PDFobj]) throws -> Font {
+        return try pageObj!.addResource(coreFont, &objects)
+    }
+
+    /// Adds an image to the resources of this page. The objects are the objects of the document.
+    public func addResource(_ image: Image, _ objects: inout [PDFobj]) {
+        pageObj!.addResource(image, &objects)
+    }
+
+    /// Adds a font to the resources of this page. The objects are the objects of the document.
+    public func addResource(_ font: Font, _ objects: inout [PDFobj]) {
+        pageObj!.addResource(font, &objects)
+    }
+
+    /// Returns the content stream of this page.
+    public func getContent() -> [UInt8] {
+        return self.buf
+    }
+
+    ///
+    /// Adds destination to this page.
+    ///
+    /// - Parameter name: The destination name.
+    /// - Parameter xPosition: The horizontal position of the destination on this page.
+    /// - Parameter yPosition: The vertical position of the destination on this page.
+    ///
+    /// - Returns: the destination.
+    ///
+    @discardableResult
+    public func addDestination(
+            _ name: String,
+            _ xPosition: Float,
+            _ yPosition: Float) -> Destination {
+        // Moved and turned with the containers it is drawn in, as a link is
+        let p = transformed(xPosition, yPosition)
+        let dest = Destination(name, p[0], height - p[1])
+        destinations.append(dest)
+        return dest
+    }
+
+    ///
+    /// Adds destination to this page.
+    ///
+    /// - Parameter name: The destination name.
+    /// - Parameter yPosition: The vertical position of the destination on this page.
+    ///
+    /// - Returns: the destination.
+    ///
+    @discardableResult
+    public func addDestination(
+            _ name: String,
+            _ yPosition: Float) -> Destination {
+        return addDestination(name, 0.0, yPosition)
+    }
+
+    ///
+    /// Returns the width of this page.
+    ///
+    /// - Returns: the width of the page.
+    ///
+    public func getWidth() -> Float {
+        return self.width
+    }
+
+    ///
+    /// Returns the height of this page.
+    ///
+    /// - Returns: the height of the page.
+    ///
+    public func getHeight() -> Float {
+        return self.height
+    }
+
+    ///
+    /// Draws a line on the page, using the current color, between the points (x1, y1) and (x2, y2).
+    ///
+    /// - Parameter x1: the first point's x coordinate.
+    /// - Parameter y1: the first point's y coordinate.
+    /// - Parameter x2: the second point's x coordinate.
+    /// - Parameter y2: the second point's y coordinate.
+    ///
+    public func drawLine(
+            _ x1: Float,
+            _ y1: Float,
+            _ x2: Float,
+            _ y2: Float) {
+        moveTo(x1, y1)
+        lineTo(x2, y2)
+        strokePath()
+    }
+
+    /// Draws the string in black. The fallback font is used for characters the main font does not have.
+    public final func drawString(
+            _ font: Font,
+            _ fallbackFont: Font?,
+            _ fontSize: Float,
+            _ str: String?,
+            _ xOrig: Float,
+            _ yOrig: Float) {
+        drawString(font, fallbackFont, fontSize, str, xOrig, yOrig, [0.0, 0.0, 0.0], nil)
+    }
+
+    ///
+    /// Draws the text given by the specified string,
+    /// using the specified main font and text color.
+    /// If the main font is missing some glyphs - the fallback font is used.
+    /// The baseline of the leftmost character is at position (xOrig, yOrig) on the page.
+    ///
+    /// - Parameter font: the main font.
+    /// - Parameter fallbackFont: the fallback font.
+    /// - Parameter fontSize: the font size.
+    /// - Parameter str: the string to be drawn.
+    /// - Parameter xOrig: the x coordinate.
+    /// - Parameter yOrig: the y coordinate.
+    /// - Parameter textColor: the text color as an array of red, green and blue values.
+    /// - Parameter highlightColors: the words to highlight and their colors, or nil.
+    ///
+    final func drawString(
+            _ font: Font,
+            _ fallbackFont: Font?,
+            _ fontSize: Float,
+            _ str: String?,
+            _ xOrig: Float,
+            _ yOrig: Float,
+            _ textColor: [Float],
+            _ highlightColors: [String : Int32]?) {
+        var x = xOrig
+        let y = yOrig
+        // A fallback font that is the font itself, as a TextLine has by
+        // default, draws every character with the font: one run, drawn as
+        // with no fallback font, without asking each character which font
+        // has it (9 October 2026)
+        if str == nil || font.isCJK || fallbackFont == nil || fallbackFont!.isCJK || fallbackFont === font {
+            drawString(font, fontSize, str, x, y, textColor, highlightColors)
+        } else {
+            // Each run of the characters drawn with one font is drawn after the run before it.
+            var activeFont = font
+            let scalars = str!.unicodeScalars
+            var start = scalars.startIndex
+            var i = scalars.startIndex
+            while i < scalars.endIndex {
+                let charFont = Font.fontOf(font, fallbackFont!, activeFont, scalars, i)
+                if charFont !== activeFont {
+                    let run = String(scalars[start..<i])
+                    drawString(activeFont, fontSize, run, x, y, textColor, highlightColors)
+                    x += activeFont.stringWidth(fontSize, run)
+                    start = i
+                    activeFont = charFont
+                }
+                i = scalars.index(after: i)
+            }
+            drawString(activeFont, fontSize, String(scalars[start...]), x, y, textColor, highlightColors)
+        }
+    }
+
+    /// Draws the string in black at the specified font size.
+    public final func drawString(
+            _ font: Font,
+            _ fontSize: Float,
+            _ text: String?,
+            _ x: Float,
+            _ y: Float) {
+        drawString(font, fontSize, text, x, y, [0.0, 0.0, 0.0], nil)
+    }
+
+    ///
+    /// Draws the text given by the specified string,
+    /// using the specified font and text color.
+    /// The baseline of the leftmost character is at position (x, y) on the page.
+    ///
+    /// - Parameter font: the font to use.
+    /// - Parameter fontSize: the font size.
+    /// - Parameter text: the string to be drawn.
+    /// - Parameter x: the x coordinate.
+    /// - Parameter y: the y coordinate.
+    /// - Parameter textColor: the text color as an array of red, green and blue values.
+    /// - Parameter highlightColors: the words to highlight and their colors, or nil.
+    ///
+    final func drawString(
+            _ font: Font,
+            _ fontSize: Float,
+            _ text: String?,
+            _ x: Float,
+            _ y: Float,
+            _ textColor: [Float],
+            _ highlightColors: [String : Int32]?) {
+        if text == nil || text! == "" {
+            return
+        }
+
+        append(Token.beginText)
+        setTextFont(font, fontSize)
+        // Tr is graphics state and lasts past ET, so once a mode other than 0 is
+        // written, every text after it writes its mode, 0 too (review of 12
+        // October 2026, F1).
+        if self.renderingMode != 0 || self.renderingModeSet {
+            self.renderingModeSet = self.renderingModeSet || self.renderingMode != 0
+            append(renderingMode)
+            append(" Tr\n")
+        }
+
+        if font.skew15 &&
+                self.tmx[0] == 1.0 &&
+                self.tmx[1] == 0.0 &&
+                self.tmx[2] == 0.0 &&
+                self.tmx[3] == 1.0 {
+            let skew = Float(0.26)
+            append(self.tmx[0])
+            append(Token.space)
+            append(self.tmx[1])
+            append(Token.space)
+            append(self.tmx[2] + skew)
+            append(Token.space)
+            append(self.tmx[3])
+            append(Token.space)
+            append(x)
+            append(Token.space)
+            append(self.height - y)
+            append(" Tm\n")
+        } else if self.tmx[0] == 1.0 && self.tmx[1] == 0.0 &&
+                self.tmx[2] == 0.0 && self.tmx[3] == 1.0 {
+            // BT sets the line matrix to the identity, which is the text matrix
+            // here, so Td puts the text where Tm would, in fewer bytes.
+            setTextLocation(x, y)
+        } else {
+            append(self.tm0)
+            append(Token.space)
+            append(self.tm1)
+            append(Token.space)
+            append(self.tm2)
+            append(Token.space)
+            append(self.tm3)
+            append(Token.space)
+            append(x)
+            append(Token.space)
+            append(self.height - y)
+            append(" Tm\n")
+        }
+
+        if highlightColors == nil {
+            setBrushColor(textColor)
+            if font.isCoreFont {
+                append("[<")
+                drawASCIIString(font, text!)
+                append(">] TJ\n")
+            } else {
+                append("<")
+                drawUnicodeString(font, text!)
+                append("> Tj\n")
+            }
+        } else {
+            drawColoredString(font, text!, textColor, highlightColors!)
+        }
+        append(Token.endText)
+    }
+
+    // Draws the string of an SVG image with the text matrix, in the brush
+    // color, or stroked in the pen color and width for the rendering mode 1.
+    final func drawSVGText(_ font: Font, _ fontSize: Float, _ text: String, _ tm: [Float], _ mode: Int) {
+        append(Token.beginText)
+        writeTextFont(font, fontSize, true)
+        if mode != 0 || self.renderingModeSet {
+            self.renderingModeSet = true
+            append(mode)
+            append(" Tr\n")
+        }
+        showSVGText(font, text, tm)
+        append(Token.endText)
+    }
+
+    // Shows the string of an SVG image with the text matrix.
+    func showSVGText(_ font: Font, _ text: String, _ tm: [Float]) {
+        // The scale and the rotation need more than hundredths, as in appendPrecise.
+        for i in 0..<6 {
+            if i < 4 {
+                appendPrecise(tm[i])
+            } else {
+                append(tm[i])
+            }
+            append(Token.space)
+        }
+        append("Tm\n")
+        if font.isCoreFont {
+            append("[<")
+            drawASCIIString(font, text)
+            append(">] TJ\n")
+        } else {
+            append("<")
+            drawUnicodeString(font, text)
+            append("> Tj\n")
+        }
+    }
+
+    // Begins a text object whose glyphs clip what is drawn after it, by the
+    // rendering mode 7 of ISO 32000-1, 9.3.6: at its ET they are one path,
+    // filled by the nonzero rule, which the clip path is intersected with. The
+    // graphics state saved around it brings the mode back.
+    final func beginSVGClipText() {
+        append(Token.beginText)
+        self.renderingModeSet = true
+        append("7 Tr\n")
+    }
+
+    // Adds the string of an SVG image to the text object begun by
+    // beginSVGClipText.
+    final func addSVGClipText(_ font: Font, _ fontSize: Float, _ text: String, _ tm: [Float]) {
+        writeTextFont(font, fontSize, true)
+        showSVGText(font, text, tm)
+    }
+
+    // Ends that text object.
+    final func endSVGClipText() {
+        append(Token.endText)
+    }
+
+    private final func drawASCIIString(_ font: Font, _ text: String) {
+        let scalars = font.withoutIgnorables(Array(text.unicodeScalars))
+        if scalars.isEmpty {
+            return
+        }
+        // The code of each character is looked up once, as the next one of the
+        // kerning pair before it is the first one of the pair after it.
+        var c1 = font.coreFontCode(scalars[0].value)
+        for i in 0..<scalars.count {
+            appendTwoHexDigits(c1, &self.buf)
+            if i == scalars.count - 1 {
+                break
+            }
+            let c2 = font.coreFontCode(scalars[i + 1].value)
+            if font.kernPairs {
+                let kerning = font.kerning(c1, c2)
+                if kerning != 0 {
+                    append(">")
+                    append(-kerning)
+                    append("<")
+                }
+            }
+            c1 = c2
+        }
+    }
+
+    private final func drawUnicodeString(_ font: Font, _ text: String) {
+        if !ownsFont(font) {
+            // Refused, and not drawn: drawing reads what the font recorded
+            // for its own PDF, which another thread may be changing (review
+            // of 12 October 2026, S1).
+            pdf.fail("The font belongs to another PDF.")
+            return
+        }
+        var kernEnds = false
+        if font.kerns() {
+            if !kernChain || kernFont !== font {
+                kernPrevious = -1
+            }
+            kernFont = font
+            kernEnds = !kernChain
+        }
+        defer {
+            if kernEnds {
+                kernFont = nil
+            }
+        }
+        let scalars = Array(text.unicodeScalars)
+        // A string of PDF/A is 32767 bytes at most, and a glyph two of them: a
+        // TextLine of 16384 characters failed veraPDF (review of 12 October
+        // 2026, W1)
+        if pdf.isPDFA() && scalars.count > Page.MAX_PDFA_STRING_GLYPHS {
+            pdf.fail(Page.PDFA_STRING_TOO_LONG)
+        }
+        if font.isCJK {
+            // A CJK font that is not embedded is drawn by the characters
+            // themselves, through a UCS-2 CMap, with the glyphs of the
+            // reader's font. PDFjet does not know which characters that font
+            // has, and so has no .notdef to draw: a character past its range
+            // is a space. What it does not draw, see Font.isNotDrawn, is
+            // left out.
+            for scalar in scalars {
+                if !Font.isNotDrawn(scalar.value) {
+                    if scalar < Unicode.Scalar(font.firstChar)! ||
+                            scalar > Unicode.Scalar(font.lastChar)! {
+                        Page.appendCodePointAsHex(0x0020, &self.buf)
+                    } else {
+                        Page.appendCodePointAsHex(Int(scalar.value), &self.buf)
+                    }
+                }
+            }
+        } else if needsShaping(font, scalars) || !appendPlainGlyphs(font, scalars) {
+            // The marks are moved to where the GPOS table of the font puts
+            // them, the characters Bidi mirrored, each after an RLM, are given
+            // the characters they stand for as actual text, and a zero width
+            // non-joiner or joiner that the font has no glyph for is put in the
+            // actual text of the glyph before it. A font that has a glyph for
+            // it draws the glyph, which has no width.
+            var codePoints = [Int]()
+            var gids = [Int]()
+            var mirrored: [Bool]? = nil
+            var joiners: [Int]? = nil
+            var runEdge: [Bool]? = nil      // An LRM before the glyph at the index
+            var hasMarks = false
+            var hasNotdef = false
+            var afterRLM = false
+            for scalar in scalars where scalar.value != 0xFEFF {    // BOM
+                if scalar.value == 0x200F {     // RLM
+                    afterRLM = true
+                    continue
+                }
+                if scalar.value == 0x200E {     // LRM
+                    // Bidi puts an LRM on each side of the brackets of a right
+                    // to left pair around left to right text; the glyphs
+                    // between the two are drawn in one span, see appendRun.
+                    if runEdge == nil {
+                        runEdge = [Bool](repeating: false, count: scalars.count + 1)
+                    }
+                    runEdge![codePoints.count] = true
+                    continue
+                }
+                let codePoint = Int(scalar.value)
+                if (codePoint == 0x200C || codePoint == 0x200D) && font.unicodeToGID[codePoint] == 0 {
+                    // A ZWNJ or ZWJ the font has no glyph for goes with the
+                    // glyph before it. One with nothing before it is left out.
+                    if !codePoints.isEmpty {
+                        if joiners == nil {
+                            joiners = [Int](repeating: 0, count: scalars.count)
+                        }
+                        joiners![codePoints.count - 1] = codePoint
+                    }
+                    continue
+                }
+                let gid = font.drawnGlyph(codePoint)
+                if gid < 0 {
+                    continue
+                }
+                if afterRLM && Bidi.mirrored(scalar.value) != nil {
+                    if mirrored == nil {
+                        mirrored = [Bool](repeating: false, count: scalars.count)
+                    }
+                    mirrored![codePoints.count] = true
+                }
+                afterRLM = false
+                codePoints.append(codePoint)
+                gids.append(gid)
+                if ownsFont(font) {
+                    font.useChar(codePoint, gids[gids.count - 1])
+                }
+                hasMarks = hasMarks || Page.isMark(codePoint)
+                hasNotdef = hasNotdef || isMissing(font, codePoints, gids.count - 1)
+            }
+            var offsets: [Int]? = nil
+            if hasMarks && font.gpos != nil {
+                offsets = markOffsets(font, codePoints, gids)
+            } else if mirrored == nil && joiners == nil && runEdge == nil && !hasNotdef {
+                for gid in gids {
+                    appendGlyph(font, gid)
+                }
+                return
+            }
+            let n = gids.count
+            var i = 0
+            while i < n {
+                if runEdge != nil && runEdge![i] {
+                    var j = i + 1
+                    while j < n && !runEdge![j] {
+                        j += 1
+                    }
+                    appendRun(font, codePoints, gids, offsets, joiners, i, j)
+                    runEdge![j] = false
+                    i = j
+                    continue
+                }
+                var end = i + 1
+                if codePoints[i] != 0x20 {
+                    while end < n && codePoints[end] != 0x20 && (runEdge == nil || !runEdge![end]) {
+                        end += 1
+                    }
+                }
+                // A glyph with a joiner after it is drawn in a span of its own,
+                // and so are the mirrored characters at the ends of a word with
+                // moved marks, like its brackets: MuPDF leaves out or repeats
+                // text when the glyphs of a span do not match its actual text
+                // one by one.
+                var k = i
+                while k < end {
+                    var j = k
+                    while j < end && (joiners == nil || joiners![j] == 0) {
+                        j += 1
+                    }
+                    appendWord(font, codePoints, gids, mirrored, offsets, k, j)
+                    if j < end {
+                        appendGlyphWithActualText(font, codePoints, gids, offsets, mirrored, joiners, j)
+                    }
+                    k = j + 1
+                }
+                i = end
+            }
+        }
+    }
+
+    // Draws the glyphs of a left to right run in brackets, nested in right to
+    // left text, in a marked content span with the text of the run between
+    // two left-to-right marks as its actual text. Poppler and MuPDF then keep
+    // the brackets with the run when the text is copied; with the brackets in
+    // spans of their own, or mirrored back like the other brackets, they come
+    // out the wrong way round. No glyph stands in for the marks: MuPDF moves
+    // the first bracket to the right to left text when one does. A zero width
+    // non-joiner or joiner the font has no glyph for is in the actual text
+    // after the glyph before it, as in a word: it was left out (review of 12
+    // October 2026, T7).
+    private func appendRun(
+            _ font: Font, _ codePoints: [Int], _ gids: [Int], _ offsets: [Int]?, _ joiners: [Int]?,
+            _ start: Int, _ end: Int) {
+        var text = "\u{200E}"
+        for k in start..<end {
+            text.append(Page.textOf(font, codePoints[k]))
+            if let joiner = joiners?[k], joiner != 0, let scalar = Unicode.Scalar(joiner) {
+                text.unicodeScalars.append(scalar)
+            }
+        }
+        text.append("\u{200E}")
+        append("> Tj\n/Span <</ActualText <")
+        append(Page.toUTF16Hex(text))
+        append(">>> BDC\n<")
+        for k in start..<end {
+            if let offsets = offsets, offsets[2*k] != 0 || offsets[2*k + 1] != 0 {
+                appendMovedGlyph(font, gids[k], offsets[2*k], offsets[2*k + 1])
+            } else {
+                appendGlyph(font, gids[k])
+            }
+        }
+        append("> Tj\nEMC\n<")
+    }
+
+    // Returns true if the glyph at k is drawn in a span of its own at an end
+    // of a word: a character Bidi mirrored, or one the font does not have.
+    private func atWordEnd(_ font: Font, _ codePoints: [Int], _ mirrored: [Bool]?, _ k: Int) -> Bool {
+        return mirrored?[k] == true || font.lacks(codePoints[k])
+    }
+
+    // Draws the glyphs of a word, or of the part of a word before a joiner,
+    // in a marked content span with the text of the word when it has moved
+    // marks, with the mirrored characters and the .notdef glyphs at its ends
+    // in spans of their own. A glyph drawn for another character stays in the
+    // word's span, whose actual text gives its character: in a span of its
+    // own, the word's span began with a moved mark, after a space that stands
+    // for it, and the word was copied with a space inside it (review of 12
+    // October 2026, T1).
+    private func appendWord(
+            _ font: Font, _ codePoints: [Int], _ gids: [Int], _ mirrored: [Bool]?, _ offsets: [Int]?,
+            _ i: Int, _ end: Int) {
+        var wordStart = i
+        var wordEnd = end
+        while wordStart < wordEnd && atWordEnd(font, codePoints, mirrored, wordStart) {
+            wordStart += 1
+        }
+        while wordEnd > wordStart && atWordEnd(font, codePoints, mirrored, wordEnd - 1) {
+            wordEnd -= 1
+        }
+        if let offsets = offsets, isMoved(offsets, wordStart, wordEnd) {
+            appendGlyphs(font, codePoints, gids, mirrored, i, wordStart)
+            appendWordWithMovedMarks(font, codePoints, gids, offsets, wordStart, wordEnd)
+            appendGlyphs(font, codePoints, gids, mirrored, wordEnd, end)
+        } else {
+            appendGlyphs(font, codePoints, gids, mirrored, i, end)
+        }
+    }
+
+    // Draws the glyphs from start to end, each character Bidi mirrored and
+    // each .notdef glyph in a span of its own.
+    private func appendGlyphs(
+            _ font: Font, _ codePoints: [Int], _ gids: [Int], _ mirrored: [Bool]?, _ start: Int, _ end: Int) {
+        for k in start..<end {
+            if inOwnSpan(font, codePoints, mirrored, k) {
+                appendGlyphWithActualText(font, codePoints, gids, nil, mirrored, nil, k)
+            } else {
+                appendGlyph(font, gids[k])
+            }
+        }
+    }
+
+    // Draws a glyph in a marked content span that has the text it stands for
+    // as its actual text: the character Bidi mirrored, since text extraction
+    // reverses right to left text but does not mirror the brackets back, or
+    // the text of the glyph followed by the zero width non-joiner or joiner
+    // after it, which the font has no glyph for. A space glyph that takes no
+    // room stands in for the joiner, so that the span has a glyph for each
+    // character of its actual text but the last: MuPDF pairs the characters
+    // with the glyphs, and repeats text when a glyph matches its character
+    // after one that does not. Poppler takes the actual text as it is.
+    private func appendGlyphWithActualText(
+            _ font: Font, _ codePoints: [Int], _ gids: [Int], _ offsets: [Int]?, _ mirrored: [Bool]?,
+            _ joiners: [Int]?, _ k: Int) {
+        let codePoint = codePoints[k]
+        let joiner = joiners?[k] ?? 0
+        var text = ""
+        if mirrored?[k] == true {
+            text.unicodeScalars.append(Unicode.Scalar(Bidi.mirrored(UInt32(codePoint))!)!)
+        } else {
+            text.append(Page.textOf(font, codePoint))
+        }
+        if joiner != 0 {
+            text.unicodeScalars.append(Unicode.Scalar(UInt32(joiner))!)
+        }
+        append("> Tj\n/Span <</ActualText <")
+        append(Page.toUTF16Hex(text))
+        append(">>> BDC\n")
+        if let offsets = offsets, offsets[2*k] != 0 || offsets[2*k + 1] != 0 {
+            append("<")
+            appendMovedGlyph(font, gids[k], offsets[2*k], offsets[2*k + 1])
+            append("> Tj\n")
+        } else {
+            append("<")
+            appendGlyph(font, gids[k])
+            append("> Tj\n")
+        }
+        if joiner != 0 {
+            let space = font.unicodeToGID[0x0020]
+            append("[<")
+            appendGlyphUnkerned(font, space)
+            append("> ")
+            append(1000.0 * Float(font.glyphAdvance(space)) / Float(font.unitsPerEm))
+            append("] TJ\n")
+        }
+        append("EMC\n<")
+    }
+
+    // Returns the text the glyph of the code point maps to: a control
+    // character is a space, as it is drawn, and an Arabic letter form is its
+    // letter. A character the font does not have is itself, though it is
+    // drawn with .notdef, so that a copy of the text is the text that was
+    // written.
+    static func textOf(_ font: Font, _ codePoint: Int) -> String {
+        if Font.isControl(codePoint) {
+            return " "
+        }
+        var text = ""
+        if let letters = Bidi.lettersOf(UInt32(codePoint)) {
+            for letter in letters {
+                text.unicodeScalars.append(Unicode.Scalar(letter)!)
+            }
+        } else if let scalar = Unicode.Scalar(UInt32(codePoint)) {
+            text.unicodeScalars.append(scalar)
+        }
+        return text
+    }
+
+    // Returns the glyph ID the character is drawn with: that of a space for a
+    // control character, which has no glyph to draw, and for a character the
+    // font does not have the glyph missingGlyph gives, .notdef in a document
+    // of no compliance, so that a reader sees a box where the character is
+    // missing and not a space, as other PDF writers draw it.
+    static func glyphOf(_ font: Font, _ codePoint: Int) -> Int {
+        if Font.isControl(codePoint) {
+            return font.unicodeToGID[0x0020]
+        }
+        if font.lacks(codePoint) {
+            return font.missingGlyph()
+        }
+        return font.unicodeToGID[codePoint]
+    }
+
+    // Draws the glyphs of text that needs no shaping, and returns true. It
+    // draws nothing and returns false when a glyph is drawn for another
+    // character too, which is drawn in a span of its own.
+    private func appendPlainGlyphs(_ font: Font, _ scalars: [Unicode.Scalar]) -> Bool {
+        // A character is drawn with the glyph drawnGlyph gives, as the
+        // kerning measures it. The glyphs are marked used in one pass and
+        // written in one, so that a character costs no runtime check of a
+        // class property's exclusive access, which made text in Swift three
+        // times as slow as in Go (9 October 2026).
+        // A printable ASCII character the font has, already marked plain, is
+        // its glyph at once, and is not looked at by useChars and
+        // drawsAnyAsAnother: codePoints and their glyphs, charGIDs, are the
+        // other characters, and stay empty, allocating nothing, for most text.
+        let asciiGIDs = font.asciiGID
+        let owns = ownsFont(font)
+        var shared = [Bool]()       // font.sharedGlyph, at the first character it is needed for
+        var codePoints = [Int]()
+        var charGIDs = [Int]()
+        var gids = [Int]()
+        gids.reserveCapacity(scalars.count)
+        // The local copy of asciiPlain ends with this block, before the font's
+        // array is written below, which a second reference to it would copy.
+        do {
+            let plain = owns ? font.asciiPlain : []
+            for scalar in scalars {
+                let codePoint = Int(scalar.value)
+                if codePoint >= 0x20 && codePoint < 0x7F && asciiGIDs[codePoint - 0x20] != 0 {
+                    let gid = Int(asciiGIDs[codePoint - 0x20])
+                    gids.append(gid)
+                    if owns && plain[codePoint - 0x20] {
+                        continue
+                    }
+                    codePoints.append(codePoint)
+                    charGIDs.append(gid)
+                    continue
+                }
+                let gid = font.drawnGlyph(codePoint)
+                if gid < 0 {
+                    continue
+                }
+                gids.append(gid)
+                if shared.isEmpty {
+                    shared = font.sharedGlyph
+                }
+                // A glyph of one character is given it by the ToUnicode map
+                // already, and is drawn for no other
+                if shared[gid] {
+                    codePoints.append(codePoint)
+                    charGIDs.append(gid)
+                }
+            }
+        }
+        if owns {
+            font.useGlyphs(gids)
+            font.useChars(codePoints, charGIDs)
+        }
+        if font.drawsAnyAsAnother(codePoints) {
+            // Nothing written yet: the shaping path kerns with the glyph
+            // before the text, the last of the word before it in colored text
+            return false
+        }
+        if owns {
+            // None is drawn as another character, and none will be.
+            for codePoint in codePoints where codePoint >= 0x20 && codePoint < 0x7F &&
+                    asciiGIDs[codePoint - 0x20] != 0 {
+                font.asciiPlain[codePoint - 0x20] = true
+            }
+        }
+        if kernFont != nil {
+            for gid in gids {
+                appendKerningBefore(font, gid)
+                Page.appendCodePointAsHex(gid, &self.buf)
+            }
+        } else {
+            Page.appendGlyphsAsHex(gids, &self.buf)
+        }
+        return true
+    }
+
+    // Returns true if the character at k is one the font does not have, which
+    // is drawn with the glyph missingGlyph gives. The ToUnicode map of the
+    // font maps that glyph to U+FFFD or to the character it is, so it is drawn
+    // in a span whose actual text is the character that is missing. A character
+    // whose glyph the ToUnicode map gives another character is drawn in such a
+    // span too.
+    private func isMissing(_ font: Font, _ codePoints: [Int], _ k: Int) -> Bool {
+        return font.lacks(codePoints[k]) || font.drawnAsAnother(codePoints[k])
+    }
+
+    // Returns true if the glyph at k is drawn in a marked content span of its
+    // own, with the text it stands for as its actual text: a character Bidi
+    // mirrored, and a character the font does not have.
+    private func inOwnSpan(_ font: Font, _ codePoints: [Int], _ mirrored: [Bool]?, _ k: Int) -> Bool {
+        return mirrored?[k] == true || isMissing(font, codePoints, k)
+    }
+
+    // Returns the offsets that move the marks to where the GPOS table of the
+    // font puts them, dx and dy in font units for each glyph. A mark goes on
+    // the letter or ligature before it. Right to left text is drawn in visual
+    // order, with the marks before their letter, so a Hebrew or Arabic mark
+    // goes on the letter after it. A mark that attaches to the mark before it,
+    // like a Thai tone mark above an upper vowel, goes on that mark instead.
+    // The marks of a letter are taken in logical order, sorted as HarfBuzz
+    // sorts them, so a fatha goes above a shadda whichever was typed first.
+    private func markOffsets(_ font: Font, _ codePoints: [Int], _ gids: [Int]) -> [Int] {
+        let n = gids.count
+        // Where each glyph is drawn before it is moved, in font units.
+        var x = [Int](repeating: 0, count: n)
+        for i in stride(from: 1, to: n, by: 1) {
+            x[i] = x[i - 1] + font.glyphAdvance(gids[i - 1])
+        }
+        var offsets = [Int](repeating: 0, count: 2*n)
+        // The letter before a mark, and the letter after it, each found once
+        // for all the marks beside it: looked for again for each mark, a
+        // letter of thousands of marks took seconds.
+        var before = -1
+        var after = -1
+        for i in 0..<n {
+            if !Page.isMark(codePoints[i]) {
+                before = i
+                continue
+            }
+            var base = before
+            if Page.isRightToLeft(codePoints[i]) {
+                if after <= i {
+                    after = i + 1
+                    while after < n && Page.isMark(codePoints[after]) {
+                        after += 1
+                    }
+                }
+                base = after
+            }
+            if base >= 0 && base < n,
+                    let offset = markToBaseOffset(font, codePoints[base], gids[base], gids[i]) {
+                offsets[2*i] = x[base] + offset[0] - x[i]
+                offsets[2*i + 1] = offset[1]
+            }
+        }
+        var order = [Int](repeating: 0, count: n)
+        var start = 0
+        while start < n {
+            if !Page.isMark(codePoints[start]) {
+                start += 1
+                continue
+            }
+            // The marks from start to end - 1 go on the same letter.
+            let rightToLeft = Page.isRightToLeft(codePoints[start])
+            var end = start + 1
+            while end < n && Page.isMark(codePoints[end]) && Page.isRightToLeft(codePoints[end]) == rightToLeft {
+                end += 1
+            }
+            let count = end - start
+            for k in 0..<count {
+                order[k] = rightToLeft ? end - 1 - k : start + k
+            }
+            sortMarks(codePoints, &order, count)
+            for k in stride(from: 1, to: count, by: 1) {
+                placeOnMark(font, gids, x, &offsets, order[k], order[k - 1])
+            }
+            start = end
+        }
+        return offsets
+    }
+
+    // Sorts the first count marks of order by their order, those of the same
+    // order as they were typed. A mark of order 0 is never moved, and no mark
+    // moves past it: each run of the marks between them is sorted by itself,
+    // by its order and then its place in the run.
+    private func sortMarks(_ codePoints: [Int], _ order: inout [Int], _ count: Int) {
+        var a = 0
+        while a < count {
+            if markOrder(codePoints[order[a]]) == 0 {
+                a += 1
+                continue
+            }
+            var b = a + 1
+            while b < count && markOrder(codePoints[order[b]]) != 0 {
+                b += 1
+            }
+            let run = Array(order[a..<b])
+            var keys = [Int](repeating: 0, count: b - a)
+            for k in 0..<keys.count {
+                keys[k] = (markOrder(codePoints[run[k]]) << 32) | k
+            }
+            keys.sort()
+            for k in 0..<keys.count {
+                order[a + k] = run[keys[k] & 0xFFFF_FFFF]
+            }
+            a = b
+        }
+    }
+
+    // Returns the offset of the mark from the letter or ligature it goes on, in
+    // font units, or nil. A font can have the anchors of an isolated Arabic
+    // letter form only for its letter, which looks the same.
+    private func markToBaseOffset(
+            _ font: Font, _ baseCodePoint: Int, _ baseGID: Int, _ markGID: Int) -> [Int]? {
+        if let offset = anchorOffset(font, baseGID, markGID) {
+            return offset
+        }
+        if let letter = Bidi.letterOfIsolatedForm(UInt32(baseCodePoint)) {
+            return anchorOffset(font, font.unicodeToGID[Int(letter)], markGID)
+        }
+        return nil
+    }
+
+    // Returns the offset of the mark from the glyph it goes on, from the first
+    // MarkToBase or MarkToLigature subtable that has an anchor for both, or nil.
+    private func anchorOffset(_ font: Font, _ baseGID: Int, _ markGID: Int) -> [Int]? {
+        let gpos = font.gpos!.readTable()
+        for (i, marks) in gpos.markAnchors.enumerated() {
+            guard let mark = marks[markGID] else {
+                continue
+            }
+            let c = 3*mark[0]
+            if let anchors = gpos.baseAnchors[i][baseGID], c + 2 < anchors.count, anchors[c] == 1 {
+                return [anchors[c + 1] - mark[1], anchors[c + 2] - mark[2]]
+            }
+        }
+        return nil
+    }
+
+    // Moves the mark onto the other mark, if the font has an offset for the two.
+    private func placeOnMark(
+            _ font: Font, _ gids: [Int], _ x: [Int], _ offsets: inout [Int], _ mark: Int, _ other: Int) {
+        if let offset = font.gpos?.readTable().markToMarkOffsets[(gids[other] << 16) | gids[mark]] {
+            offsets[2*mark] = offsets[2*other] + x[other] + offset[0] - x[mark]
+            offsets[2*mark + 1] = offsets[2*other + 1] + offset[1]
+        }
+    }
+
+    // Returns true if the text has a character that is more than a glyph: an
+    // RLM, LRM, ZWNJ or ZWJ, a mark that the GPOS table of the font puts in
+    // place, or a character the font does not have, whose glyph is drawn with
+    // the character as its actual text. Marks start at U+0300, so
+    // most text is looked at once, with no more than two comparisons and the
+    // lookup of its glyph for each character.
+    private func needsShaping(_ font: Font, _ scalars: [Unicode.Scalar]) -> Bool {
+        // The font's tables read once, not for each character; a character
+        // the font lacks is one Font's lacks says it lacks
+        let hasMarks = font.gpos != nil
+        let table = font.unicodeToGID
+        let first = font.firstChar
+        let last = font.lastChar
+        let asciiGIDs = font.asciiGID
+        for scalar in scalars {
+            let codePoint = Int(scalar.value)
+            if codePoint >= 0x20 && codePoint < 0x7F && asciiGIDs[codePoint - 0x20] != 0 {
+                continue
+            }
+            if codePoint >= 0x0300 {
+                if Font.isJoinerOrRLM(scalar.value) {
+                    return true
+                }
+                if hasMarks && Page.isMark(codePoint) {
+                    return true
+                }
+            }
+            if codePoint != 0xFEFF && !Font.isControl(codePoint) && !Font.isIgnorable(codePoint) &&
+                    (codePoint < first || codePoint > last || table[codePoint] == 0) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // True for each 64 characters of the Basic Multilingual Plane that have a
+    // mark among them, so that isMark looks up the category of a character
+    // only when it can be a mark. Greek and most of Cyrillic, like the Latin
+    // letters before U+0300, have none. Made the first time it is needed.
+    private static let markChunks: [Bool] = {
+        var chunks = [Bool](repeating: false, count: 1024)
+        for value in UInt32(0x0300)..<0x10000 {
+            if let scalar = Unicode.Scalar(value) {
+                switch scalar.properties.generalCategory {
+                case .nonspacingMark, .enclosingMark:
+                    chunks[Int(value >> 6)] = true
+                default:
+                    break
+                }
+            }
+        }
+        return chunks
+    }()
+
+    static func isMark(_ codePoint: Int) -> Bool {
+        if codePoint < 0x10000 && !Page.markChunks[codePoint >> 6] {
+            return false
+        }
+        guard let scalar = Unicode.Scalar(UInt32(codePoint)) else {
+            return false
+        }
+        switch scalar.properties.generalCategory {
+        case .nonspacingMark, .enclosingMark:
+            return true
+        default:
+            return false
+        }
+    }
+
+    // Returns true if the character is in the blocks of the right to left scripts.
+    static func isRightToLeft(_ codePoint: Int) -> Bool {
+        return (codePoint >= 0x0590 && codePoint <= 0x08FF) ||
+                (codePoint >= 0xFB1D && codePoint <= 0xFDFF) ||
+                (codePoint >= 0xFE70 && codePoint <= 0xFEFF) ||
+                (codePoint >= 0x10800 && codePoint <= 0x10FFF) ||
+                (codePoint >= 0x1E800 && codePoint <= 0x1EFFF)
+    }
+
+    // Returns the order of a mark among the marks of its letter, or 0 for a
+    // mark that stays where it is: the canonical combining class of the mark,
+    // changed as in HarfBuzz to put the Hebrew points in the order of the SBL
+    // Hebrew manual, and the Arabic shadda before the other Arabic vowel marks.
+    private func markOrder(_ codePoint: Int) -> Int {
+        if codePoint >= 0x05B0 && codePoint <= 0x05C7 {     // Hebrew points
+            return Page.hebrewMarkOrder[codePoint - 0x05B0]
+        }
+        if codePoint >= 0x064B && codePoint <= 0x0652 {     // Arabic fathatan to sukun
+            return Page.arabicMarkOrder[codePoint - 0x064B]
+        }
+        switch codePoint {
+        case 0x0670: return 35      // ARABIC LETTER SUPERSCRIPT ALEF
+        case 0x0E38, 0x0E39: return 103     // THAI SARA U, SARA UU
+        case 0x0E3A: return 9       // THAI PHINTHU
+        case 0x0E48, 0x0E49, 0x0E4A, 0x0E4B: return 107    // THAI tone marks
+        case 0x0EB8, 0x0EB9: return 118     // LAO VOWEL SIGN U, UU
+        case 0x0EC8, 0x0EC9, 0x0ECA, 0x0ECB: return 122    // LAO tone marks
+        default: return 0
+        }
+    }
+
+    private static let hebrewMarkOrder: [Int] = [
+        22, 15, 16, 17, 23, 18, 19, 20,     // U+05B0 sheva to U+05B7 patah
+        21, 14, 14, 24, 12, 25, 0, 13,      // U+05B8 qamats to U+05BF rafe
+        0, 10, 11, 0, 230, 220, 0, 21       // U+05C0 to U+05C7 qamats qatan
+    ]
+
+    private static let arabicMarkOrder: [Int] = [
+        28, 29, 30, 31, 32, 33, 27, 34      // U+064B fathatan to U+0652 sukun
+    ]
+
+    private func isMoved(_ offsets: [Int], _ start: Int, _ end: Int) -> Bool {
+        for k in start..<end where offsets[2*k] != 0 || offsets[2*k + 1] != 0 {
+            return true
+        }
+        return false
+    }
+
+    // Draws a word with moved marks in a marked content span that has the text
+    // of the word as its actual text. Text extraction would otherwise take a
+    // moved mark for text above or below the line, and break the word there.
+    // Poppler puts the actual text where the first glyph of the span is drawn,
+    // so a word that starts with a moved mark, like a Hebrew or Arabic word
+    // drawn in visual order, starts with a space drawn back over the space
+    // before it, and its actual text starts with a space. MuPDF takes the
+    // glyphs that match the actual text as they are, and leaves out a space
+    // drawn over a space.
+    private func appendWordWithMovedMarks(
+            _ font: Font, _ codePoints: [Int], _ gids: [Int], _ offsets: [Int], _ start: Int, _ end: Int) {
+        let leadingSpace = isMoved(offsets, start, start + 1)
+        var text = leadingSpace ? " " : ""
+        for k in start..<end {
+            text.append(Page.textOf(font, codePoints[k]))    // The text the glyphs map to
+        }
+        append("> Tj\n/Span <</ActualText <")
+        append(Page.toUTF16Hex(text))
+        append(">>> BDC\n")
+        if leadingSpace {
+            let space = font.unicodeToGID[0x0020]
+            append("[")
+            append(1000.0 * Float(font.glyphAdvance(space)) / Float(font.unitsPerEm))
+            append(" <")
+            appendGlyphUnkerned(font, space)
+            append(">] TJ\n")
+        }
+        append("<")
+        for k in start..<end {
+            if offsets[2*k] == 0 && offsets[2*k + 1] == 0 {
+                appendGlyph(font, gids[k])
+            } else {
+                appendMovedGlyph(font, gids[k], offsets[2*k], offsets[2*k + 1])
+            }
+        }
+        append("> Tj\nEMC\n<")
+    }
+
+    // Ends the string of glyphs, draws the glyph moved by dx and dy font units,
+    // and starts the string again.
+    private func appendMovedGlyph(_ font: Font, _ gid: Int, _ dx: Int, _ dy: Int) {
+        // A mark, which kerns with neither glyph beside it, drawn in a string
+        // or TJ array of its own
+        if kernFont === font {
+            kernPrevious = gid
+        }
+        let fontSize = (textFontSize != 0.0) ? textFontSize : font.size
+        append("> Tj\n")
+        append(textRise + Float(dy) * fontSize / Float(font.unitsPerEm))
+        append(" Ts\n")
+        if dx == 0 {
+            append("<")
+            appendGlyphUnkerned(font, gid)
+            append("> Tj\n")
+        } else {
+            let adjustment = 1000.0 * Float(dx) / Float(font.unitsPerEm)
+            append("[")
+            append(-adjustment)
+            append(" <")
+            appendGlyphUnkerned(font, gid)
+            append("> ")
+            append(adjustment)
+            append("] TJ\n")
+        }
+        append(textRise)
+        append(" Ts\n<")
+    }
+
+    /// Saves the current graphics state. Please see Example_30.
+    public func saveGraphicsState() {
+        savedStates.append(State(brushColor, brushColorWritten, penColor, penColorWritten,
+                penWidth, penWidthWritten, writtenFont, writtenFontSize,
+                writtenFontPrecise, lineCapStyle, lineJoinStyle, strokeDashPattern, height))
+        append("q\n")
+    }
+
+    ///
+    /// Sets the graphics state. Please see Example_30.
+    ///
+    /// - Parameter gs: the graphics state to use.
+    /// - Returns: this page.
+    ///
+    @discardableResult
+    public final func setGraphicsState(_ gs: GraphicsState) -> Page {
+        // PDF/A-1 has no transparency, and veraPDF refused the document
+        // (review of 12 October 2026, R9).
+        if pdf.isPDFA1() && (gs.getAlphaStroking() < 1 || gs.getAlphaNonStroking() < 1) {
+            pdf.fail("A document of \(pdf.compliance)"
+                    + " cannot draw with an opacity below 1: PDF/A-1 has no transparency.")
+            return self
+        }
+        if pdf.isPDFA1(), let blendMode = gs.getBlendMode(), blendMode != BlendMode.NORMAL {
+            pdf.fail("A document of \(pdf.compliance)"
+                    + " cannot draw with the blend mode \(blendMode.rawValue): PDF/A-1 has no transparency.")
+            return self
+        }
+        let state = gs.entries()
+        var n = pdf.states[state]
+        if n == nil {
+            n = pdf.states.count + 1
+            pdf.states[state] = n
+        }
+        let value = ["<<"] + state.split(separator: " ").map(String.init) + [">>"]
+        append(resourceName("/ExtGState", "/GS", n!, value, 0))
+        append(" gs\n")
+        return self
+    }
+
+    /// Restores the last saved graphics state. Please see Example_30.
+    public func restoreGraphicsState() {
+        guard let state = savedStates.popLast() else {
+            pdf.fail("restoreGraphicsState was called without a matching saveGraphicsState.")
+            return
+        }
+        penChanges += 1
+        penColor = state.getPen()
+        penColorWritten = state.getPenWritten()
+        brushColor = state.getBrush()
+        brushColorWritten = state.getBrushWritten()
+        penWidth = state.getPenWidth()
+        penWidthWritten = state.getPenWidthWritten()
+        writtenFont = state.getWrittenFont()
+        writtenFontSize = state.getWrittenFontSize()
+        writtenFontPrecise = state.getWrittenFontPrecise()
+        lineCapStyle = state.getLineCapStyle()
+        lineJoinStyle = state.getLineJoinStyle()
+        strokeDashPattern = state.getLinePattern()
+        // transform divides the height of the page by the vertical scale, so
+        // the y coordinates that follow are measured in the space it made;
+        // the state the transformation was saved before has the height back.
+        height = state.getHeight()
+        append("Q\n")
+    }
+
+    /// Sets the pen color as a 0xRRGGBB value.
+    /// Color.transparent leaves it unchanged.
+    @discardableResult
+    public func setPenColor(_ color: Int32) -> Page {
+        if color == Color.transparent {
+            return self
+        }
+        penChanges += 1
+        if color == Util.shortColor {
+            pdf.fail(Page.RGB_COUNT)
+            return self
+        }
+        let r = Float((color >> 16) & 0xff)/255.0
+        let g = Float((color >>  8) & 0xff)/255.0
+        let b = Float((color)       & 0xff)/255.0
+        if penColorWritten && penColor[0] == r && penColor[1] == g && penColor[2] == b {
+            return self     // The content is drawn with this color already
+        }
+        return setPenColor([r, g, b])
+    }
+
+    ///
+    /// Sets the pen color as red, green and blue values between 0.0 and 1.0.
+    /// A nil color is ignored, and so is a value out of range, with a warning.
+    ///
+    /// - Parameter rgbColor: the red, green and blue values.
+    /// - Returns: this page.
+    ///
+    @discardableResult
+    public func setPenColor(_ rgbColor: [Float]?) -> Page {
+        penChanges += 1
+        guard let rgbColor = rgbColor else {
+            return self
+        }
+        if rgbColor.count < 3 {
+            pdf.fail(Page.RGB_COUNT)
+            return self
+        }
+        if rgbColor[0] < 0.0 || rgbColor[0] > 1.0 ||
+                rgbColor[1] < 0.0 || rgbColor[1] > 1.0 ||
+                rgbColor[2] < 0.0 || rgbColor[2] > 1.0 {
+            FileHandle.standardError.write(Data("Warning: RGB color values must be between 0f and 1f. Ignoring request.\n".utf8))
+            return self
+        }
+        if penColorWritten && penColor[0] == rgbColor[0] && penColor[1] == rgbColor[1] && penColor[2] == rgbColor[2] {
+            return self     // The content is drawn with this color already
+        }
+        penColor = rgbColor
+        penColorWritten = true
+        append(rgbColor[0])
+        append(Token.space)
+        append(rgbColor[1])
+        append(Token.space)
+        append(rgbColor[2])
+        append(" RG\n")
+        return self
+    }
+
+    /// Returns the pen color as red, green and blue values between 0.0 and 1.0.
+    public final func getPenColor() -> [Float] {
+        return penColor
+    }
+
+    /// Sets the brush color as a 0xRRGGBB value.
+    /// Color.transparent leaves it unchanged.
+    @discardableResult
+    public func setBrushColor(_ color: Int32) -> Page {
+        if color == Color.transparent {
+            return self
+        }
+        if color == Util.shortColor {
+            pdf.fail(Page.RGB_COUNT)
+            return self
+        }
+        let r = Float((color >> 16) & 0xff)/255.0
+        let g = Float((color >>  8) & 0xff)/255.0
+        let b = Float((color)       & 0xff)/255.0
+        if brushColorWritten && brushColor[0] == r && brushColor[1] == g && brushColor[2] == b {
+            return self     // The content is drawn with this color already
+        }
+        return setBrushColor([r, g, b])
+    }
+
+    ///
+    /// Sets the brush color as red, green and blue values between 0.0 and 1.0.
+    /// A nil color is ignored, and so is a value out of range, with a warning.
+    ///
+    /// - Parameter rgbColor: the red, green and blue values.
+    /// - Returns: this page.
+    ///
+    @discardableResult
+    public func setBrushColor(_ rgbColor: [Float]?) -> Page {
+        guard let rgbColor = rgbColor else {
+            return self
+        }
+        if rgbColor.count < 3 {
+            pdf.fail(Page.RGB_COUNT)
+            return self
+        }
+        if rgbColor[0] < 0.0 || rgbColor[0] > 1.0 ||
+                rgbColor[1] < 0.0 || rgbColor[1] > 1.0 ||
+                rgbColor[2] < 0.0 || rgbColor[2] > 1.0 {
+            FileHandle.standardError.write(Data("Warning: RGB color values must be between 0f and 1f. Ignoring request.\n".utf8))
+            return self
+        }
+        if brushColorWritten && brushColor[0] == rgbColor[0] && brushColor[1] == rgbColor[1] && brushColor[2] == rgbColor[2] {
+            return self     // The content is drawn with this color already
+        }
+        brushColor = rgbColor
+        brushColorWritten = true
+        append(rgbColor[0])
+        append(Token.space)
+        append(rgbColor[1])
+        append(Token.space)
+        append(rgbColor[2])
+        append(" rg\n")
+        return self
+    }
+
+    /// Returns the brush color as red, green and blue values between 0.0 and 1.0.
+    public func getBrushColor() -> [Float] {
+        return brushColor
+    }
+
+    ///
+    /// Sets the color for stroking operations using CMYK.
+    /// The pen color is used when drawing lines and splines.
+    ///
+    /// - Parameter c: the cyan component is Float value from 0.0 to 1.0.
+    /// - Parameter m: the magenta component is Float value from 0.0 to 1.0.
+    /// - Parameter y: the yellow component is Float value from 0.0 to 1.0.
+    /// - Parameter k: the black component is Float value from 0.0 to 1.0.
+    /// - Returns: this page.
+    ///
+    @discardableResult
+    public final func setPenColorCMYK(_ c: Float, _ m: Float, _ y: Float, _ k: Float) -> Page {
+        penChanges += 1
+        if !canUseCMYK() {
+            return self
+        }
+        append(c)
+        append(Token.space)
+        append(m)
+        append(Token.space)
+        append(y)
+        append(Token.space)
+        append(k)
+        append(" K\n")
+        penColor = Page.cmykToRGB(c, m, y, k)
+        penColorWritten = false
+        return self
+    }
+
+    ///
+    /// Sets the color for brush operations using CMYK.
+    /// This is the color used when drawing regular text and filling shapes.
+    ///
+    /// - Parameter c: the cyan component is Float value from 0.0 to 1.0.
+    /// - Parameter m: the magenta component is Float value from 0.0 to 1.0.
+    /// - Parameter y: the yellow component is Float value from 0.0 to 1.0.
+    /// - Parameter k: the black component is Float value from 0.0 to 1.0.
+    /// - Returns: this page.
+    ///
+    @discardableResult
+    public final func setBrushColorCMYK(_ c: Float, _ m: Float, _ y: Float, _ k: Float) -> Page {
+        if !canUseCMYK() {
+            return self
+        }
+        append(c)
+        append(Token.space)
+        append(m)
+        append(Token.space)
+        append(y)
+        append(Token.space)
+        append(k)
+        append(" k\n")
+        brushColor = Page.cmykToRGB(c, m, y, k)
+        brushColorWritten = false
+        return self
+    }
+
+    /// Reports whether the document can use a CMYK color, and fails the
+    /// document when it cannot. The output intent of a PDF/A document is sRGB,
+    /// an RGB profile, so its colors are gray or RGB and not CMYK, as ISO 19005
+    /// asks of a device color space, as its images are.
+    private func canUseCMYK() -> Bool {
+        if pdf.isPDFA() {
+            pdf.fail("A document of \(pdf.compliance) cannot use a CMYK color: "
+                    + "its output intent is sRGB, so its colors are gray or RGB.")
+            return false
+        }
+        return true
+    }
+
+    /// Returns a CMYK color converted to RGB the way the PDF specification
+    /// converts DeviceCMYK to DeviceRGB, for getPenColor and getBrushColor.
+    private static func cmykToRGB(_ c: Float, _ m: Float, _ y: Float, _ k: Float) -> [Float] {
+        return [
+            1.0 - min(1.0, c + k),
+            1.0 - min(1.0, m + k),
+            1.0 - min(1.0, y + k)]
+    }
+
+    ///
+    /// Sets the line width to the default, 0.5 points, as every line PDFjet draws by default
+    /// (9.1.9). setPenWidth(0) is the thinnest line of the device, a pixel on a screen, faint or
+    /// gone in print.
+    ///
+    @discardableResult
+    public func setDefaultPenWidth() -> Page {
+        return setPenWidth(0.5)
+    }
+
+    ///
+    /// The stroke dash pattern controls the pattern of dashes and gaps used to stroke paths.
+    /// It is specified by a dash array and a dash phase.
+    /// The elements of the dash array are positive numbers that specify the lengths of
+    /// alternating dashes and gaps.
+    /// The dash phase specifies the distance into the dash pattern at which to start the dash.
+    /// The elements of both the dash array and the dash phase are expressed in user space units.
+    /// Examples of line dash patterns:
+    ///
+    /// ```
+    ///   "[Array] Phase"     Appearance          Description
+    ///   _______________     _________________   ____________________________________
+    ///
+    ///   "[] 0"              -----------------   Solid line
+    ///   "[3] 0"             ---   ---   ---     3 units on, 3 units off, ...
+    ///   "[2] 1"             -  --  --  --  --   1 on, 2 off, 2 on, 2 off, ...
+    ///   "[2 1] 0"           -- -- -- -- -- --   2 on, 1 off, 2 on, 1 off, ...
+    ///   "[3 5] 6"             ---     ---       2 off, 3 on, 5 off, 3 on, 5 off, ...
+    ///   "[2 3] 11"          -   --   --   --    1 on, 3 off, 2 on, 3 off, 2 on, ...
+    /// ```
+    ///
+    /// - Parameter pattern: the line dash pattern.
+    ///
+    @discardableResult
+    public func setStrokeDashPattern(_ pattern: String) -> Page {
+        if !Page.isDashPattern(pattern) {
+            pdf.fail("The dash pattern \"" + pattern + "\" is not an array of non-negative numbers, " +
+                    "not all zero, followed by a phase, such as \"[3 3] 0\".")
+            return self
+        }
+        self.strokeDashPattern = pattern
+        append(self.strokeDashPattern)
+        append(" d\n")
+        return self
+    }
+
+    // Returns true for a dash array of non-negative numbers, not all zero, and a
+    // phase, like "[3 3] 0"; "[] 0" is a solid line. The numbers are separated
+    // by white space.
+    static func isDashPattern(_ pattern: String) -> Bool {
+        let bytes = Array(pattern.utf8)
+        var i = 0
+        func isSpace(_ b: UInt8) -> Bool {
+            // The white space of Go's \\s, which has no vertical tab
+            return b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D
+        }
+        func skipSpaces() {
+            while i < bytes.count && isSpace(bytes[i]) {
+                i += 1
+            }
+        }
+        func isDigit() -> Bool {
+            return i < bytes.count && bytes[i] >= 0x30 && bytes[i] <= 0x39
+        }
+        // Reads a number, [+-]?(digits(.digits?)?|.digits), or returns nil.
+        func number() -> [UInt8]? {
+            let start = i
+            if i < bytes.count && (bytes[i] == 0x2B || bytes[i] == 0x2D) {
+                i += 1
+            }
+            var digits = 0
+            while isDigit() {
+                i += 1
+                digits += 1
+            }
+            if i < bytes.count && bytes[i] == 0x2E {
+                i += 1
+                while isDigit() {
+                    i += 1
+                    digits += 1
+                }
+            }
+            if digits == 0 {
+                i = start
+                return nil
+            }
+            return Array(bytes[start..<i])
+        }
+
+        skipSpaces()
+        guard i < bytes.count && bytes[i] == 0x5B else {    // [
+            return false
+        }
+        i += 1
+        var notAllZero = false
+        var lengths = 0
+        skipSpaces()
+        while i < bytes.count && bytes[i] != 0x5D {         // ]
+            guard let length = number(), length[0] != 0x2D else {
+                return false
+            }
+            if length.contains(where: { $0 >= 0x31 && $0 <= 0x39 }) {
+                notAllZero = true
+            }
+            lengths += 1
+            if i < bytes.count && bytes[i] != 0x5D && !isSpace(bytes[i]) {
+                return false
+            }
+            skipSpaces()
+        }
+        guard i < bytes.count else {
+            return false
+        }
+        i += 1
+        skipSpaces()
+        guard number() != nil else {
+            return false
+        }
+        skipSpaces()
+        return i == bytes.count && (lengths == 0 || notAllZero)
+    }
+
+    ///
+    /// Sets the default line dash pattern - solid line.
+    ///
+    @discardableResult
+    public func setDefaultStrokeDashPattern() -> Page {
+        self.strokeDashPattern = "[] 0"
+        append(self.strokeDashPattern)
+        append(" d\n")
+        return self
+    }
+
+    ///
+    /// Sets the pen width that will be used to draw lines and splines on this page.
+    ///
+    /// - Parameter width: the pen width.
+    ///
+    @discardableResult
+    public func setPenWidth(_ width: Float) -> Page {
+        penChanges += 1
+        if width < 0.0 {
+            pdf.fail("The pen width cannot be negative.")
+            return self
+        }
+        if penWidthWritten && width == self.penWidth {
+            return self     // The content is drawn with this width already
+        }
+        self.penWidth = width
+        penWidthWritten = true
+        append(width)
+        append(" w\n")
+        return self
+    }
+
+    /// Returns the current pen width.
+    public func getPenWidth() -> Float {
+        return self.penWidth
+    }
+
+    ///
+    /// Sets the current line cap style.
+    ///
+    /// - Parameter style: the cap style of the current line.
+    /// Supported values: CapStyle.BUTT, CapStyle.ROUND and CapStyle.PROJECTING_SQUARE
+    ///
+    @discardableResult
+    public func setLineCapStyle(_ style: CapStyle) -> Page {
+        self.lineCapStyle = style
+        append(self.lineCapStyle.rawValue)
+        append(" J\n")
+        return self
+    }
+
+    ///
+    /// Sets the line join style.
+    ///
+    /// - Parameter style: the line join style code. Supported values: JoinStyle.MITER, JoinStyle.ROUND and JoinStyle.BEVEL
+    ///
+    @discardableResult
+    public func setLineJoinStyle(_ style: JoinStyle) -> Page {
+        self.lineJoinStyle = style
+        append(self.lineJoinStyle.rawValue)
+        append(" j\n")
+        return self
+    }
+
+    ///
+    /// Moves the pen to the point with coordinates (x, y) on the page.
+    ///
+    /// - Parameter x: the x coordinate of new pen position.
+    /// - Parameter y: the y coordinate of new pen position.
+    ///
+    public func moveTo(_ x: Float, _ y: Float) {
+        append(x)
+        append(Token.space)
+        append(height - y)
+        append(" m\n")
+    }
+
+    ///
+    /// Draws a line from the current pen position to the point with coordinates (x, y),
+    /// using the current pen width and stroke color.
+    /// Make sure you call strokePath(), closePath() or fillPath() after the last call to this method.
+    ///
+    public func lineTo(_ x: Float, _ y: Float) {
+        append(x)
+        append(Token.space)
+        append(height - y)
+        append(" l\n")
+    }
+
+    ///
+    /// Draws the path using the current pen color.
+    ///
+    public func strokePath() {
+        append("S\n")
+    }
+
+    ///
+    /// Closes the path and draws it using the current pen color.
+    ///
+    public func closePath() {
+        append("s\n")
+    }
+
+    ///
+    /// Closes and fills the path with the current brush color.
+    ///
+    public func fillPath() {
+        append("f\n")
+    }
+
+    ///
+    /// Draws the outline of the specified rectangle on the page.
+    /// The left and right edges of the rectangle are at x and x + w.
+    /// The top and bottom edges are at y and y + h.
+    /// The rectangle is drawn using the current pen color.
+    ///
+    /// - Parameter x: the x coordinate of the rectangle to be drawn.
+    /// - Parameter y: the y coordinate of the rectangle to be drawn.
+    /// - Parameter w: the width of the rectangle to be drawn.
+    /// - Parameter h: the height of the rectangle to be drawn.
+    ///
+    public func drawRect(
+            _ x: Float,
+            _ y: Float,
+            _ w: Float,
+            _ h: Float) {
+        moveTo(x, y)
+        lineTo(x + w, y)
+        lineTo(x + w, y + h)
+        lineTo(x, y + h)
+        closePath()
+    }
+
+    ///
+    /// Fills the specified rectangle on the page.
+    /// The left and right edges of the rectangle are at x and x + w.
+    /// The top and bottom edges are at y and y + h.
+    /// The rectangle is drawn using the current brush color.
+    ///
+    /// - Parameter x: the x coordinate of the rectangle to be drawn.
+    /// - Parameter y: the y coordinate of the rectangle to be drawn.
+    /// - Parameter w: the width of the rectangle to be drawn.
+    /// - Parameter h: the height of the rectangle to be drawn.
+    ///
+    public func fillRect(
+            _ x: Float,
+            _ y: Float,
+            _ w: Float,
+            _ h: Float) {
+        fillRectBetween(x, y, x + w, y + h)
+    }
+
+    // Fills the rectangle between the corners (x1, y1) and (x2, y2), for a
+    // caller that has the corners, so its edges are not rounded from a width
+    // and a height.
+    func fillRectBetween(_ x1: Float, _ y1: Float, _ x2: Float, _ y2: Float) {
+        let left = x1
+        let right = x2
+        let top = height - y1
+        let bottom = height - y2
+        if abs(left) < 100000.0 && abs(right) < 100000.0 && abs(top) < 100000.0 && abs(bottom) < 100000.0 {
+            // One re operator, where four path operators drew the rectangle.
+            // The corners are rounded as the path wrote them, and the width
+            // and the height are their differences, so the edges stay where
+            // the path put them; below 100000 a float holds hundredths
+            // closely enough to be written back as the same hundredths.
+            let xLeft = FastFloat.toHundredths(left)
+            let yBottom = FastFloat.toHundredths(bottom)
+            append(Float(xLeft) / 100.0)
+            append(Token.space)
+            append(Float(yBottom) / 100.0)
+            append(Token.space)
+            append(Float(FastFloat.toHundredths(right) - xLeft) / 100.0)
+            append(Token.space)
+            append(Float(FastFloat.toHundredths(top) - yBottom) / 100.0)
+            append(" re\nf\n")
+        } else {
+            // Outside the page by far, or NaN, which moveTo refuses.
+            moveTo(x1, y1)
+            lineTo(x2, y1)
+            lineTo(x2, y2)
+            lineTo(x1, y2)
+            fillPath()
+        }
+    }
+
+    ///
+    /// Draws or fills the specified path using the current pen or brush. A path
+    /// that ends on a control point, whose curve has no end, is refused and
+    /// nothing of it is drawn.
+    ///
+    /// - Parameter path: the path.
+    /// - Parameter pathOperator: the path operator, for example PathOperator.STROKE or PathOperator.FILL.
+    ///
+    public func drawPath(
+            _ path: [Point],
+            _ pathOperator: PathOperator) {
+        if path.count < 2 {
+            return // A path needs two points to paint anything.
+        }
+        if let message = Page.pathError(path) {
+            pdf.fail(message)
+            return
+        }
+        var point = path[0]
+        moveTo(point.x, point.y)
+        var controlPoint: String = ""
+        for i in 1..<path.count {
+            point = path[i]
+            if point.controlPoint != "" {
+                controlPoint = point.controlPoint
+                append(point)
+            } else {
+                if controlPoint != "" {
+                    append(point)
+                    append(controlPoint)
+                    append("\n")
+                    controlPoint = ""
+                } else {
+                    lineTo(point.x, point.y)
+                }
+            }
+        }
+        append(pathOperator.rawValue)
+        append("\n")
+    }
+
+    ///
+    /// Draws a circle on the page.
+    ///
+    /// The outline of the circle is drawn using the current pen color.
+    ///
+    /// - Parameter x: the x coordinate of the center of the circle to be drawn.
+    /// - Parameter y: the y coordinate of the center of the circle to be drawn.
+    /// - Parameter r: the radius of the circle to be drawn.
+    ///
+    public func drawCircle(
+            _ x: Float,
+            _ y: Float,
+            _ r: Float) {
+        drawEllipse(x, y, r, r, PathOperator.STROKE)
+    }
+
+    ///
+    /// Fills a circle on the page using the current brush color.
+    ///
+    /// - Parameter x: the x coordinate of the center of the circle to be filled.
+    /// - Parameter y: the y coordinate of the center of the circle to be filled.
+    /// - Parameter r: the radius of the circle to be filled.
+    ///
+    public func fillCircle(
+            _ x: Float,
+            _ y: Float,
+            _ r: Float) {
+        drawEllipse(x, y, r, r, PathOperator.FILL)
+    }
+
+    ///
+    /// Draws an ellipse on the page using the current pen color.
+    ///
+    /// - Parameter x: the x coordinate of the center of the ellipse to be drawn.
+    /// - Parameter y: the y coordinate of the center of the ellipse to be drawn.
+    /// - Parameter r1: the horizontal radius of the ellipse to be drawn.
+    /// - Parameter r2: the vertical radius of the ellipse to be drawn.
+    ///
+    public func drawEllipse(
+            _ x: Float,
+            _ y: Float,
+            _ r1: Float,
+            _ r2: Float) {
+        drawEllipse(x, y, r1, r2, PathOperator.STROKE)
+    }
+
+    ///
+    /// Fills an ellipse on the page using the current brush color.
+    ///
+    /// - Parameter x: the x coordinate of the center of the ellipse to be drawn.
+    /// - Parameter y: the y coordinate of the center of the ellipse to be drawn.
+    /// - Parameter r1: the horizontal radius of the ellipse to be drawn.
+    /// - Parameter r2: the vertical radius of the ellipse to be drawn.
+    ///
+    public func fillEllipse(
+            _ x: Float,
+            _ y: Float,
+            _ r1: Float,
+            _ r2: Float) {
+        drawEllipse(x, y, r1, r2, PathOperator.FILL)
+    }
+
+    ///
+    /// Draws an ellipse on the page and fills it using the current brush color.
+    ///
+    /// - Parameter x: the x coordinate of the center of the ellipse to be drawn.
+    /// - Parameter y: the y coordinate of the center of the ellipse to be drawn.
+    /// - Parameter r1: the horizontal radius of the ellipse to be drawn.
+    /// - Parameter r2: the vertical radius of the ellipse to be drawn.
+    /// - Parameter operation: the operation.
+    ///
+    private func drawEllipse(
+            _ x: Float,
+            _ y: Float,
+            _ r1: Float,
+            _ r2: Float,
+            _ pathOperator: PathOperator) {
+        // The best 4-spline magic number
+        let m4: Float = 0.55228
+
+        // Starting point
+        moveTo(x, y - r2)
+
+        appendPointXY(x + m4*r1, y - r2)
+        appendPointXY(x + r1, y - m4*r2)
+        appendPointXY(x + r1, y)
+        append("c\n")
+
+        appendPointXY(x + r1, y + m4*r2)
+        appendPointXY(x + m4*r1, y + r2)
+        appendPointXY(x, y + r2)
+        append("c\n")
+
+        appendPointXY(x - m4*r1, y + r2)
+        appendPointXY(x - r1, y + m4*r2)
+        appendPointXY(x - r1, y)
+        append("c\n")
+
+        appendPointXY(x - r1, y - m4*r2)
+        appendPointXY(x - m4*r1, y - r2)
+        appendPointXY(x, y - r2)
+        append("c\n")
+
+        append(pathOperator.rawValue)
+        append("\n")
+    }
+
+    ///
+    /// Draws a point on the page using the current pen color.
+    ///
+    /// - Parameter p: the point.
+    ///
+    public func drawPoint(_ p: Point) {
+        if p.shape != Shape.INVISIBLE  {
+            var list: [Point]
+            if p.shape == Shape.CIRCLE {
+                drawEllipse(p.x, p.y, p.r, p.r, p.getPathOperator())
+            } else if p.shape == Shape.DIAMOND {
+                list = [Point]()
+                list.append(Point(p.x, p.y - p.r*1.2))
+                list.append(Point(p.x + p.r*1.2, p.y))
+                list.append(Point(p.x, p.y + p.r*1.2))
+                list.append(Point(p.x - p.r*1.2, p.y))
+                drawPath(list, p.getPathOperator())
+            } else if p.shape == Shape.BOX {
+                list = [Point]()
+                list.append(Point(p.x - p.r*0.886, p.y - p.r*0.886))
+                list.append(Point(p.x + p.r*0.886, p.y - p.r*0.886))
+                list.append(Point(p.x + p.r*0.886, p.y + p.r*0.886))
+                list.append(Point(p.x - p.r*0.886, p.y + p.r*0.886))
+                drawPath(list, p.getPathOperator())
+            } else if p.shape == Shape.PLUS {
+                drawLine(p.x - p.r, p.y, p.x + p.r, p.y)
+                drawLine(p.x, p.y - p.r, p.x, p.y + p.r)
+            } else if p.shape == Shape.UP_ARROW {
+                list = [Point]()
+                list.append(Point(p.x, p.y - p.r))
+                list.append(Point(p.x + p.r, p.y + p.r))
+                list.append(Point(p.x - p.r, p.y + p.r))
+                list.append(Point(p.x, p.y - p.r))
+                drawPath(list, p.getPathOperator())
+            } else if p.shape == Shape.DOWN_ARROW {
+                list = [Point]()
+                list.append(Point(p.x - p.r, p.y - p.r))
+                list.append(Point(p.x + p.r, p.y - p.r))
+                list.append(Point(p.x, p.y + p.r))
+                list.append(Point(p.x - p.r, p.y - p.r))
+                drawPath(list, p.getPathOperator())
+            } else if p.shape == Shape.LEFT_ARROW {
+                list = [Point]()
+                list.append(Point(p.x + p.r, p.y + p.r))
+                list.append(Point(p.x - p.r, p.y))
+                list.append(Point(p.x + p.r, p.y - p.r))
+                list.append(Point(p.x + p.r, p.y + p.r))
+                drawPath(list, p.getPathOperator())
+            } else if p.shape == Shape.RIGHT_ARROW {
+                list = [Point]()
+                list.append(Point(p.x - p.r, p.y - p.r))
+                list.append(Point(p.x + p.r, p.y))
+                list.append(Point(p.x - p.r, p.y + p.r))
+                list.append(Point(p.x - p.r, p.y - p.r))
+                drawPath(list, p.getPathOperator())
+            } else if p.shape == Shape.HORIZONTAL_DASH {
+                drawLine(p.x - p.r, p.y, p.x + p.r, p.y)
+            } else if p.shape == Shape.VERTICAL_DASH {
+                drawLine(p.x, p.y - p.r, p.x, p.y + p.r)
+            } else if p.shape == Shape.X_MARK {
+                drawLine(p.x - p.r, p.y - p.r, p.x + p.r, p.y + p.r)
+                drawLine(p.x - p.r, p.y + p.r, p.x + p.r, p.y - p.r)
+            } else if p.shape == Shape.MULTIPLY {
+                drawLine(p.x - p.r, p.y - p.r, p.x + p.r, p.y + p.r)
+                drawLine(p.x - p.r, p.y + p.r, p.x + p.r, p.y - p.r)
+                drawLine(p.x - p.r, p.y, p.x + p.r, p.y)
+                drawLine(p.x, p.y - p.r, p.x, p.y + p.r)
+            } else if p.shape == Shape.STAR {
+                list = [Point]()
+                for i in 0..<10 {
+                    let theta = Double(i) * 36.0 * (Double.pi / 180.0)
+                    let radius = (i % 2 == 0)
+                    ? Double(p.r) * 1.147
+                    : Double(p.r) * 0.38196 * 1.147
+                    let x = Float(Double(p.x) + radius * sin(theta))
+                    let y = Float(Double(p.y) - radius * cos(theta))  // minus because y grows down
+                    list.append(Point(x, y))
+                }
+                drawPath(list, p.getPathOperator())
+            }
+        }
+    }
+
+    ///
+    /// Sets the text rendering mode.
+    ///
+    /// - Parameter mode: the rendering mode.
+    ///
+    @discardableResult
+    public func setTextRenderingMode(_ mode: Int) throws -> Page {
+        if mode >= 0 && mode <= 7 {
+            self.renderingMode = mode
+        } else {
+            throw PDFjetError(message: "Invalid text rendering mode: \(mode)")
+        }
+        return self
+    }
+
+    ///
+    /// Sets the rotation of the text that is drawn next. A positive angle turns
+    /// clockwise, as every rotation in PDFjet turns, and a negative angle
+    /// counterclockwise.
+    ///
+    /// - Parameter angleInDegrees: the angle in degrees.
+    ///
+    @discardableResult
+    public func setTextRotation(_ angleInDegrees: Int) -> Page {
+        // The text matrix turns counterclockwise, as PDF does. The angle is
+        // taken within a turn first, as Int.min has no negative.
+        var degrees: Int = -(angleInDegrees % 360)
+        if degrees > 360 {
+            degrees %= 360
+        }
+        if degrees < 0 {
+            degrees = degrees % 360 + 360
+        }
+        if degrees == 0 {
+            self.tmx = [ 1.0,  0.0,  0.0,  1.0 ]
+        } else if degrees == 90 {
+            self.tmx = [ 0.0,  1.0, -1.0,  0.0 ]
+        } else if degrees == 180 {
+            self.tmx = [-1.0,  0.0,  0.0, -1.0 ]
+        } else if degrees == 270 {
+            self.tmx = [ 0.0, -1.0,  1.0,  0.0 ]
+        } else if degrees == 360 {
+            self.tmx = [ 1.0,  0.0,  0.0,  1.0 ]
+        } else {
+            let sinOfAngle = Float(sin(Double(degrees) * (Double.pi / 180.0)))
+            let cosOfAngle = Float(cos(Double(degrees) * (Double.pi / 180.0)))
+            self.tmx = [cosOfAngle, sinOfAngle, -sinOfAngle, cosOfAngle]
+        }
+        // The sine and the cosine are written with five decimals: hundredths
+        // would turn the text by another angle, by 1.15 degrees for 1.
+        self.tm0 = FastFloat.toPreciseByteArray(tmx[0])
+        self.tm1 = FastFloat.toPreciseByteArray(tmx[1])
+        self.tm2 = FastFloat.toPreciseByteArray(tmx[2])
+        self.tm3 = FastFloat.toPreciseByteArray(tmx[3])
+        return self
+    }
+
+    ///
+    /// Sets the text rotation and the text rendering mode of the page to none
+    /// and to fill, the ones a chart draws its text with, and returns what puts
+    /// back the ones the page had. The charts drew their text in the rotation
+    /// and the mode the program had left on the page, and BarChart then set the
+    /// rotation to none.
+    ///
+    func plainText() -> () -> Void {
+        let tmx = self.tmx
+        let tm0 = self.tm0
+        let tm1 = self.tm1
+        let tm2 = self.tm2
+        let tm3 = self.tm3
+        let mode = self.renderingMode
+        setTextRotation(0)
+        self.renderingMode = 0
+        return {
+            self.tmx = tmx
+            self.tm0 = tm0
+            self.tm1 = tm1
+            self.tm2 = tm2
+            self.tm3 = tm3
+            self.renderingMode = mode
+        }
+    }
+
+    ///
+    /// Draws a cubic bezier curve starting from the current point to the end point p3
+    ///
+    /// - Parameter x1: first control point x
+    /// - Parameter y1: first control point y
+    /// - Parameter x2: second control point x
+    /// - Parameter y2: second control point y
+    /// - Parameter x3: end point x
+    /// - Parameter y3: end point y
+    ///
+    public func curveTo(
+        _ x1: Float, _ y1: Float,
+        _ x2: Float, _ y2: Float,
+        _ x3: Float, _ y3: Float) {
+        append(x1)
+        append(Token.space)
+        append(height - y1)
+        append(Token.space)
+        append(x2)
+        append(Token.space)
+        append(height - y2)
+        append(Token.space)
+        append(x3)
+        append(Token.space)
+        append(height - y3)
+        append(" c\n")
+    }
+
+    ///
+    /// Adds a circular arc to the current path.
+    ///
+    /// - Parameter x: the x coordinate of the center.
+    /// - Parameter y: the y coordinate of the center.
+    /// - Parameter r: the radius.
+    /// - Parameter startAngle: the start angle in degrees.
+    /// - Parameter sweepDegrees: the sweep angle in degrees.
+    /// - Returns: the control points and the end point of the last curve segment.
+    ///
+    public func addCircularArcToPath(
+        _ x: Float, _ y: Float, _ r: Float, _ startAngle: Float, _ sweepDegrees: Float) -> [Float] {
+        return addArcToPath(x, y, r, r, startAngle, sweepDegrees)
+    }
+
+    ///
+    /// Adds an elliptical arc to the current path.
+    ///
+    /// - Parameter x: the x coordinate of the center.
+    /// - Parameter y: the y coordinate of the center.
+    /// - Parameter rx: the horizontal radius.
+    /// - Parameter ry: the vertical radius.
+    /// - Parameter startAngle: the start angle in degrees.
+    /// - Parameter sweepDegrees: the sweep angle in degrees.
+    /// - Returns: the control points and the end point of the last curve segment.
+    ///
+    public func addArcToPath(
+            _ x: Float,
+            _ y: Float,
+            _ rx: Float,
+            _ ry: Float,
+            _ startAngle: Float,
+            _ sweepDegrees: Float) -> [Float] {
+        var x1: Float = 0.0
+        var y1: Float = 0.0
+        var x2: Float = 0.0
+        var y2: Float = 0.0
+        var x3: Float = 0.0
+        var y3: Float = 0.0
+
+        if !isArcSweep(sweepDegrees) {
+            return [x1, y1, x2, y2, x3, y3]
+        }
+        let sweepDegrees = max(-360.0, min(360.0, sweepDegrees))
+        let numSegments = Int((abs(sweepDegrees) / 90.0).rounded(.up))
+        var angleRad = Double(startAngle) * .pi / 180.0
+        let deltaPerSeg = Double(sweepDegrees / Float(numSegments)) * .pi / 180.0
+
+        for i in 0..<numSegments {
+            let segStart = angleRad
+            let segEnd = angleRad + deltaPerSeg
+            let deltaRad = segEnd - segStart // guaranteed ≤ ±π/2
+
+            // Calculate safe κ
+            let k = Float(4.0 / 3.0 * tan(deltaRad / 4.0))
+
+            let cosStart = Float(cos(segStart))
+            let sinStart = Float(sin(segStart))
+            let cosEnd = Float(cos(segEnd))
+            let sinEnd = Float(sin(segEnd))
+
+            // End points
+            let x0 = x + rx * cosStart
+            let y0 = y + ry * sinStart
+            x3 = x + rx * cosEnd
+            y3 = y + ry * sinEnd
+
+            // Control points
+            x1 = x0 - (k * rx * sinStart)
+            y1 = y0 + (k * ry * cosStart)
+            x2 = x3 + (k * rx * sinEnd)
+            y2 = y3 - (k * ry * cosEnd)
+
+            if i == 0 {
+                moveTo(x0, y0)
+            }
+            curveTo(x1, y1, x2, y2, x3, y3)
+
+            angleRad = segEnd
+        }
+
+        return [x1, y1, x2, y2, x3, y3]
+    }
+
+    // Returns false for a sweep of an arc that draws nothing: 0, or one that is
+    // not a number or is infinite, which is refused, as it would take a curve
+    // for every quarter turn of it. A sweep of more than a full turn either
+    // way is drawn as a full turn.
+    func isArcSweep(_ sweepDegrees: Float) -> Bool {
+        if !sweepDegrees.isFinite {
+            pdf.fail("The sweep of an arc must be a finite number of degrees.")
+            return false
+        }
+        return sweepDegrees != 0.0
+    }
+
+    ///
+    /// Draws a bezier curve starting from the current point.
+    /// **Please note:** You must call the fillPath,
+    /// closePath or strokePath method after the last bezierCurveTo call.
+    ///
+    /// *Author:* **Pieter Libin**, pieter@emweb.be
+    ///
+    /// - Parameter p1: first control point
+    /// - Parameter p2: second control point
+    /// - Parameter p3: end point
+    ///
+    public func bezierCurveTo(
+            _ p1: Point,
+            _ p2: Point,
+            _ p3: Point) {
+        append(p1)
+        append(p2)
+        append(p3)
+        append("c\n")
+    }
+
+    internal func setTextFont(_ font: Font, _ fontSize: Float) {
+        writeTextFont(font, fontSize, false)
+    }
+
+    // Sets the text font; precise is for SVG text, whose size is in the units of
+    // the image: with a scale in the text matrix, 0.125 written as 0.13 is 4% too
+    // large, and 0.004 written as 0 draws nothing.
+    func writeTextFont(_ font: Font, _ fontSize: Float, _ precise: Bool) {
+        if let identity = font.pdfIdentity, identity != pdf.identity {
+            pdf.fail("The font belongs to another PDF.")
+        }
+        self.textFontSize = fontSize
+        // The size as it was written counts too: 0.125 written as 0.13 for text
+        // drawn before is not the 0.125 of SVG text in the same font.
+        if writtenFont === font && writtenFontSize == fontSize && writtenFontPrecise == precise {
+            return          // The text is drawn in this font already
+        }
+        writtenFont = font
+        writtenFontSize = fontSize
+        writtenFontPrecise = precise
+        if font.pdfIdentity == nil || font.pdfIdentity == pdf.identity {
+            font.referenced = true      // Never a write to the font of another PDF
+        }
+        if font.fontID != nil {
+            append("/")
+            append(font.fontID!)
+        } else {
+            append("/F")
+            append(font.objNumber)
+        }
+        append(Token.space)
+        if precise {
+            appendPrecise(fontSize)
+        } else {
+            append(fontSize)
+        }
+        append(" Tf\n")
+    }
+
+    // Original code provided by:
+    // Dominique Andre Gunia <contact@dgunia.de>
+    // >>
+    ///
+    /// Draws the outline of a rectangle with rounded corners using the current pen color.
+    ///
+    /// - Parameter x: the x coordinate of the top left corner.
+    /// - Parameter y: the y coordinate of the top left corner.
+    /// - Parameter w: the width.
+    /// - Parameter h: the height.
+    /// - Parameter r1: the horizontal radius of the corners.
+    /// - Parameter r2: the vertical radius of the corners.
+    ///
+    public func drawRoundedRect(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ r1: Float, _ r2: Float) {
+        drawRoundedRect(x, y, w, h, r1, r2, PathOperator.STROKE)
+    }
+
+    ///
+    /// Fills a rectangle with rounded corners using the current brush color.
+    ///
+    /// - Parameter x: the x coordinate of the top left corner.
+    /// - Parameter y: the y coordinate of the top left corner.
+    /// - Parameter w: the width.
+    /// - Parameter h: the height.
+    /// - Parameter r1: the horizontal radius of the corners.
+    /// - Parameter r2: the vertical radius of the corners.
+    ///
+    public func fillRoundedRect(_ x: Float, _ y: Float, _ w: Float, _ h: Float, _ r1: Float, _ r2: Float) {
+        drawRoundedRect(x, y, w, h, r1, r2, PathOperator.FILL)
+    }
+
+    // Draws a rectangle with rounded corners with the path operator.
+    private func drawRoundedRect(
+            _ x: Float,
+            _ y: Float,
+            _ w: Float,
+            _ h: Float,
+            _ r1: Float,
+            _ r2: Float,
+            _ pathOperator: PathOperator) {
+        // The best 4-spline magic number
+        let m4: Float = 0.55228
+        var list = [Point]()
+        // Starting point
+        list.append(Point(x + w - r1, y))
+        list.append(Point(x + w - r1 + m4*r1, y, Point.CONTROL_POINT_C))
+        list.append(Point(x + w, y + r2 - m4*r2, Point.CONTROL_POINT_C))
+        list.append(Point(x + w, y + r2))
+
+        list.append(Point(x + w, y + h - r2))
+        list.append(Point(x + w, y + h - r2 + m4*r2, Point.CONTROL_POINT_C))
+        list.append(Point(x + w - m4*r1, y + h, Point.CONTROL_POINT_C))
+        list.append(Point(x + w - r1, y + h))
+
+        list.append(Point(x + r1, y + h))
+        list.append(Point(x + r1 - m4*r1, y + h, Point.CONTROL_POINT_C))
+        list.append(Point(x, y + h - m4*r2, Point.CONTROL_POINT_C))
+        list.append(Point(x, y + h - r2))
+
+        list.append(Point(x, y + r2))
+        list.append(Point(x, y + r2 - m4*r2, Point.CONTROL_POINT_C))
+        list.append(Point(x + m4*r1, y, Point.CONTROL_POINT_C))
+        list.append(Point(x + r1, y))
+        list.append(Point(x + w - r1, y))
+
+        drawPath(list, pathOperator)
+    }
+
+    ///
+    /// Clips the path.
+    ///
+    public func clipPath() {
+        append("W\n")
+        append("n\n")   // Close the path without painting it.
+    }
+
+    /// Sets the clipping path to the specified rectangle.
+    public func clipRect(
+            _ x: Float,
+            _ y: Float,
+            _ w: Float,
+            _ h: Float) {
+        moveTo(x, y)
+        lineTo(x + w, y)
+        lineTo(x + w, y + h)
+        lineTo(x, y + h)
+        clipPath()
+    }
+
+    // <<
+
+    ///
+    /// Sets the page CropBox.
+    /// See page 77 of the PDF32000_2008.pdf specification.
+    ///
+    /// - Parameter upperLeftX: the top left X coordinate of the CropBox.
+    /// - Parameter upperLeftY: the top left Y coordinate of the CropBox.
+    /// - Parameter lowerRightX: the bottom right X coordinate of the CropBox.
+    /// - Parameter lowerRightY: the bottom right Y coordinate of the CropBox.
+    ///
+    @discardableResult
+    public func setCropBox(
+            _ upperLeftX: Float,
+            _ upperLeftY: Float,
+            _ lowerRightX: Float,
+            _ lowerRightY: Float) -> Page {
+        self.cropBox = [upperLeftX, upperLeftY, lowerRightX, lowerRightY]
+        return self
+    }
+
+    ///
+    /// Sets the page BleedBox.
+    /// See page 77 of the PDF32000_2008.pdf specification.
+    ///
+    /// - Parameter upperLeftX: the top left X coordinate of the BleedBox.
+    /// - Parameter upperLeftY: the top left Y coordinate of the BleedBox.
+    /// - Parameter lowerRightX: the bottom right X coordinate of the BleedBox.
+    /// - Parameter lowerRightY: the bottom right Y coordinate of the BleedBox.
+    ///
+    @discardableResult
+    public func setBleedBox(
+            _ upperLeftX: Float,
+            _ upperLeftY: Float,
+            _ lowerRightX: Float,
+            _ lowerRightY: Float) -> Page {
+        self.bleedBox = [upperLeftX, upperLeftY, lowerRightX, lowerRightY]
+        return self
+    }
+
+    ///
+    /// Sets the page TrimBox.
+    /// See page 77 of the PDF32000_2008.pdf specification.
+    ///
+    /// - Parameter upperLeftX: the top left X coordinate of the TrimBox.
+    /// - Parameter upperLeftY: the top left Y coordinate of the TrimBox.
+    /// - Parameter lowerRightX: the bottom right X coordinate of the TrimBox.
+    /// - Parameter lowerRightY: the bottom right Y coordinate of the TrimBox.
+    ///
+    @discardableResult
+    public func setTrimBox(
+            _ upperLeftX: Float,
+            _ upperLeftY: Float,
+            _ lowerRightX: Float,
+            _ lowerRightY: Float) -> Page {
+        self.trimBox = [upperLeftX, upperLeftY, lowerRightX, lowerRightY]
+        return self
+    }
+
+    ///
+    /// Sets the page ArtBox.
+    /// See page 77 of the PDF32000_2008.pdf specification.
+    ///
+    /// - Parameter upperLeftX: the top left X coordinate of the ArtBox.
+    /// - Parameter upperLeftY: the top left Y coordinate of the ArtBox.
+    /// - Parameter lowerRightX: the bottom right X coordinate of the ArtBox.
+    /// - Parameter lowerRightY: the bottom right Y coordinate of the ArtBox.
+    ///
+    @discardableResult
+    public func setArtBox(
+            _ upperLeftX: Float,
+            _ upperLeftY: Float,
+            _ lowerRightX: Float,
+            _ lowerRightY: Float) -> Page {
+        self.artBox = [upperLeftX, upperLeftY, lowerRightX, lowerRightY]
+        return self
+    }
+
+    private func appendPointXY(_ x: Float, _ y: Float) {
+        append(x)
+        append(Token.space)
+        append(height - y)
+        append(Token.space)
+    }
+
+    private func append(_ point: Point) {
+        append(point.x)
+        append(Token.space)
+        append(height - point.y)
+        append(Token.space)
+    }
+
+    func append(_ str: String) {
+        if written {
+            failWritten()
+            return
+        }
+        self.buf.append(contentsOf: str.utf8)
+    }
+
+    func append(_ num: Int) {
+        append(String(num))
+    }
+
+    // Appends a number of a scale, written with five decimals, as hundredths
+    // would change the size: 0.125 was written as 0.13, 4% too large, and 0.004
+    // as 0, which drew nothing (review of 30 October 2026, B6).
+    func appendPrecise(_ val: Float) {
+        if !FastFloat.isWritable(val) {
+            pdf.fail(FastFloat.NOT_WRITABLE)
+        }
+        append(FastFloat.toPreciseByteArray(val))
+    }
+
+    func append(_ val: Float) {
+        if !FastFloat.isWritable(val) {
+            // The misuse is recorded, and the number is written all the same:
+            // FastFloat writes 0 for it, so the operator keeps its operands
+            // and the content stream stays valid syntax, as in the other ports.
+            pdf.fail(FastFloat.NOT_WRITABLE)
+        }
+        if written {
+            failWritten()
+            return
+        }
+        FastFloat.append(val, to: &self.buf)
+    }
+
+    func append(_ byte: UInt8) {
+        if written {
+            failWritten()
+            return
+        }
+        self.buf.append(byte)
+    }
+
+    /// Appends the bytes to the content stream of this page.
+    func append(_ buffer: [UInt8]) {
+        if written {
+            failWritten()
+            return
+        }
+        self.buf.append(contentsOf: buffer)
+    }
+
+    // The drawing on a page whose content was written to the PDF would be lost.
+    private func failWritten() {
+        pdf.fail("The page was already written to the PDF: " +
+                "draw on a page before creating the next page or completing the PDF.")
+    }
+
+    // Appends the cm operator of the rotation with the cosine and the sine,
+    // written with five decimals, as hundredths would turn it by another
+    // angle, by 1.15 degrees for 1.
+    func appendRotation(_ cosValue: Float, _ sinValue: Float) {
+        // A NaN or infinite angle fails the document, as a NaN coordinate
+        // does: it wrote 0 0 0 0 0 0 cm, and the content vanished (review of
+        // 12 October 2026, F12).
+        if !FastFloat.isWritable(cosValue) || !FastFloat.isWritable(sinValue) {
+            pdf.fail(FastFloat.NOT_WRITABLE)
+        }
+        append(FastFloat.toPreciseByteArray(cosValue))
+        append(Token.space)
+        append(FastFloat.toPreciseByteArray(sinValue))
+        append(Token.space)
+        append(FastFloat.toPreciseByteArray(-sinValue))
+        append(Token.space)
+        append(FastFloat.toPreciseByteArray(cosValue))
+        append(" 0 0 cm\n")
+    }
+
+    // Returns the color of the word in the map of highlight colors, as written,
+    // or in lower case. The keys are compared by their code points, as in the
+    // other ports, and not by canonical equivalence, as Swift compares strings.
+    private func highlightColor(_ highlightColors: [String : Int32], _ word: String) -> Int32? {
+        let lower = Util.lowerAsJava(word)
+        var lowerColor: Int32?
+        for (key, color) in highlightColors {
+            if key.unicodeScalars.elementsEqual(word.unicodeScalars) {
+                return color
+            }
+            if lowerColor == nil && key.unicodeScalars.elementsEqual(lower.unicodeScalars) {
+                lowerColor = color
+            }
+        }
+        return lowerColor
+    }
+
+    private func drawWord(
+            _ font: Font,
+            _ str: inout String,
+            _ textColor: [Float],
+            _ highlightColors: [String : Int32]) {
+        if str != "" {
+            // A keyword is matched as written, or ignoring case when the map
+            // holds it in lower case, as TextBlock.setHighlightColors does
+            if let highlight = highlightColor(highlightColors, str) {
+                setBrushColor(highlight)
+            } else {
+                setBrushColor(textColor)
+            }
+
+            if font.isCoreFont {
+                drawASCIIWord(font, str)
+            } else {
+                append("<")
+                drawUnicodeString(font, str)
+                append("> Tj\n")
+            }
+            str = ""
+        }
+    }
+
+    // Draws a word of colored text in a core font in a TJ array of its own,
+    // moved first by the kerning of the pair it starts with the last character
+    // of the word before it: stringWidth measures the whole text, and "Y."
+    // with a colored "Y" was drawn wider than it measured, as each word was
+    // kerned on its own (the review of 28 October 2026).
+    private func drawASCIIWord(_ font: Font, _ text: String) {
+        append("[")
+        if font.kernPairs {
+            let scalars = font.withoutIgnorables(Array(text.unicodeScalars))
+            if let first = scalars.first, let last = scalars.last {
+                let c1 = font.coreFontCode(first.value)
+                if kernFont === font && kernPrevious >= 0 {
+                    let kerning = font.kerning(kernPrevious, c1)
+                    if kerning != 0 {
+                        append(-kerning)
+                    }
+                }
+                kernFont = font
+                kernPrevious = font.coreFontCode(last.value)
+            }
+        }
+        append("<")
+        drawASCIIString(font, text)
+        append(">] TJ\n")
+    }
+
+    func drawColoredString(
+            _ font: Font,
+            _ text: String,
+            _ color: [Float],
+            _ highlightColors: [String : Int32]) {
+        kernChain = true
+        defer {
+            kernChain = false
+            kernFont = nil
+        }
+        var buf1 = String()
+        var buf2 = String()
+        var inWord = false
+        for scalar in text.unicodeScalars {
+            // A combining mark belongs to the character before it, so that a
+            // word keeps its accents, which are placed on their letters and
+            // matched with the word.
+            if !Page.isCombiningMark(scalar) {
+                inWord = isLetterOrDigit(scalar)
+            }
+            if inWord {
+                drawWord(font, &buf2, color, highlightColors)
+                buf1.append(String(scalar))
+            } else {
+                drawWord(font, &buf1, color, highlightColors)
+                buf2.append(String(scalar))
+            }
+        }
+        drawWord(font, &buf1, color, highlightColors)
+        drawWord(font, &buf2, color, highlightColors)
+    }
+
+    func setStructElementsPageObjNumber(
+            _ pageObjNumber: Int) {
+        for element in structures {
+            element.pageObjNumber = pageObjNumber
+        }
+    }
+
+    /// Begins marked content for a structure element when the document is tagged: PDF/UA, or a PDF/A of level A.
+    public func addBDC(
+            _ structure: StructElem,
+            _ actualText: String?,
+            _ altDescription: String?) {
+        addBDC(structure, nil, actualText, altDescription)
+    }
+
+    /// Begins marked content in the specified language for a structure element when the document is tagged: PDF/UA, or a PDF/A of level A.
+    public func addBDC(
+            _ structure: StructElem,
+            _ language: String?,
+            _ actualText: String?,
+            _ altDescription: String?) {
+        addBDC(structure, language, actualText, altDescription, nil)
+    }
+
+    // Begins the marked content of a structure element that has attributes of
+    // its own, like a table cell that holds its text and nothing else and so
+    // needs no paragraph under it.
+    func addBDC(
+            _ structure: StructElem,
+            _ language: String?,
+            _ actualText: String?,
+            _ altDescription: String?,
+            _ attributes: String?) {
+        // An artifact is not an element of the structure: what is drawn as
+        // one, like a text line of the structure type Artifact, is marked as one.
+        if structure == StructElem.ARTIFACT {
+            addArtifactBMC()
+            return
+        }
+        markedContentDepth += 1
+        if structure == StructElem.FIGURE {
+            figure = nil    // Until it is made below, if it is tagged
+        }
+        if pdf.isTagged() && artifactDepth == 0 {
+            // A figure stands for what it draws, which only the one who draws
+            // it can say, so PDF/UA asks for a description of every one.
+            if structure == StructElem.FIGURE &&
+                    (altDescription == nil || altDescription!.trimmingCharacters(
+                        in: .whitespacesAndNewlines).isEmpty) {
+                pdf.fail("A figure of a tagged document, PDF/UA or PDF/A of level A, needs an alternative description.")
+            }
+            // The marked content of a paragraph that is drawn word by word
+            // belongs to the one element of the paragraph; a figure in it, as the
+            // linked marker of a wrapped table cell, is an element of its own,
+            // with its description (the review of 9 October 2026: it was lost).
+            if var parent = mcidParent, structure != StructElem.FIGURE {
+                if let altDescription = altDescription, !altDescription.isEmpty {
+                    parent = describedWords(parent, altDescription)
+                } else {
+                    words = nil
+                }
+                parent.mcids.append(mcid)
+                append("/")
+                append(parent.structure!)
+                append(" <</MCID ")
+                append(mcid)
+                // A word of another language than its paragraph says so in its
+                // marked content, as the paragraph is one element for all of them.
+                // The hexadecimal digits of its UTF-8 bytes, as in the other
+                // ports: the content stream is encrypted whole, so the string is
+                // not encrypted on its own (the review of 9 October 2026: it was
+                // encrypted twice).
+                if let language = language, !language.isEmpty {
+                    append(" /Lang <")
+                    append(pdf.toHex(language))
+                    append(">")
+                }
+                append(Token.endDictionary)
+                append("BDC\n")
+                mcid += 1
+                return
+            }
+            if structure == StructElem.FIGURE && figurePiece() {
+                return
+            }
+            let element = StructElement()
+            element.structure = structure.rawValue
+            element.mcid = mcid
+            element.language = language
+            element.actualText = actualText
+            element.altDescription = altDescription
+            element.attributes = attributes
+            addStructure(element, structParent)
+            amongTheWords(element)
+            append("/")
+            append(structure.rawValue)
+            append(" <</MCID ")
+            append(mcid)
+            append(Token.endDictionary)
+            append("BDC\n")
+            mcid += 1
+            // The content of a figure is the figure: what it draws inside, such as the
+            // bars and the digits of a barcode, is neither tagged again nor marked as
+            // an artifact, as it would be inside an artifact, since its description
+            // stands for it.
+            if structure == StructElem.FIGURE {
+                artifactDepth = markedContentDepth
+                figure = element
+                pieces = pieceOf
+                piecesFigure = element
+            }
+        }
+    }
+
+    // Begins the marked content of a piece of a Figure text line that a
+    // TextFrame or TextColumn draws in rows, or word by word, as one more of
+    // the Figure of the piece drawn just before it in the paragraph, and
+    // returns true; or false when it is the first piece. A figure is one
+    // element whose description a screen reader reads once: each piece was a
+    // Figure of its own, with the description of the whole line again.
+    private func figurePiece() -> Bool {
+        guard let pieceOf = pieceOf, pieces === pieceOf, let figure = piecesFigure,
+                let parent = mcidParent, parent === structParent, figure.parent === parent,
+                parent.mcids.last == -(figure.objNumber ?? 0) else {
+            return false
+        }
+        if figure.mcid >= 0 {
+            figure.mcids.append(figure.mcid)
+            figure.mcid = -1
+        }
+        figure.mcids.append(mcid)
+        append("/Figure <</MCID ")
+        append(mcid)
+        append(Token.endDictionary)
+        append("BDC\n")
+        mcid += 1
+        artifactDepth = markedContentDepth
+        self.figure = figure
+        return true
+    }
+
+    // Puts the element, a kid of a paragraph drawn word by word, like the
+    // Figure of an image in a composite text line, among the words of the
+    // paragraph, whose /K lists its marked contents and its kids in the order
+    // they are drawn: it was left out, and read by no screen reader.
+    private func amongTheWords(_ element: StructElement) {
+        if let parent = mcidParent, parent === structParent {
+            parent.mcids.append(-(element.objNumber ?? 0))
+        }
+    }
+
+    // Returns the Span of a text line with an alternate description that is
+    // drawn in a paragraph word by word or row by row: the description is of
+    // the whole text line, so its words are the marked content of one element,
+    // which takes its place among the words of the paragraph and is read once.
+    private func describedWords(_ parent: StructElement, _ altDescription: String) -> StructElement {
+        if let words = words, words.parent === parent, words.altDescription == altDescription {
+            return words
+        }
+        let element = StructElement()
+        element.structure = StructElem.SPAN.rawValue
+        element.mcid = -1
+        element.altDescription = altDescription
+        addStructure(element, parent)
+        parent.mcids.append(-(element.objNumber ?? 0))
+        words = element
+        return element
+    }
+
+    /// Sets the bounding box of the figure that AddBDC began last: the box it is
+    /// drawn in, x and y its top left corner, w wide and h tall. PDF/UA asks for
+    /// the bounding box of every figure, which a screen reader or a program that
+    /// reflows the page uses to find it. The figures of the library, images, SVG
+    /// images, charts, barcodes and QR codes, set it themselves; a figure drawn
+    /// with AddBDC and AddEMC around other drawing needs it set before AddEMC. It
+    /// does nothing in a document that is not tagged.
+    public func setFigureBoundingBox(_ x: Float, _ y: Float, _ w: Float, _ h: Float) {
+        guard let figure = figure else {
+            return
+        }
+        // Moved and turned with the containers it is drawn in
+        let box = transformedBox(x, y, x + w, y + h)
+        let x1 = box[0]
+        let y1 = box[1]
+        let x2 = box[2]
+        let y2 = box[3]
+        // In the coordinates of PDF, from the bottom left of the page
+        figure.attributes = "<</O /Layout /BBox [" +
+                bboxNumber(x1) + " " + bboxNumber(height - y2) + " " +
+                bboxNumber(x2) + " " + bboxNumber(height - y1) + "]>>"
+    }
+
+    private func bboxNumber(_ value: Float) -> String {
+        return String(decoding: FastFloat.toByteArray(value), as: UTF8.self)
+    }
+
+    /// Begins marked content for an artifact when the document is tagged: PDF/UA, or a PDF/A of level A.
+    public func addArtifactBMC() {
+        markedContentDepth += 1
+        if artifactDepth == 0 {
+            artifactDepth = markedContentDepth
+            if pdf.isTagged() {
+                append("/Artifact BMC\n")
+            }
+        }
+    }
+
+    // Begins marked content for an artifact of the type that the properties
+    // give, like "/Type /Pagination /Subtype /Footer" for a running footer,
+    // when the document is tagged, as addArtifactBMC does.
+    func addArtifactBDC(_ properties: String) {
+        markedContentDepth += 1
+        if artifactDepth == 0 {
+            artifactDepth = markedContentDepth
+            if pdf.isTagged() {
+                append("/Artifact <<")
+                append(properties)
+                append(">> BDC\n")
+            }
+        }
+    }
+
+    /// Draws glyphs that another text engine shaped -- Apple's Core Text,
+    /// HarfBuzz, Java's java.awt.font, Android's TextShaper -- by their
+    /// numbers in the font, at their places, as outlines: each glyph is drawn
+    /// as the shape the font file gives it, filled in the page's brush color.
+    /// This is how text PDFjet does not shape itself, such as Hindi or Khmer,
+    /// is drawn: the engine finds the glyphs and their places, and PDFjet
+    /// draws them.
+    ///
+    /// What the outlines give: the text looks as the engine shaped it, on any
+    /// screen and in print, with no font in the document, as the font is only
+    /// read for its outlines. In a tagged document, PDF/UA or a PDF/A of level
+    /// A, the glyphs are part of the content they are drawn in, such as a
+    /// paragraph begun with addBDC, or, drawn outside any, a paragraph of
+    /// their own; the text they stand for is their actual text, in the
+    /// language given, which screen readers read. What they do not give: the
+    /// text cannot be selected, copied or searched, as it is not text. A
+    /// document that needs its exact text along can carry it with
+    /// PDF.attachText.
+    ///
+    /// Each glyph is drawn once, as a form XObject of its outline, and placed
+    /// wherever it is drawn: a page of Hindi or Khmer draws some 150 glyphs
+    /// some 2,000 times. The glyph numbers must be those of the font file the
+    /// engine shaped with, loaded as this font: a TrueType font, or an
+    /// OpenType font of CFF outlines; not a core font or a CJK font.
+    ///
+    /// - Parameters:
+    ///   - font: the font, loaded from the font file the engine shaped with.
+    ///   - glyphs: the glyph numbers, in the order they are drawn.
+    ///   - positions: the x and the baseline y of each glyph, in points from
+    ///     the top left corner of the page: x0, y0, x1, y1 and so on.
+    ///   - text: the text the glyphs stand for, as it is read.
+    ///   - language: the language of the text, such as "hi" or "km", or nil.
+    public func drawGlyphs(_ font: Font, _ glyphs: [Int], _ positions: [Float],
+            _ text: String?, _ language: String?) {
+        if let identity = font.pdfIdentity, identity != pdf.identity {
+            pdf.fail("The font belongs to another PDF.")
+            return
+        }
+        guard !font.isCoreFont && !font.isCJK, let program = font.program else {
+            pdf.fail("drawGlyphs needs a font loaded from the font file the glyphs were shaped with.")
+            return
+        }
+        if positions.count != 2 * glyphs.count {
+            pdf.fail("drawGlyphs needs an x and a y for each glyph.")
+            return
+        }
+        for v in positions where !(abs(v) <= 1e6) {     // NaN too
+            pdf.fail("drawGlyphs needs positions between -1,000,000 and 1,000,000 points.")
+            return
+        }
+        // The size times the glyphs' matrix is written with 7 decimals
+        if !(font.size > 0 && font.size <= 10000) {     // NaN too
+            pdf.fail("drawGlyphs needs a font size of more than 0 and at most 10,000 points.")
+            return
+        }
+        if program.outline == nil {
+            do {
+                program.outline = try GlyphOutline(program.font, program.cff)
+            } catch {
+                pdf.fail((error as? PDFjetError)?.message ?? "\(error)")
+                return
+            }
+            program.glyphStamps = [:]
+        }
+        let outline = program.outline!
+        for gid in glyphs {
+            if gid < 0 || gid >= outline.count() {
+                pdf.fail("The font has no glyph number \(gid).")
+                return
+            }
+        }
+        let tagged = pdf.isTagged() && artifactDepth == 0
+        if tagged && !glyphs.isEmpty && (text ?? "").isEmpty {
+            pdf.fail("drawGlyphs in a tagged document needs the text the glyphs stand for, which screen readers read.")
+            return
+        }
+        if glyphs.isEmpty {
+            return
+        }
+        font.drawnAsOutlines = true
+        // A paragraph of their own, in a tagged document, drawn outside any
+        let own = tagged && !insideTaggedContent()
+        if own {
+            addBDC(StructElem.P, language, nil, nil)
+        }
+        // The text they stand for, and its language, as the actual text of
+        // the marked content of the outlines (ISO 32000-1, 14.9.4)
+        if tagged {
+            append("/Span <<")
+            if let language = language, !language.isEmpty {
+                append("/Lang <")
+                append(pdf.toHex(language))
+                append("> ")
+            }
+            append("/ActualText <")
+            append(Page.toUTF16Hex(text!))
+            append(">>> BDC\n")
+        }
+        let size = font.size
+        for k in 0..<glyphs.count {
+            let gid = glyphs[k]
+            // The glyph's stamp, made the first time it is drawn; nil for a
+            // glyph of no outline, as the space
+            if program.glyphStamps.index(forKey: gid) == nil {
+                let path: GlyphOutline.Path
+                do {
+                    path = try outline.outline(gid)
+                } catch {
+                    pdf.fail((error as? PDFjetError)?.message ?? "\(error)")
+                    return
+                }
+                program.glyphStamps[gid] = .some(path.operators.isEmpty ? nil : Stamp.ofGlyph(pdf, path))
+            }
+            if let stamp = program.glyphStamps[gid] ?? nil {
+                stamp.placeGlyph(self, Page.glyphMatrix(outline.matrixOf(gid), size,
+                        positions[2 * k], height - positions[2 * k + 1]))
+            }
+        }
+        if tagged {
+            append("EMC\n")
+        }
+        if own {
+            addEMC()
+        }
+    }
+
+    // The matrix that draws the units of a glyph at its place: its matrix to
+    // the em, times the size, moved to x and y, in the coordinates of PDF.
+    static func glyphMatrix(_ m: [Double], _ size: Float, _ x: Float, _ y: Float) -> String {
+        let s = Double(size)
+        return GlyphOutline.decimals(m[0] * s, 7) + " "
+                + GlyphOutline.decimals(m[1] * s, 7) + " "
+                + GlyphOutline.decimals(m[2] * s, 7) + " "
+                + GlyphOutline.decimals(m[3] * s, 7) + " "
+                + GlyphOutline.decimals(m[4] * s + Double(x), 2) + " "
+                + GlyphOutline.decimals(m[5] * s + Double(y), 2)
+    }
+
+    // Whether what is drawn now is inside real content of a tagged document:
+    // marked content an addBDC began and addEMC has not ended, with no
+    // artifact around it, like a paragraph whose letters are drawn as stamps.
+    func insideTaggedContent() -> Bool {
+        return pdf.isTagged() && markedContentDepth > 0 && artifactDepth == 0
+    }
+
+    // Begins the marked content of a shape, like a line or an arc: a
+    // paragraph when it is given an alternate description or an actual text,
+    // which a screen reader reads, and otherwise an artifact, the decoration
+    // it is.
+    func addShapeBDC(_ language: String?, _ actualText: String?, _ altDescription: String?) {
+        if (altDescription ?? "").isEmpty && (actualText ?? "").isEmpty {
+            addArtifactBMC()
+        } else {
+            addBDC(StructElem.P, language, actualText, altDescription)
+        }
+    }
+
+    /// Ends the current marked content when the document is tagged: PDF/UA, or a PDF/A of level A.
+    public func addEMC() {
+        if markedContentDepth == 0 {
+            pdf.fail("addEMC was called without a matching addBDC or addArtifactBMC.")
+            return
+        }
+        if artifactDepth == 0 || artifactDepth == markedContentDepth {
+            artifactDepth = 0
+            // The figure ends here, and a bounding box set after it is not its own
+            figure = nil
+            if pdf.isTagged() {
+                append("EMC\n")
+            }
+        }
+        markedContentDepth -= 1
+    }
+
+    // Notes a heading of a tagged document, H1 to H6, with its text and the
+    // top of its text at x, for the bookmarks that the document has when it
+    // has none of its own. The top is moved with the containers the heading is
+    // drawn in. A heading inside an artifact, like a running header, is not
+    // noted, nor anything that is not a heading.
+    func noteHeading(_ structure: StructElem, _ text: String?, _ x: Float, _ top: Float) {
+        let level = headingLevel(structure)
+        if level == 0 || !pdf.isTagged() || artifactDepth != 0 {
+            return
+        }
+        let title = (text ?? "").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        if title.isEmpty {
+            return
+        }
+        pdf.headings.append(Heading(level: level, title: title, page: self, top: transformed(x, top)[1]))
+    }
+
+    // Begins the marked content of a text that is a link, and returns the
+    // Link element its annotation joins, as PDF/UA asks: the Link holds the
+    // text and the annotation both, so that a screen reader reads the text as
+    // the link. The Link is a kid of the element of the text, structure,
+    // which it makes, like the P of a text line, or it is among the words of a
+    // paragraph drawn word by word. It returns nil, and begins the marked
+    // content as addBDC does, in a document that is not tagged or inside an
+    // artifact or a figure, where the link stays an element of its own.
+    func addLinkBDC(
+            _ structure: StructElem,
+            _ language: String?,
+            _ actualText: String?,
+            _ altDescription: String?) -> StructElement? {
+        if !pdf.isTagged() || artifactDepth != 0 || structure == StructElem.ARTIFACT {
+            addBDC(structure, language, actualText, altDescription, nil)
+            return nil
+        }
+        markedContentDepth += 1
+        let link = StructElement()
+        link.structure = StructElem.LINK.rawValue
+        link.mcid = mcid
+        link.language = language
+        if let parent = mcidParent {
+            // A word of a paragraph: the Link takes its place among the words
+            link.altDescription = altDescription
+            addStructure(link, parent)
+            parent.mcids.append(-(link.objNumber ?? 0))
+        } else if structure == StructElem.LINK {
+            link.actualText = actualText
+            link.altDescription = altDescription
+            addStructure(link, structParent)
+        } else {
+            let element = addStructElement(structParent, structure, nil)
+            element?.language = language
+            element?.actualText = actualText
+            element?.altDescription = altDescription
+            addStructure(link, element)
+        }
+        append("/Link <</MCID ")
+        append(mcid)
+        append(Token.endDictionary)
+        append("BDC\n")
+        mcid += 1
+        return link
+    }
+
+    // Begins the Link element of content that is a link and is drawn as
+    // elements of its own, like the Figure of an image, which become its
+    // kids; endLink ends it. It returns the Link, which the annotation of the
+    // link joins, or nil in a document that is not tagged or inside an
+    // artifact or a figure.
+    func beginLink() -> StructElement? {
+        let link = addStructElement(structParent, StructElem.LINK, nil)
+        if let link = link {
+            amongTheWords(link)
+            structElementStack.append(structParent)
+            structParent = link
+        }
+        return link
+    }
+
+    // Ends the Link that beginLink began, if it began one.
+    func endLink(_ link: StructElement?) {
+        if link != nil {
+            endStructElement()
+        }
+    }
+
+    // Whether what is drawn now is tagged: the document is tagged, and it is
+    // not drawn inside an artifact or a figure.
+    func isTaggedHere() -> Bool {
+        return pdf.isTagged() && artifactDepth == 0
+    }
+
+    // Adds a structure element that groups the elements added after it, like
+    // a table row, as a kid of the parent, or of the Document element when the
+    // parent is nil. Returns nil when the document is not tagged or the
+    // content drawn is an artifact.
+    func addStructElement(
+            _ parent: StructElement?,
+            _ structure: StructElem,
+            _ attributes: String?) -> StructElement? {
+        return addStructElement(parent, structure, attributes, false)
+    }
+
+    /// Begins a structure element of a tagged document, PDF/UA or a PDF/A of level A, that what is drawn until
+    /// endStructElement becomes the kids of, like the L of a list whose items are
+    /// drawn one at a time. The calls nest, and every one needs its
+    /// endStructElement. In a document that is not tagged both do nothing.
+    public func beginStructElement(_ structure: StructElem) {
+        let element = addStructElement(structParent, structure, nil)
+        structElementStack.append(structParent)
+        if element != nil {
+            structParent = element
+        }
+    }
+
+    /// Ends the structure element that beginStructElement began.
+    public func endStructElement() {
+        if structElementStack.isEmpty {
+            pdf.fail("endStructElement was called without a matching beginStructElement.")
+            return
+        }
+        structParent = structElementStack.removeLast()
+    }
+
+    // Adds a structure element that groups its kids. An open element is one a
+    // drawable goes on adding to after the page it was made on is written,
+    // like the Table of a table that runs over pages.
+    func addStructElement(
+            _ parent: StructElement?,
+            _ structure: StructElem,
+            _ attributes: String?,
+            _ open: Bool) -> StructElement? {
+        if !pdf.isTagged() || artifactDepth != 0 {
+            return nil
+        }
+        let element = StructElement()
+        element.structure = structure.rawValue
+        element.mcid = -1
+        element.attributes = attributes
+        element.open = open
+        addStructure(element, parent)
+        return element
+    }
+
+    // Gives the element its object number, which its parent and its kids refer
+    // to before it is written, and adds it to its parent and to the page.
+    private func addStructure(_ element: StructElement, _ parent: StructElement?) {
+        // An artifact is marked content outside the structure, which PDF/UA
+        // does not allow an element of the structure to be.
+        if element.structure == StructElem.ARTIFACT.rawValue {
+            pdf.fail("An artifact is not a structure element: "
+                    + "draw it between addArtifactBMC and addEMC.")
+        }
+        pdf.reserveStructTreeNumbers()
+        element.objNumber = pdf.reserveObjNumber()
+        element.pageObjNumber = self.objNumber
+        element.parent = parent
+        element.parentObjNumber = parent?.objNumber
+        element.parentStructure = parent?.structure ?? ""
+        parent?.kids.append(element.objNumber ?? 0)
+        self.structures.append(element)
+    }
+
+    func addAnnotation(_ annotation: Annotation) {
+        // The element of an annotation of a tagged document is written with
+        // its page, and a page that was written has no place for it.
+        if pdf.isTagged() && written {
+            failWritten()
+            return
+        }
+        // PDF/A-1 has the annotations of PDF 1.4 alone, and the polygon came with
+        // PDF 1.5 (ISO 19005-1, 6.5.2): veraPDF refused the document.
+        if annotation.annotationType == Annotation.Polygon && pdf.isPDFA1() {
+            pdf.fail("A document of \(pdf.compliance)"
+                    + " cannot have a polygon annotation: PDF/A-1 has none; PDF/A-2 and PDF/A-3 have it.")
+            return
+        }
+        transformAnnotation(annotation)
+        if annotation.hitSize > 0.0 {
+            (annotation.x1, annotation.x2) = Page.hitSpan(annotation.x1, annotation.x2, annotation.hitSize, self.width)
+            (annotation.y1, annotation.y2) = Page.hitSpan(annotation.y1, annotation.y2, annotation.hitSize, self.height)
+        }
+        annotation.y1 = self.height - annotation.y1
+        annotation.y2 = self.height - annotation.y2
+        self.annots.append(annotation)
+        if pdf.isTagged() {
+            // A link joins the Link element of the content it is drawn on,
+            // which its text stands for; its own description stays in its
+            // Contents
+            if let link = annotation.linkElement {
+                link.annotation = annotation
+                // The element now holds the annotation; the annotation
+                // letting go of the element breaks the cycle between them.
+                annotation.linkElement = nil
+                return
+            }
+            let element = StructElement()
+            element.mcid = -1   // It stands for the annotation, not for marked content
+            // PDF/UA puts a link in a Link element, and any other annotation in an Annot element.
+            element.structure = (annotation.annotationType == Annotation.Link) ?
+                    StructElem.LINK.rawValue : StructElem.ANNOT.rawValue
+            element.language = annotation.language
+            element.actualText = annotation.actualText
+            element.altDescription = annotation.altDescription
+            // An annotation that is not a link, a note, a shape or a file, is
+            // described by what it says, or by its title, as a viewer shows them:
+            // its element has no text of its own, which PAC would read as text of
+            // only whitespace
+            var contents = annotation.contents
+            var title = annotation.title
+            if let file = annotation.fileAttachment {
+                contents = file.contents
+                title = file.title
+            }
+            if element.altDescription == nil || element.altDescription!.isEmpty {
+                element.altDescription = contents
+            }
+            if element.altDescription == nil || element.altDescription!.isEmpty {
+                element.altDescription = title
+            }
+            // An annotation stands for what it says, which only the one who
+            // draws it can say, as a figure does.
+            if element.altDescription == nil || element.altDescription!.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty {
+                pdf.fail("An annotation of a tagged document, PDF/UA or PDF/A of level A, "
+                        + "needs contents, a title or an alternative description.")
+            }
+            element.annotation = annotation
+            addStructure(element, structParent)
+        }
+    }
+
+    func beginTransform(
+            _ x: Float,
+            _ y: Float,
+            _ xScale: Float,
+            _ yScale: Float) {
+        saveGraphicsState()
+
+        appendPrecise(xScale)
+        append(" 0 0 ")
+        appendPrecise(yScale)
+        append(Token.space)
+        append(x)
+        append(Token.space)
+        append(y)
+        append(" cm\n")
+    }
+
+    func endTransform() {
+        restoreGraphicsState()
+    }
+
+    /// Draws the content stream scaled and placed at the specified location.
+    public func drawContents(
+            _ content: [UInt8],
+            _ h: Float,     // The height of the graphics object in points.
+            _ x: Float,
+            _ y: Float,
+            _ xScale: Float,
+            _ yScale: Float) {
+        beginTransform(x, (self.height - yScale * h) - y, xScale, yScale)
+        append(content)
+        append(Token.newline)     // The content can end with an operator, like ET.
+        endTransform()
+    }
+
+    /// Draws the characters of the string one at a time, dx apart.
+    public func drawString(
+            _ font: Font,
+            _ fontSize: Float,
+            _ str: String,
+            _ x: Float,
+            _ y: Float,
+            _ dx: Float) {
+        var x1 = x
+        for scalar in str.unicodeScalars {
+            drawString(font, fontSize, String(scalar), x1, y)
+            x1 += dx
+        }
+    }
+
+    // Returns true if the character is a letter or a decimal digit of any
+    // script, as Character.isLetterOrDigit does in Java.
+    // Returns true for a combining mark, Mn, Mc or Me, as Go's unicode.IsMark.
+    static func isCombiningMark(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func isLetterOrDigit(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+                .decimalNumber:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func appendTwoHexDigits(_ number: Int, _ buffer: inout [UInt8]) {
+        let index = (number & 0xFF) << 1
+        buffer.append(hexadecimal.digits[index])
+        buffer.append(hexadecimal.digits[index + 1])
+    }
+
+    /// The hexadecimal digits.
+    static let HEX: [UInt8] = [
+        UInt8(ascii: "0"), UInt8(ascii: "1"), UInt8(ascii: "2"), UInt8(ascii: "3"),
+        UInt8(ascii: "4"), UInt8(ascii: "5"), UInt8(ascii: "6"), UInt8(ascii: "7"),
+        UInt8(ascii: "8"), UInt8(ascii: "9"), UInt8(ascii: "A"), UInt8(ascii: "B"),
+        UInt8(ascii: "C"), UInt8(ascii: "D"), UInt8(ascii: "E"), UInt8(ascii: "F")
+    ]
+
+    // Appends the glyph number as hexadecimal and records that the font draws
+    // it, so that a subset of the font keeps it.
+    private func appendGlyph(_ font: Font, _ gid: Int) {
+        if kernFont != nil {
+            appendKernedGlyph(font, gid)
+            return
+        }
+        if ownsFont(font) {
+            font.useGlyph(gid)
+        }
+        Page.appendCodePointAsHex(gid, &self.buf)
+    }
+
+    // Appends the glyph of a kerned string, with the kerning of the pair it
+    // ends before it. Apart from appendGlyph, which stays small, as almost
+    // every glyph drawn is not kerned.
+    private func appendKernedGlyph(_ font: Font, _ gid: Int) {
+        appendKerningBefore(font, gid)
+        appendGlyphUnkerned(font, gid)
+    }
+
+    // Appends the kerning of the pair the glyph ends, when the string of
+    // glyphs is of the font that kerns, and makes it the glyph drawn last.
+    private func appendKerningBefore(_ font: Font, _ gid: Int) {
+        if kernFont === font {
+            if kernPrevious >= 0 {
+                let kerning = font.glyphKerning(kernPrevious, gid)
+                if kerning != 0 {
+                    appendKerning(font, kerning)
+                }
+            }
+            kernPrevious = gid
+        }
+    }
+
+    // Appends the glyph as appendGlyph does, with no kerning before it: a
+    // space that stands in for a joiner or for a moved mark, and a moved mark,
+    // each drawn in a TJ array of its own.
+    private func appendGlyphUnkerned(_ font: Font, _ gid: Int) {
+        if ownsFont(font) {
+            font.useGlyph(gid)
+        }
+        Page.appendCodePointAsHex(gid, &self.buf)
+    }
+
+    // Ends the string of glyphs, moves the next glyph by the kerning, in font
+    // units, and starts the string again: a TJ of the move alone is valid
+    // wherever a string of glyphs is, in a span of actual text too.
+    private func appendKerning(_ font: Font, _ kerning: Int) {
+        append("> Tj\n[")
+        append(-(1000.0 * Float(kerning)) / Float(font.unitsPerEm))
+        append("] TJ\n<")
+    }
+
+    // Says whether the font is of the page's PDF, or of none. A font of
+    // another PDF is refused, and is not changed: what it records it records
+    // for its own PDF, which another thread may be drawing on; in Go, 4 PDFs
+    // drawing one font made 9 data races (review of 12 October 2026, R23).
+    private func ownsFont(_ font: Font) -> Bool {
+        guard let identity = font.pdfIdentity else {
+            return true
+        }
+        return identity == pdf.identity
+    }
+
+    // Writes the glyphs, four hex digits each, as appendCodePointAsHex writes
+    // each, in one access to the buffer.
+    private static func appendGlyphsAsHex(_ gids: [Int], _ buf: inout [UInt8]) {
+        for gid in gids {
+            appendCodePointAsHex(gid, &buf)
+        }
+    }
+
+    private static func appendCodePointAsHex(_ codePoint: Int, _ buf: inout [UInt8]) {
+        if codePoint <= 0xFFFF {
+            // Basic Multilingual Plane (BMP) character
+            buf.append(HEX[(codePoint >> 12) & 0xF])
+            buf.append(HEX[(codePoint >> 8)  & 0xF])
+            buf.append(HEX[(codePoint >> 4)  & 0xF])
+            buf.append(HEX[(codePoint)       & 0xF])
+        } else {
+            // Supplementary character (needs surrogate pair in UTF-16)
+            // Write as 6 hex digits (max Unicode code point is 0x10FFFF)
+            buf.append(HEX[(codePoint >> 20) & 0xF])
+            buf.append(HEX[(codePoint >> 16) & 0xF])
+            buf.append(HEX[(codePoint >> 12) & 0xF])
+            buf.append(HEX[(codePoint >> 8)  & 0xF])
+            buf.append(HEX[(codePoint >> 4)  & 0xF])
+            buf.append(HEX[(codePoint)       & 0xF])
+        }
+    }
+
+    /// Draws the text as a watermark diagonally across the page.
+    public func addWatermark(
+            _ font: Font,
+            _ text: String) {
+        let hypotenuse = Float(sqrt(Double(self.height * self.height + self.width * self.width)))
+        let stringWidth = font.stringWidth(text)
+        let offset = (hypotenuse - stringWidth) / 2.0
+        let angle = atan(Double(self.height / self.width))
+        if !angle.isFinite || !offset.isFinite {
+            // A page of a NaN or infinite size, as a /MediaBox of a PDF that
+            // was read can be, fails the document, as the other ports fail
+            // it: Int() of the NaN angle stopped the program (review of
+            // 12 October 2026, S2)
+            pdf.fail(FastFloat.NOT_WRITABLE)
+            return
+        }
+        let watermark = TextLine(font)
+        watermark.setTextColor(Color.lightgrey)
+        watermark.setText(text)
+        watermark.setLocation(
+                Float(Double(offset) * cos(angle)),
+                self.height - Float(Double(offset) * sin(angle)))
+        watermark.setTextRotation(-Int(angle * (180.0 / Double.pi)))
+        // A watermark is no part of the content, which a screen reader skips.
+        addArtifactBDC("/Type /Pagination /Subtype /Watermark")
+        watermark.drawOn(self)
+        addEMC()
+    }
+
+    /// Rotates this page clockwise when it is displayed, as every rotation in PDFjet turns and as /Rotate does,
+    /// by 0, 90, 180 or 270 degrees; other angles are ignored.
+    @discardableResult
+    public func setRotation(_ degrees: Int) -> Page {
+        if degrees == 0 || degrees == 90 || degrees == 180 || degrees == 270 {
+            self.rotateDegrees = Float(degrees)
+        }
+        return self
+    }
+
+    /// Flips the y axis, so the origin is the top left corner of the page and y grows downward.
+    public func invertYAxis() {
+        append("1 0 0 -1 0 ")
+        append(self.height)
+        append(" cm\n")
+    }
+
+    /// Concatenates a transformation matrix to the current one. Save the graphics
+    /// state before and restore it after. The page height is divided by the
+    /// vertical scale.
+    ///
+    /// - Parameter values: the scale x, skew x, translate x, skew y, scale y and
+    ///   translate y at the MSCALE_X to MTRANS_Y indices, the first six values of
+    ///   an Android Matrix.getValues() array.
+    public func transform(_ values: [Float]) {
+        if values.count < 6 {
+            pdf.fail(Page.TRANSFORM_COUNT)
+            return
+        }
+        let scalex = values[Page.MSCALE_X]
+        let scaley = values[Page.MSCALE_Y]
+        var transx = values[Page.MTRANS_X]
+        let transy = values[Page.MTRANS_Y]
+
+        appendPrecise(scalex)
+        append(Token.space)
+        appendPrecise(values[Page.MSKEW_X])
+        append(Token.space)
+        appendPrecise(values[Page.MSKEW_Y])
+        append(Token.space)
+        appendPrecise(scaley)
+        append(Token.space)
+
+        if asin(Double(values[Page.MSKEW_Y])) != 0.0 {
+            transx -= values[Page.MSKEW_Y] * height / scaley
+        }
+
+        append(transx)
+        append(Token.space)
+        append(-transy)
+        append(" cm\n")
+
+        self.height = self.height / scaley
+    }
+
+    /// Draws the text line centered at the top of the page.
+    @discardableResult
+    public func addHeader(_ textLine: TextLine) -> [Float] {
+        return addHeader(textLine, 1.5*textLine.font!.getAscent(textLine.fontSize))
+    }
+
+    /// Draws the text line centered at the top of the page, with its baseline at the specified offset.
+    @discardableResult
+    public func addHeader(_ textLine: TextLine, _ offset: Float) -> [Float] {
+        textLine.setLocation((getWidth() - textLine.getWidth())/2, offset)
+        // A running header is no part of the content, which a screen reader skips.
+        addArtifactBDC("/Type /Pagination /Subtype /Header")
+        var xy = textLine.drawOn(self)
+        addEMC()
+        xy[1] += textLine.font!.getDescent(textLine.fontSize)
+        return xy
+    }
+
+    /// Draws the text line centered at the bottom of the page.
+    @discardableResult
+    public func addFooter(_ textLine: TextLine) -> [Float] {
+        return addFooter(textLine, textLine.font!.getAscent(textLine.fontSize))
+    }
+
+    /// Draws the text line centered at the bottom of the page, with its baseline at the specified offset from the bottom.
+    @discardableResult
+    public func addFooter(_ textLine: TextLine, _ offset: Float) -> [Float] {
+        textLine.setLocation((getWidth() - textLine.getWidth())/2, getHeight() - offset)
+        // A running footer, like a page number, is no part of the content,
+        // which a screen reader skips.
+        addArtifactBDC("/Type /Pagination /Subtype /Footer")
+        let xy = textLine.drawOn(self)
+        addEMC()
+        return xy
+    }
+
+    /**
+     * Sets the text location.
+     *
+     * - Parameter x: the x coordinate of new text location.
+     * - Parameter y: the y coordinate of new text location.
+     */
+    func setTextLocation(_ x: Float, _ y: Float) {
+        append(x)
+        append(Token.space)
+        append(height - y)
+        append(" Td\n")
+    }
+
+    /**
+     * Draws a string at the correct location.
+     * - Parameter str: the string.
+     */
+    internal func drawTextLine(_ font: Font, _ str: String, _ x: Float, _ y: Float) {
+        append(Token.beginText)
+        setTextLocation(x, y)
+        setTextFont(font, font.size)
+        if font.isCoreFont {
+            append("[<")
+            drawASCIIString(font, str)
+            append(">] TJ\n")
+        } else {
+            append("<")
+            drawUnicodeString(font, str)
+            append("> Tj\n")
+        }
+        append(Token.endText)
+    }
+
+    // Returns the span lo to hi of an annotation at least size long around its
+    // center, and moved inside 0 to limit, not cut, as long as it fits.
+    private static func hitSpan(_ low: Float, _ high: Float, _ size: Float, _ limit: Float) -> (Float, Float) {
+        var lo = low
+        var hi = high
+        if hi - lo < size {
+            let center = (lo + hi) / 2.0
+            lo = center - size / 2.0
+            hi = lo + size
+        }
+        if hi > limit {
+            lo -= hi - limit
+            hi = limit
+        }
+        if lo < 0.0 {
+            hi = Swift.min(hi - lo, limit)
+            lo = 0.0
+        }
+        return (lo, hi)
+    }
+
+    // Returns where the point x, y of what is drawn is on the page, after the
+    // transform of the containers it is drawn in.
+    func transformed(_ x: Float, _ y: Float) -> [Float] {
+        guard let t = transform else {
+            return [x, y]
+        }
+        return [t[0]*x + t[2]*y + t[4], t[1]*x + t[3]*y + t[5]]
+    }
+
+    // Returns the box, left, top, right and bottom, that holds the rectangle
+    // between the corners x1, y1 and x2, y2 after the transform of the
+    // containers it is drawn in, which can turn it.
+    func transformedBox(_ x1: Float, _ y1: Float, _ x2: Float, _ y2: Float) -> [Float] {
+        if transform == nil {
+            return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+        }
+        let a = transformed(x1, y1)
+        let b = transformed(x2, y1)
+        let c = transformed(x2, y2)
+        let d = transformed(x1, y2)
+        return [
+            min(min(a[0], b[0]), min(c[0], d[0])),
+            min(min(a[1], b[1]), min(c[1], d[1])),
+            max(max(a[0], b[0]), max(c[0], d[0])),
+            max(max(a[1], b[1]), max(c[1], d[1]))]
+    }
+
+    // Concatenates the transform of a container, in the order of transformed,
+    // to that of the containers it is in, and returns the transform that
+    // popTransform puts back after the container is drawn.
+    func pushTransform(_ matrix: [Float]) -> [Float]? {
+        let saved = transform
+        var m = matrix
+        if let t = saved {
+            let m0 = t[0]*m[0] + t[2]*m[1]
+            let m1 = t[1]*m[0] + t[3]*m[1]
+            let m2 = t[0]*m[2] + t[2]*m[3]
+            let m3 = t[1]*m[2] + t[3]*m[3]
+            let m4 = t[0]*m[4] + t[2]*m[5] + t[4]
+            let m5 = t[1]*m[4] + t[3]*m[5] + t[5]
+            m = [m0, m1, m2, m3, m4, m5]
+        }
+        transform = m
+        return saved
+    }
+
+    // Puts back the transform that pushTransform returned.
+    func popTransform(_ saved: [Float]?) {
+        transform = saved
+    }
+
+    // Moves the rectangle of an annotation drawn in a container, and the
+    // vertices of a polygon, with the container, as its drawing is moved. The
+    // rectangle of a turned annotation is the box that holds it.
+    private func transformAnnotation(_ annotation: Annotation) {
+        if transform == nil {
+            return
+        }
+        if annotation.annotationType == Annotation.Polygon,
+                let old = annotation.vertices, old.count >= 2 {
+            // The vertices are relative to the first corner, and each is turned with it
+            let p0 = transformed(annotation.x1, annotation.y1)
+            var vertices = [Float](repeating: 0.0, count: old.count & ~1)
+            var i = 0
+            while i + 1 < old.count {
+                let p = transformed(annotation.x1 + old[i], annotation.y1 + old[i + 1])
+                vertices[i] = p[0] - p0[0]
+                vertices[i + 1] = p[1] - p0[1]
+                i += 2
+            }
+            annotation.vertices = vertices
+            let p2 = transformed(annotation.x2, annotation.y2)
+            annotation.x2 = p2[0]
+            annotation.y2 = p2[1]
+            annotation.x1 = p0[0]
+            annotation.y1 = p0[1]
+            return
+        }
+        let box = transformedBox(annotation.x1, annotation.y1, annotation.x2, annotation.y2)
+        annotation.x1 = box[0]
+        annotation.y1 = box[1]
+        annotation.x2 = box[2]
+        annotation.y2 = box[3]
+    }
+
+    func rotateAroundCenter(_ centerX: Float, _ centerY: Float, _ degrees: Float) {
+        append("1 0 0 1 ")
+        append(centerX)
+        append(Token.space)
+        append(centerY)
+        append(" cm\n")
+
+        let radians = Double(degrees) * Double.pi / 180
+        appendRotation(Float(cos(radians)), Float(sin(radians)))
+
+        append("1 0 0 1 ")
+        append(-centerX)
+        append(Token.space)
+        append(-centerY)
+        append(" cm\n")
+    }
+
+    func drawTextBlock(
+            _ font: Font,
+            _ fallbackFont: Font?,
+            _ fontSize: Float,
+            _ fallbackFontSize: Float,
+            _ textLines: [TextLine],
+            _ x: Float,
+            _ y: Float,
+            _ leading: Float,
+            _ color: [Float],
+            _ highlightColors: Dictionary<String, Int32>?,
+            _ language: String?) {
+        if textLines.count == 0 {
+            return
+        }
+        // The fallback font is used as drawString uses it.
+        let hasFallbackFont = fallbackFont != nil && fallbackFont! !== font &&
+                !font.isCJK && !fallbackFont!.isCJK
+
+        // A span gives the language of the text, for screen readers and text extraction.
+        let hasLanguage = language != nil && !language!.isEmpty
+        if hasLanguage {
+            append("/Span <</Lang <")
+            append(Page.toUTF16Hex(language!))
+            append(">>> BDC\n")
+        }
+        append("BT\n")
+        setBrushColor(color)
+        setTextFont(font, fontSize)
+        var yText: Float = y
+        for textLine in textLines {
+            append("1 0 0 1 ")
+            append(x + textLine.xOffset)
+            append(" ")
+            append(height - (yText + font.getAscent(fontSize)))
+            append(" Tm\n")
+            if hasFallbackFont {
+                drawTextBlockLine(font, fallbackFont!, fontSize, fallbackFontSize, textLine.text!, color, highlightColors)
+            } else if highlightColors == nil {
+                if font.isCoreFont {
+                    append("[<")
+                    drawASCIIString(font, textLine.text!)
+                    append(">] TJ\n")
+                } else {
+                    append("<")
+                    drawUnicodeString(font, textLine.text!)
+                    append("> Tj\n")
+                }
+            } else {
+                drawColoredString(font, textLine.text!, color, highlightColors!)
+            }
+            if textLine.trailingSpace {
+                // The space the line was wrapped at, drawn after it: no ink, and
+                // the next line is placed with its own matrix, so nothing moves.
+                if font.isCoreFont {
+                    append("[<")
+                    drawASCIIString(font, Single.space)
+                    append(">] TJ\n")
+                } else {
+                    append("<")
+                    drawUnicodeString(font, Single.space)
+                    append("> Tj\n")
+                }
+            }
+            yText += leading
+        }
+        append("ET\n")
+        if hasLanguage {
+            append("EMC\n")
+        }
+
+        var yLine = y + font.getBodyHeight(fontSize)
+        var yStrike = y + font.getAscent(fontSize) - font.getBodyHeight(fontSize) / 4.0
+        var decorated = false
+        for textLine in textLines {
+            if textLine.underline || textLine.strikeout {
+                decorated = true
+                break
+            }
+        }
+        if decorated {
+            // The lines are drawn in the color of the text and as thick as the
+            // font says they are, as TextLine draws them.
+            setPenWidth(font.getUnderlineThickness(fontSize))
+            setPenColor(color)
+        }
+        for textLine in textLines {
+            if textLine.underline || textLine.strikeout {
+                let width = hasFallbackFont ?
+                        font.stringWidth(fallbackFont, fontSize, fallbackFontSize, textLine.text) :
+                        font.stringWidth(fontSize, textLine.text)
+                if textLine.underline {
+                    moveTo(x + textLine.xOffset, yLine)
+                    lineTo(x + textLine.xOffset + width, yLine)
+                    strokePath()
+                }
+                if textLine.strikeout {
+                    moveTo(x + textLine.xOffset, yStrike)
+                    lineTo(x + textLine.xOffset + width, yStrike)
+                    strokePath()
+                }
+            }
+            yLine += leading
+            yStrike += leading
+        }
+    }
+
+    // Draws a line of a text block at the text position, with the characters the
+    // font has no glyph for in the fallback font, as drawString draws them.
+    private func drawTextBlockLine(
+            _ font: Font,
+            _ fallbackFont: Font,
+            _ fontSize: Float,
+            _ fallbackFontSize: Float,
+            _ str: String,
+            _ color: [Float],
+            _ highlightColors: [String: Int32]?) {
+        var activeFont = font
+        let scalars = str.unicodeScalars
+        var start = scalars.startIndex
+        var i = scalars.startIndex
+        while i < scalars.endIndex {
+            let charFont = Font.fontOf(font, fallbackFont, activeFont, scalars, i)
+            if charFont !== activeFont {
+                drawTextBlockRun(activeFont, String(scalars[start..<i]), color, highlightColors)
+                start = i
+                activeFont = charFont
+                setTextFont(activeFont, (activeFont === font) ? fontSize : fallbackFontSize)
+            }
+            i = scalars.index(after: i)
+        }
+        drawTextBlockRun(activeFont, String(scalars[start...]), color, highlightColors)
+        if activeFont !== font {
+            setTextFont(font, fontSize)     // The next line starts in the font
+        }
+    }
+
+    // Draws the string at the text position in the font set last.
+    private func drawTextBlockRun(
+            _ font: Font, _ str: String, _ color: [Float], _ highlightColors: [String: Int32]?) {
+        if str.isEmpty {
+            return
+        }
+        if highlightColors != nil {
+            drawColoredString(font, str, color, highlightColors!)
+        } else if font.isCoreFont {
+            append("[<")
+            drawASCIIString(font, str)
+            append(">] TJ\n")
+        } else {
+            append("<")
+            drawUnicodeString(font, str)
+            append("> Tj\n")
+        }
+    }
+
+    /// Returns the string as a PDF text string, in UTF-16BE with a byte order
+    /// mark, written in hexadecimal.
+    static func toUTF16Hex(_ str: String) -> String {
+        var hex: [UInt8] = Array("FEFF".utf8)
+        hex.reserveCapacity(4 + 4 * str.utf16.count)
+        for unit in str.utf16 {
+            hex.append(upperHexDigits[Int((unit >> 12) & 0xF)])
+            hex.append(upperHexDigits[Int((unit >> 8) & 0xF)])
+            hex.append(upperHexDigits[Int((unit >> 4) & 0xF)])
+            hex.append(upperHexDigits[Int(unit & 0xF)])
+        }
+        return String(decoding: hex, as: UTF8.self)
+    }
+
+    // The hexadecimal digits of toUTF16Hex, made once.
+    private static let upperHexDigits: [UInt8] = Array("0123456789ABCDEF".utf8)
+
+    // A resource of the PDF that a page that was read draws with. It goes in the
+    // category of the resources of the page, like /ExtGState, under the name:
+    // the value, or a reference to the object of the PDF with the number.
+    private struct ReadResource {
+        let category: String
+        let name: String
+        let value: [String]
+        let number: Int
+    }
+}   // End of Page.swift

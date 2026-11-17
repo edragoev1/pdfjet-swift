@@ -1,0 +1,691 @@
+/**
+ * Subset.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+// The character first drawn with each glyph of a font, by glyph number: in
+// blocks of 256 glyphs, each made when one of its glyphs is first drawn, the
+// character plus one, 0 for none, as in Java, where a map of boxed numbers
+// made each character drawn allocate (12 October 2026).
+struct GlyphChars {
+    // Empty until a character is recorded, so that an empty one, which
+    // useChars makes for each run of text, allocates nothing
+    private var blocks = [[Int32]?]()
+    private(set) var isEmpty = true
+
+    // Returns the character first drawn with the glyph, or -1.
+    func first(_ gid: Int) -> Int {
+        guard !blocks.isEmpty, let block = blocks[(gid >> 8) & 0xFF] else {
+            return -1
+        }
+        return Int(block[gid & 0xFF]) - 1
+    }
+
+    // Records the character as the one drawn with the glyph, unless one was,
+    // and returns the one drawn first, or -1 when it is this one.
+    @discardableResult
+    mutating func use(_ gid: Int, _ c: Int) -> Int {
+        let b = (gid >> 8) & 0xFF
+        if blocks.isEmpty {
+            blocks = [[Int32]?](repeating: nil, count: 256)
+        }
+        if blocks[b] == nil {
+            blocks[b] = [Int32](repeating: 0, count: 256)
+        }
+        let first = Int(blocks[b]![gid & 0xFF]) - 1
+        if first < 0 {
+            blocks[b]![gid & 0xFF] = Int32(c + 1)
+            isEmpty = false
+        }
+        return first
+    }
+}
+
+/// The subsets of the embedded fonts, .ttf and .otf files, embedded at
+/// complete() with the glyphs the document drew alone. The PDF names each
+/// glyph by its number in the whole font, its CID, so the widths, the
+/// character map and the ToUnicode map are those of the whole font: a .ttf
+/// subset numbers its glyphs again, and its CIDFont maps the CIDs to them
+/// with a CIDToGIDMap; an .otf subset gives each glyph its number in the font
+/// as its CID in its charset.
+class Subset {
+    /// The font program of a TrueType font, or the CFF table of an OpenType
+    /// font with CFF outlines, kept until complete(). Fonts read from one file
+    /// share one program, and the glyphs any of them drew.
+    final class Program {
+        var font = [UInt8]()        // The TrueType font, or the CFF table
+        var cff = false
+        var forbidden = false       // The fsType of a CFF font's OS/2 table forbids subsetting
+        // The glyphs drawn, by glyph number, written in four hexadecimal digits.
+        var used: GlyphSet
+        // The character first drawn with each glyph, by glyph number, for the
+        // ToUnicode map of a glyph of several characters, as U+3000 and U+2003
+        var chars = GlyphChars()
+        var whole = false           // Set by setSubset(false): the font is embedded whole
+        // The outlines of the glyphs, read when drawGlyphs first draws one,
+        // and the stamp of each glyph it drew, a form XObject of its outline
+        // drawn once and placed wherever the glyph is; nil for a glyph of no
+        // outline, as the space.
+        var outline: GlyphOutline?
+        var glyphStamps = [Int: Stamp?]()
+
+        // The program of a font of the number of glyphs given, the count of
+        // its maxp table, or 0 when it has none.
+        init(_ glyphs: Int) {
+            used = GlyphSet(glyphs)
+            used.add(0)             // .notdef, drawn for a character the font lacks
+        }
+    }
+
+    // The set of the glyphs drawn with a font, a bit for each glyph number:
+    // 128 bytes for the 1,019 glyphs of IBM Plex Sans, where a Bool for each of
+    // the 65,536 glyph numbers was 64 KB for every font of every document (the
+    // owner's idea, 10 October 2026). It grows for a glyph past the font's
+    // count, up to the 65,536 a glyph number can be, so that it keeps what the
+    // array kept.
+    struct GlyphSet {
+        private var words: [UInt64]
+
+        init(_ glyphs: Int) {
+            // A glyph number is written in four hexadecimal digits
+            let count = (glyphs <= 0 || glyphs > 0x10000) ? 0x10000 : glyphs
+            words = [UInt64](repeating: 0, count: (count + 63) / 64)
+        }
+
+        // Adds the glyph number to the set.
+        mutating func add(_ gid: Int) {
+            if gid < 0 || gid >= 0x10000 {
+                return
+            }
+            let i = gid >> 6
+            if i >= words.count {
+                words.append(contentsOf: [UInt64](repeating: 0, count: i + 1 - words.count))
+            }
+            words[i] |= UInt64(1) << UInt64(gid & 63)
+        }
+
+        // Adds the glyph numbers to the set.
+        mutating func add(_ gids: [Int]) {
+            // The words grown once, then written with no check of each write
+            let top = gids.reduce(-1) { $1 < 0x10000 && $1 > $0 ? $1 : $0 }
+            if top < 0 {
+                return
+            }
+            if top >> 6 >= words.count {
+                words.append(contentsOf: [UInt64](repeating: 0, count: (top >> 6) + 1 - words.count))
+            }
+            words.withUnsafeMutableBufferPointer { w in
+                for gid in gids where gid >= 0 && gid < 0x10000 {
+                    w[gid >> 6] |= UInt64(1) << UInt64(gid & 63)
+                }
+            }
+        }
+
+        // The set as a Bool for each glyph number up to the end of its last
+        // word, for the subsetters, which read a glyph number's Bool.
+        func bools() -> [Bool] {
+            var used = [Bool](repeating: false, count: words.count * 64)
+            for gid in 0..<used.count {
+                used[gid] = words[gid >> 6] & (UInt64(1) << UInt64(gid & 63)) != 0
+            }
+            return used
+        }
+    }
+
+    /// The font cannot be subset, and is embedded whole.
+    struct NotSubset: Error {
+    }
+
+    // The tables a subset keeps: those a PDF reader draws a TrueType font with
+    // (ISO 32000-1, 9.9), and the OS/2 and post tables, which some readers and
+    // checkers look at. The cmap and name tables are left out: a subset is
+    // embedded as a CIDFontType2 with an Identity CIDToGIDMap, whose glyphs
+    // the PDF names by their numbers, and the two were nearly a third of a subset of
+    // IBM Plex Sans, more to compress for every document (26 October 2026).
+    // The tables of shaping and of vertical text, which PDFjet reads from the
+    // font and the PDF does not need, are left out, and so is the DSIG table,
+    // the signature of the whole font.
+    private static let subsetTables: Set<String> = [
+        "head", "hhea", "hmtx", "maxp", "loca", "glyf",
+        "cvt ", "fpgm", "prep", "gasp",
+        "OS/2", "post"
+    ]
+
+    /// Gives the font the program of a font the PDF already has from the same
+    /// file, if any, or else a new one of the font given.
+    static func share(
+            _ pdf: PDF, _ font: Font, _ data: [UInt8], _ cff: Bool, _ forbidden: Bool, _ glyphs: Int) {
+        for f in pdf.fonts {
+            if f.program != nil && f.name == font.name && f.checksum == font.checksum {
+                font.program = f.program
+                return
+            }
+        }
+        let program = Program(glyphs)
+        program.font = data
+        program.cff = cff
+        program.forbidden = forbidden
+        font.program = program
+    }
+
+    /// Writes the TrueType fonts at complete(), when every glyph they draw is
+    /// known: each font program, its descriptor, its CID font and its
+    /// ToUnicode map once, and the Type0 font of each Font under the number its
+    /// pages refer to.
+    static func addTrueTypeFonts(_ pdf: PDF) {
+        for font in pdf.fonts {
+            if font.program == nil || font.outlinesOnly() {
+                continue    // A font drawGlyphs alone drew with, as outlines
+            }
+            let kept = embedProgram(pdf, font)
+            addCIDSetObject(pdf, font, kept)
+            FontWriter.addFontDescriptorObject(pdf, font, font.baseFont)
+            FontWriter.addCIDFontDictionaryObject(pdf, font, font.baseFont, kept)
+            FontWriter.addToUnicodeCMapObject(pdf, font, kept)
+
+            pdf.newObj(font.objNumber)
+            pdf.append(Token.beginDictionary)
+            pdf.append("/Type /Font\n")
+            pdf.append("/Subtype /Type0\n")
+            pdf.append("/BaseFont /")
+            pdf.append(Array(font.baseFont.utf8))
+            pdf.append(Token.newline)
+            pdf.append("/Encoding /Identity-H\n")
+            pdf.append("/DescendantFonts [")
+            pdf.append(font.cidFontDictObjNumber)
+            pdf.append(" 0 R]\n")
+            pdf.append("/ToUnicode ")
+            pdf.append(font.toUnicodeCMapObjNumber)
+            pdf.append(" 0 R\n")
+            pdf.append(Token.endDictionary)
+            pdf.endObj()
+        }
+        // The programs are no longer needed.
+        for font in pdf.fonts {
+            font.program = nil
+        }
+    }
+
+    /// Writes the font program, a subset unless it is to be whole, sets the
+    /// name of the font, with the tag of a subset, and returns the glyphs the
+    /// subset keeps, or nil for a whole font. A font of the same program
+    /// embedded before is not written again: its name and object numbers are
+    /// used.
+    private static func embedProgram(_ pdf: PDF, _ font: Font) -> [Bool]? {
+        for f in pdf.fonts {
+            if f === font {
+                break
+            }
+            if f.fileObjNumber != 0 && f.name == font.name && f.checksum == font.checksum {
+                font.fileObjNumber = f.fileObjNumber
+                font.cidSetObjNumber = f.cidSetObjNumber
+                font.baseFont = f.baseFont
+                return f.kept
+            }
+        }
+
+        let program = font.program!
+        let data = embeddedProgram(font)
+        var compressed = [UInt8]()
+        FlateEncode(&compressed, data, pdf.flateMemory)
+        let length = data.count
+
+        let metadataObjNumber = pdf.addMetadataObject(font.info, true)
+        let encrypted = pdf.encrypted(compressed)
+        pdf.newObj()
+        pdf.append(Token.beginDictionary)
+        if program.cff {
+            pdf.append("/Subtype /CIDFontType0C\n")
+        }
+        pdf.append("/Filter /FlateDecode\n")
+        if !program.cff {
+            pdf.append("/Length1 ")
+            pdf.append(length)
+            pdf.append(Token.newline)
+        }
+        if metadataObjNumber != -1 {
+            pdf.append("/Metadata ")
+            pdf.append(metadataObjNumber)
+            pdf.append(" 0 R\n")
+        }
+        pdf.append("/Length ")
+        pdf.append(encrypted.count)
+        pdf.append(Token.newline)
+        pdf.append(Token.endDictionary)
+        pdf.append(Token.stream)
+        pdf.append(encrypted)
+        pdf.append(Token.endStream)
+        pdf.endObj()
+        font.fileObjNumber = pdf.getObjNumber()
+        return font.kept
+    }
+
+    /// Returns the font program to embed, a subset unless it is to be whole,
+    /// and sets the name of the font, with the tag of a subset, and the glyphs
+    /// the subset keeps, nil for a whole font.
+    static func embeddedProgram(_ font: Font) -> [UInt8] {
+        let program = font.program!
+        let data = program.font
+        let subset = (program.whole || program.forbidden) ? nil :
+                (program.cff ? try? CFFSubset.subset(data, program.used.bools())
+                        : try? subsetTrueType(data, program.used.bools()))
+        if let (subset, kept) = subset {
+            font.kept = kept
+            font.baseFont = subsetTag(font.checksum, kept) + "+" + font.name
+            return subset
+        }
+        font.kept = nil
+        font.baseFont = font.name
+        if program.cff, let (whole, _) = try? CFFSubset.subset(data, nil) {
+            // Written again for the identity charset of a CID-keyed font.
+            return whole
+        }
+        return data
+    }
+
+    /// Writes, for PDF/A-1, which asks it of a subset, the CIDSet of the glyphs
+    /// the subset keeps: a bit for each glyph number, the first in the high bit
+    /// of the first byte.
+    private static func addCIDSetObject(_ pdf: PDF, _ font: Font, _ kept: [Bool]?) {
+        guard let kept = kept, font.cidSetObjNumber == 0,
+                pdf.compliance == Compliance.PDF_A_1A || pdf.compliance == Compliance.PDF_A_1B else {
+            return
+        }
+        var bits = [UInt8](repeating: 0, count: (kept.count + 7) / 8)
+        for gid in 0..<kept.count where kept[gid] {
+            bits[gid / 8] |= UInt8(0x80 >> (gid % 8))
+        }
+        FontWriter.addCompressedStream(pdf, bits)
+        font.cidSetObjNumber = pdf.getObjNumber()
+    }
+
+    /// Returns the six capitals that begin the name of a subset, from the font
+    /// and the glyphs it keeps, so that another subset of the font has another
+    /// tag, and the same document the same one, in the four ports.
+    static func subsetTag(_ checksum: UInt64, _ kept: [Bool]) -> String {
+        var hash = checksum
+        for gid in 0..<kept.count where kept[gid] {
+            hash = Font.fold(hash, gid)
+        }
+        var tag = String()
+        for _ in 0..<6 {
+            tag.append(Character(Unicode.Scalar(UInt8(65 + hash % 26))))
+            hash /= 26
+        }
+        return tag
+    }
+
+    private static func u16(_ ttf: [UInt8], _ at: Int) throws -> Int {
+        if at < 0 || at + 2 > ttf.count {
+            throw NotSubset()
+        }
+        return Int(ttf[at]) << 8 | Int(ttf[at + 1])
+    }
+
+    // A value past 2^31 - 1 is refused, as an Int of 32 bits could not hold
+    // it (the review of 9 October 2026), in the four ports alike.
+    private static func u32(_ ttf: [UInt8], _ at: Int) throws -> Int {
+        if at < 0 || at + 4 > ttf.count {
+            throw NotSubset()
+        }
+        let v = UInt32(ttf[at]) << 24 | UInt32(ttf[at + 1]) << 16 | UInt32(ttf[at + 2]) << 8 | UInt32(ttf[at + 3])
+        if v > UInt32(Int32.max) {
+            throw NotSubset()
+        }
+        return Int(v)
+    }
+
+    /// A table of the font: its tag, offset and length.
+    private struct Table {
+        let tag: String
+        let offset: Int
+        let length: Int
+    }
+
+    /// Returns the TrueType font of the glyphs used alone, and the glyphs
+    /// kept: those used, glyph 0 and the parts of the composite glyphs kept.
+    /// The tables kept, subsetTables, are copied as they are, but for the
+    /// glyf, loca and hmtx tables made again, the counts of the maxp and hhea
+    /// tables, the head table's checksum adjustment, and the post table
+    /// without the names of the glyphs. The glyphs kept are numbered again,
+    /// from 0, in the order of their numbers in the font, and the maxp, hhea
+    /// and hmtx tables made for them, so that a subset of a font of thousands
+    /// of glyphs carries no entry for each of them (Noto Sans's 4,503 glyphs
+    /// were 36 KB of loca and hmtx for a page that drew 38); the glyphs kept
+    /// returned are of the numbers in the font, which the CIDToGIDMap maps to
+    /// the new ones. A font that forbids subsetting
+    /// in the fsType of its OS/2 table, or whose tables cannot be read, throws
+    /// NotSubset, and is embedded whole.
+    static func subsetTrueType(_ ttf: [UInt8], _ used: [Bool]) throws -> ([UInt8], [Bool]) {
+        let numTables = try u16(ttf, 4)
+        var tables = [Table]()
+        var head: Table?, loca: Table?, glyf: Table?, maxp: Table?, os2: Table?, hhea: Table?, hmtx: Table?
+        var seen = Set<UInt32>()
+        for i in 0..<numTables {
+            let entry = 12 + 16 * i
+            let offset = try u32(ttf, entry + 8)
+            let length = try u32(ttf, entry + 12)
+            if offset + length > ttf.count {
+                throw NotSubset()
+            }
+            // A tag twice, as two head tables, one of them too short to copy,
+            // is not a font to subset (the review of 9 October 2026: the
+            // checksum adjustment of the second was written past its end)
+            let raw = UInt32(ttf[entry]) << 24 | UInt32(ttf[entry + 1]) << 16 |
+                    UInt32(ttf[entry + 2]) << 8 | UInt32(ttf[entry + 3])
+            if !seen.insert(raw).inserted {
+                throw NotSubset()
+            }
+            // The tag of its bytes, each a character of its own, as the other
+            // ports read it: a byte with its high bit set makes a tag none
+            // of those below, as 0xE8 "ead" is not "head", which a mask of
+            // the high bit made it, and h[8] = 0 trapped on a table of 4 bytes
+            let tag = String(ttf[entry..<(entry + 4)].map { Character(Unicode.Scalar($0)) })
+            let table = Table(tag: tag, offset: offset, length: length)
+            tables.append(table)
+            switch tag {
+            case "head": head = table
+            case "loca": loca = table
+            case "glyf": glyf = table
+            case "maxp": maxp = table
+            case "OS/2": os2 = table
+            case "hhea": hhea = table
+            case "hmtx": hmtx = table
+            default: break
+            }
+        }
+        guard let head = head, let maxp = maxp, let loca = loca, let glyf = glyf,
+                head.length >= 54, maxp.length >= 6, loca.length > 0, glyf.length > 0 else {
+            throw NotSubset()
+        }
+        if let os2 = os2, os2.length >= 10, try u16(ttf, os2.offset + 8) & 0x0100 != 0 {
+            throw NotSubset()   // No subsetting
+        }
+        let numGlyphs = try u16(ttf, maxp.offset + 4)
+        let longOffsets = try u16(ttf, head.offset + 50)
+        if numGlyphs == 0 || longOffsets > 1 || loca.length < (numGlyphs + 1) * (2 + 2 * longOffsets) {
+            throw NotSubset()
+        }
+        var starts = [Int](repeating: 0, count: numGlyphs)
+        var ends = [Int](repeating: 0, count: numGlyphs)
+        for gid in 0..<numGlyphs {
+            var start: Int
+            var end: Int
+            if longOffsets == 1 {
+                // An offset that cannot be read, as one past 2^31 - 1, makes
+                // the glyph one that cannot be read, refused only if kept
+                guard let s = try? u32(ttf, loca.offset + 4 * gid),
+                        let e = try? u32(ttf, loca.offset + 4 * gid + 4) else {
+                    starts[gid] = -1
+                    continue
+                }
+                start = s
+                end = e
+            } else {
+                start = try 2 * u16(ttf, loca.offset + 2 * gid)
+                end = try 2 * u16(ttf, loca.offset + 2 * gid + 2)
+            }
+            starts[gid] = glyf.offset + start
+            ends[gid] = glyf.offset + end
+            if start > end || end > glyf.length {
+                starts[gid] = -1    // Read only if kept
+            }
+        }
+
+        // The glyphs kept, with the parts of the composite glyphs.
+        var keep = [Bool](repeating: false, count: numGlyphs)
+        var stack = [Int]()
+        for gid in 0..<min(numGlyphs, used.count) where used[gid] || gid == 0 {
+            keep[gid] = true
+            stack.append(gid)
+        }
+        while let gid = stack.popLast() {
+            let start = starts[gid]
+            let end = ends[gid]
+            if start < 0 {
+                throw NotSubset()
+            }
+            if end - start < 10 {
+                continue    // No outline
+            }
+            if try u16(ttf, start) < 0x8000 {
+                continue    // A simple glyph
+            }
+            var at = start + 10
+            while true {
+                let flags = try u16(ttf, at)
+                let component = try u16(ttf, at + 2)
+                if at + 4 > end || component >= numGlyphs {
+                    throw NotSubset()
+                }
+                if !keep[component] {
+                    keep[component] = true
+                    stack.append(component)
+                }
+                at += 4
+                at += (flags & 0x0001) != 0 ? 4 : 2     // ARG_1_AND_2_ARE_WORDS
+                if (flags & 0x0008) != 0 {              // WE_HAVE_A_SCALE
+                    at += 2
+                } else if (flags & 0x0040) != 0 {       // WE_HAVE_AN_X_AND_Y_SCALE
+                    at += 4
+                } else if (flags & 0x0080) != 0 {       // WE_HAVE_A_TWO_BY_TWO
+                    at += 8
+                }
+                if (flags & 0x0020) == 0 {              // MORE_COMPONENTS
+                    break
+                }
+            }
+        }
+
+        // The glyphs of the subset, numbered again: the glyphs kept in the
+        // order of their numbers in the font, glyph 0 first, each the next
+        // number, so that a subset of a font of thousands of glyphs has an
+        // entry in its loca and hmtx tables for each glyph it keeps alone.
+        // The PDF names a glyph by its number in the font, its CID, which the
+        // CIDToGIDMap of the CIDFont maps to its number here (FontWriter).
+        // A font whose metrics cannot be read is not subset.
+        var numberOfHMetrics = 0
+        if let hhea = hhea, hhea.length >= 36, hmtx != nil {
+            numberOfHMetrics = try u16(ttf, hhea.offset + 34)
+        }
+        guard let hmtx = hmtx, numberOfHMetrics > 0, numberOfHMetrics <= numGlyphs,
+                hmtx.length >= 4 * numberOfHMetrics + 2 * (numGlyphs - numberOfHMetrics) else {
+            throw NotSubset()
+        }
+        var last = numGlyphs - 1
+        while last > 0 && !keep[last] {
+            last -= 1
+        }
+        var newGid = [Int](repeating: -1, count: last + 1)
+        var glyphs = 0
+        for gid in 0...last where keep[gid] {
+            newGid[gid] = glyphs
+            glyphs += 1
+        }
+
+        // The glyf, loca and hmtx tables of the glyphs kept, each glyph
+        // padded to a multiple of four bytes, a composite glyph's parts named
+        // by their new numbers, and a long metric for each glyph.
+        var newGlyf = [UInt8]()
+        var newLoca = [UInt8]()
+        newLoca.reserveCapacity((glyphs + 1) * (2 + 2 * longOffsets))
+        var newHmtx = [UInt8]()
+        newHmtx.reserveCapacity(4 * glyphs)
+        func appendOffset(_ offset: Int) {
+            if longOffsets == 1 {
+                newLoca.append(contentsOf: [UInt8(truncatingIfNeeded: offset >> 24), UInt8(truncatingIfNeeded: offset >> 16),
+                        UInt8(truncatingIfNeeded: offset >> 8), UInt8(truncatingIfNeeded: offset)])
+            } else {
+                newLoca.append(contentsOf: [UInt8(truncatingIfNeeded: offset >> 9), UInt8(truncatingIfNeeded: offset >> 1)])
+            }
+        }
+        for gid in 0...last where keep[gid] {
+            appendOffset(newGlyf.count)
+            let at = newGlyf.count
+            newGlyf.append(contentsOf: ttf[starts[gid]..<ends[gid]])
+            if ends[gid] - starts[gid] >= 10, try u16(ttf, starts[gid]) >= 0x8000 {
+                try Subset.renumberComponents(&newGlyf, at, ends[gid] - starts[gid], newGid)
+            }
+            while newGlyf.count % 4 != 0 {
+                newGlyf.append(0)
+            }
+            // Glyphs whose outlines overlap, each copied again, could make
+            // the subset larger than the whole font many times over (the
+            // review of 9 October 2026: 112 KB into 384 MB); a subset is never
+            // larger than the glyf table and the padding of each glyph.
+            if newGlyf.count > glyf.length + 3 * glyphs {
+                throw NotSubset()
+            }
+            // The advance of a glyph past numberOfHMetrics is the last one's,
+            // and its left side bearing follows the long metrics.
+            let advance = try u16(ttf, hmtx.offset + 4 * min(gid, numberOfHMetrics - 1))
+            let lsb = (gid < numberOfHMetrics)
+                    ? try u16(ttf, hmtx.offset + 4 * gid + 2)
+                    : try u16(ttf, hmtx.offset + 4 * numberOfHMetrics + 2 * (gid - numberOfHMetrics))
+            newHmtx.append(contentsOf: [UInt8(truncatingIfNeeded: advance >> 8), UInt8(truncatingIfNeeded: advance),
+                    UInt8(truncatingIfNeeded: lsb >> 8), UInt8(truncatingIfNeeded: lsb)])
+        }
+        appendOffset(newGlyf.count)
+        if longOffsets == 0 && newGlyf.count > 0x1FFFE {
+            throw NotSubset()
+        }
+
+        // The font again, its tables in the order of their tags.
+        tables.sort { Array($0.tag.utf8).lexicographicallyPrecedes(Array($1.tag.utf8)) }
+        var tags = [String]()
+        var data = [[UInt8]]()
+        for t in tables {
+            if t.tag == "glyf" {
+                data.append(newGlyf)
+            } else if t.tag == "loca" {
+                data.append(newLoca)
+            } else if t.tag == "head" {
+                var h = Array(ttf[t.offset..<(t.offset + t.length)])
+                h[8] = 0; h[9] = 0; h[10] = 0; h[11] = 0    // checkSumAdjustment, set below
+                data.append(h)
+            } else if t.tag == "maxp" {
+                var m = Array(ttf[t.offset..<(t.offset + t.length)])
+                m[4] = UInt8(truncatingIfNeeded: glyphs >> 8); m[5] = UInt8(truncatingIfNeeded: glyphs)
+                data.append(m)
+            } else if t.tag == "hhea" {
+                var h = Array(ttf[t.offset..<(t.offset + t.length)])
+                // numberOfHMetrics: one for each glyph
+                h[34] = UInt8(truncatingIfNeeded: glyphs >> 8); h[35] = UInt8(truncatingIfNeeded: glyphs)
+                data.append(h)
+            } else if t.tag == "hmtx" {
+                data.append(newHmtx)
+            } else if t.tag == "post" {
+                if t.length < 32 {
+                    continue
+                }
+                // Version 3, without the names of the glyphs.
+                var p = Array(ttf[t.offset..<(t.offset + 32)])
+                p[0] = 0; p[1] = 3; p[2] = 0; p[3] = 0
+                data.append(p)
+            } else if subsetTables.contains(t.tag) {
+                data.append(Array(ttf[t.offset..<(t.offset + t.length)]))
+            } else {
+                continue
+            }
+            tags.append(t.tag)
+        }
+        let count = data.count
+        var searchRange = 1
+        var entrySelector = 0
+        while searchRange * 2 <= count {
+            searchRange *= 2
+            entrySelector += 1
+        }
+        var out = [UInt8]()
+        out.reserveCapacity(12 + 16 * count + data.reduce(0) { $0 + (($1.count + 3) & ~3) })
+        func be16(_ v: Int) {
+            out.append(UInt8(truncatingIfNeeded: v >> 8))
+            out.append(UInt8(truncatingIfNeeded: v))
+        }
+        func be32(_ v: UInt32) {
+            out.append(UInt8(truncatingIfNeeded: v >> 24))
+            out.append(UInt8(truncatingIfNeeded: v >> 16))
+            out.append(UInt8(truncatingIfNeeded: v >> 8))
+            out.append(UInt8(truncatingIfNeeded: v))
+        }
+        out.append(contentsOf: ttf[0..<4])
+        be16(count)
+        be16(16 * searchRange)
+        be16(entrySelector)
+        be16(16 * count - 16 * searchRange)
+        var offset = 12 + 16 * count
+        var headAt = 0
+        for i in 0..<count {
+            out.append(contentsOf: Array(tags[i].utf8))
+            be32(tableChecksum(data[i]))
+            be32(UInt32(offset))
+            be32(UInt32(data[i].count))
+            if tags[i] == "head" {
+                headAt = offset
+            }
+            offset += (data[i].count + 3) & ~3
+        }
+        for d in data {
+            out.append(contentsOf: d)
+            while out.count % 4 != 0 {
+                out.append(0)
+            }
+        }
+        let adjustment = UInt32(0xB1B0AFBA) &- tableChecksum(out)
+        out[headAt + 8] = UInt8(truncatingIfNeeded: adjustment >> 24)
+        out[headAt + 9] = UInt8(truncatingIfNeeded: adjustment >> 16)
+        out[headAt + 10] = UInt8(truncatingIfNeeded: adjustment >> 8)
+        out[headAt + 11] = UInt8(truncatingIfNeeded: adjustment)
+        return (out, Array(keep[0...last]))
+    }
+
+    // Names the parts of the composite glyph at start in the glyf table by
+    // their new numbers, as each was kept with it.
+    private static func renumberComponents(_ glyf: inout [UInt8], _ start: Int, _ length: Int, _ newGid: [Int]) throws {
+        let end = start + length
+        var at = start + 10
+        while true {
+            let flags = try u16(glyf, at)
+            let component = try u16(glyf, at + 2)
+            if at + 4 > end || component >= newGid.count || newGid[component] < 0 {
+                throw NotSubset()
+            }
+            glyf[at + 2] = UInt8(truncatingIfNeeded: newGid[component] >> 8)
+            glyf[at + 3] = UInt8(truncatingIfNeeded: newGid[component])
+            at += 4
+            at += (flags & 0x0001) != 0 ? 4 : 2         // ARG_1_AND_2_ARE_WORDS
+            if (flags & 0x0008) != 0 {                  // WE_HAVE_A_SCALE
+                at += 2
+            } else if (flags & 0x0040) != 0 {           // WE_HAVE_AN_X_AND_Y_SCALE
+                at += 4
+            } else if (flags & 0x0080) != 0 {           // WE_HAVE_A_TWO_BY_TWO
+                at += 8
+            }
+            if (flags & 0x0020) == 0 {                  // MORE_COMPONENTS
+                break
+            }
+        }
+    }
+
+    /// Returns the sum of the big-endian 32-bit words of the data, the last one
+    /// padded with zeros.
+    static func tableChecksum(_ data: [UInt8]) -> UInt32 {
+        var sum: UInt32 = 0
+        var i = 0
+        while i < data.count {
+            var word: UInt32 = 0
+            for j in 0..<4 {
+                word <<= 8
+                if i + j < data.count {
+                    word |= UInt32(data[i + j])
+                }
+            }
+            sum = sum &+ word
+            i += 4
+        }
+        return sum
+    }
+}

@@ -1,0 +1,524 @@
+/**
+ * SVG.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+/// Converts SVG path data to PDF path operations.
+class SVG {
+
+    static func isCommand(_ ch: Character) -> Bool {
+        // Capital letter commands use absolute coordinates
+        // Small letter commands use relative coordinates
+        switch ch {
+        case "M", "m":  // moveto
+            return true
+        case "L", "l":  // lineto
+            return true
+        case "H", "h":  // horizontal lineto
+            return true
+        case "V", "v":  // vertical lineto
+            return true
+        case "Q", "q":  // quadratic curveto
+            return true
+        case "T", "t":  // smooth quadratic curveto
+            return true
+        case "C", "c":  // cubic curveto
+            return true
+        case "S", "s":  // smooth cubic curveto
+            return true
+        case "A", "a":  // elliptical arc
+            return true
+        case "Z", "z":  // close path
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Parses SVG path data into a list of path operations.
+    // Returns true when the character separates the numbers of path data: the
+    // white space of SVG 1.1 section 8.3.9, which is the white space of XML.
+    // Path data is often written over several lines. The path is read by
+    // Characters, and "\r\n" is one of them, which is white space too: as
+    // two, d="M0 0\r\nL10 10" was not read (review of 11 October 2026, #22).
+    private static func isSpace(_ ch: Character) -> Bool {
+        return ch == " " || ch == "\t" || ch == "\n" || ch == "\r" || ch == "\r\n"
+    }
+
+    // Returns true when the number so far ends with the e of an exponent, so
+    // that the sign of the exponent belongs to it: the numbers of path data
+    // are written as SVG 1.1 section 8.3.9 gives them, sign, digits, point
+    // and exponent.
+    private static func afterExponent(_ buf: String) -> Bool {
+        return buf.hasSuffix("e") || buf.hasSuffix("E")
+    }
+
+    // Returns true when the next argument of the operation is one of the two
+    // flags of an elliptical arc. SVG 1.1 section 8.3.9 writes a flag as a
+    // single character, which needs no separator from what follows, so that
+    // the seven arguments of an arc are often written as "10 10 0 0120 20".
+    private static func isArcFlag(_ op: PathOp) -> Bool {
+        if op.cmd != "A" && op.cmd != "a" {
+            return false
+        }
+        let argument = op.args.count % 7
+        return argument == 3 || argument == 4
+    }
+
+    static func getOperations(_ path: String) -> [PathOp] {
+        var operations = [PathOp]()
+        // Path data starts with a command; the numbers before the first one
+        // belong to this operation, which is not added to the list.
+        var op = PathOp(" ")
+        var buf = String()
+        var token = false
+        for ch in path {
+            if isCommand(ch) {          // open path
+                if token {
+                    op.args.append(buf)
+                    buf = ""
+                }
+                token = false
+                op = PathOp(ch)
+                operations.append(op)
+            } else if isSpace(ch) || ch == "," {
+                if token {
+                    op.args.append(buf)
+                    buf = ""
+                }
+                token = false
+            } else if ch == "-" || ch == "+" {
+                // The sign starts a number, unless it is the sign of an
+                // exponent: 1e-3 is one number, and 10-3 is two.
+                if token && !afterExponent(buf) {
+                    op.args.append(buf)
+                    buf = ""
+                }
+                token = true
+                buf.append(ch)
+            } else if ch == "." {
+                if buf.contains(".") {
+                    op.args.append(buf)
+                    buf = ""
+                }
+                token = true
+                buf.append(ch)
+            } else if !token && isArcFlag(op) && (ch == "0" || ch == "1") {
+                op.args.append(String(ch))
+            } else {
+                token = true
+                buf.append(ch)
+            }
+        }
+        if token {  // The last number of a path that does not end with Z
+            op.args.append(buf)
+        }
+        return operations
+    }
+
+    /// Returns the argument as a number, and throws when it is not one, as the
+    /// other ports fail on such path data rather than stopping the program.
+    /// A number is one of SVG's grammar alone, and not the others Float(_:)
+    /// reads, as 0x1p3, inf or nan. A number past the range of a Float, such as
+    /// 1e40, which Float(_:) makes an infinity, is refused too, as Go's
+    /// ParseFloat refuses it.
+    private static func number(_ args: [String], _ i: Int) throws -> Float {
+        // A number of SVG's grammar, and no other that the parser of the language
+        // reads, so that the four ports read the same numbers (the review of
+        // 9 October 2026)
+        guard i < args.count, isSVGNumber(args[i]), let value = Float(args[i]) else {
+            throw PDFjetError(message: "Invalid path data: " +
+                    (i < args.count ? args[i] : "missing argument"))
+        }
+        // A number is finite: an infinity or NaN, written as such or past the
+        // range of a Float, is refused, in the four ports alike.
+        if !value.isFinite {
+            throw PDFjetError(message: "Invalid path data: " + args[i])
+        }
+        return value
+    }
+
+    /// Returns whether the text is a number as SVG writes one: a sign or none,
+    /// digits with a fraction or a fraction alone, and an exponent or none.
+    static func isSVGNumber(_ text: String) -> Bool {
+        let bytes = Array(text.utf8)
+        var i = 0
+        func isDigit(_ at: Int) -> Bool {
+            return at < bytes.count && bytes[at] >= 0x30 && bytes[at] <= 0x39     // 0 to 9
+        }
+        if i < bytes.count && (bytes[i] == 0x2B || bytes[i] == 0x2D) {         // + or -
+            i += 1
+        }
+        var digits = 0
+        while isDigit(i) {
+            digits += 1
+            i += 1
+        }
+        if i < bytes.count && bytes[i] == 0x2E {                                // .
+            i += 1
+            while isDigit(i) {
+                digits += 1
+                i += 1
+            }
+        }
+        if digits == 0 {
+            return false
+        }
+        if i < bytes.count && (bytes[i] == 0x65 || bytes[i] == 0x45) {         // e or E
+            i += 1
+            if i < bytes.count && (bytes[i] == 0x2B || bytes[i] == 0x2D) {
+                i += 1
+            }
+            var exponent = 0
+            while isDigit(i) {
+                exponent += 1
+                i += 1
+            }
+            if exponent == 0 {
+                return false
+            }
+        }
+        return i == bytes.count
+    }
+
+    /// Converts SVG path operations to PDF path operations.
+    static func toPDF(_ list: [PathOp]) throws -> [PathOp] {
+        var operations = [PathOp]()
+        // The current point starts at the origin: path data that begins with a
+        // command that needs one is drawn from there rather than stopping.
+        var lastOp = PathOp(" ")
+        var x0: Float = 0.0 // Start of subpath
+        var y0: Float = 0.0
+        for op in list {
+            // A command after Z other than a moveto starts the next subpath at
+            // the start of the one it closed, as SVG 1.1 section 8.3.3 says.
+            if lastOp.cmd == "Z" && op.cmd != "M" && op.cmd != "m" && op.cmd != "Z" && op.cmd != "z" {
+                let pathOp = PathOp("M", x0, y0)
+                pathOp.inner = true
+                operations.append(pathOp)
+                lastOp = pathOp
+            }
+            let first = operations.count
+            if op.cmd == "M" || op.cmd == "m" {
+                var i: Int = 0
+                while i <= (op.args.count - 2) {
+                    let pathOp: PathOp
+                    var x = try number(op.args, i)
+                    var y = try number(op.args, i + 1)
+                    if op.cmd == "m" {
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    if i == 0 {
+                        x0 = x
+                        y0 = y
+                        pathOp = PathOp("M", x, y)
+                    } else {
+                        pathOp = PathOp("L", x, y)
+                    }
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 2
+                }
+            } else if op.cmd == "L" || op.cmd == "l" {
+                var i: Int = 0
+                while i <= (op.args.count - 2) {
+                    var x = try number(op.args, i)
+                    var y = try number(op.args, i + 1)
+                    if op.cmd == "l" {
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    let pathOp = PathOp("L", x, y)
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 2
+                }
+            } else if op.cmd == "H" || op.cmd == "h" {
+                var i: Int = 0
+                while i < op.args.count {
+                    var x = try number(op.args, i)
+                    if op.cmd == "h" {
+                        x += lastOp.x
+                    }
+                    let pathOp = PathOp("L", x, lastOp.y)
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 1
+                }
+            } else if op.cmd == "V" || op.cmd == "v" {
+                var i: Int = 0
+                while i < op.args.count {
+                    var y = try number(op.args, i)
+                    if op.cmd == "v" {
+                        y += lastOp.y
+                    }
+                    let pathOp = PathOp("L", lastOp.x, y)
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 1
+                }
+            } else if op.cmd == "Q" || op.cmd == "q" {
+                var i: Int = 0
+                while i <= (op.args.count - 4) {
+                    let pathOp = PathOp("C")
+                    var x1 = try number(op.args, i)
+                    var y1 = try number(op.args, i + 1)
+                    var x = try number(op.args, i + 2)
+                    var y = try number(op.args, i + 3)
+                    if op.cmd == "q" {
+                        x1 += lastOp.x
+                        y1 += lastOp.y
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    // Save the original control point
+                    pathOp.x1q = x1
+                    pathOp.y1q = y1
+                    // Calculate the coordinates of the cubic control points
+                    let x1c = lastOp.x + (2.0/3.0)*(x1 - lastOp.x)
+                    let y1c = lastOp.y + (2.0/3.0)*(y1 - lastOp.y)
+                    let x2c = x + (2.0/3.0)*(x1 - x)
+                    let y2c = y + (2.0/3.0)*(y1 - y)
+                    pathOp.setCubicPoints(x1c, y1c, x2c, y2c, x, y)
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 4
+                }
+            } else if op.cmd == "T" || op.cmd == "t" {
+                var i: Int = 0
+                while i <= (op.args.count - 2) {
+                    let pathOp = PathOp("C")
+                    // The control point is the reflection of that of the curve
+                    // before, if it is a quadratic one, and else the current point.
+                    var x1 = lastOp.x
+                    var y1 = lastOp.y
+                    if lastOp.from == "Q" || lastOp.from == "T" {
+                        x1 = 2*lastOp.x - lastOp.x1q
+                        y1 = 2*lastOp.y - lastOp.y1q
+                    }
+                    pathOp.x1q = x1
+                    pathOp.y1q = y1
+                    var x = try number(op.args, i)
+                    var y = try number(op.args, i + 1)
+                    if op.cmd == "t" {
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    // Calculate the coordinates of the cubic control points
+                    let x1c = lastOp.x + (2.0/3.0)*(x1 - lastOp.x)
+                    let y1c = lastOp.y + (2.0/3.0)*(y1 - lastOp.y)
+                    let x2c = x + (2.0/3.0)*(x1 - x)
+                    let y2c = y + (2.0/3.0)*(y1 - y)
+                    pathOp.setCubicPoints(x1c, y1c, x2c, y2c, x, y)
+                    // Each pair of numbers is another T, whose next one
+                    // reflects its control point too, as SVG 1.1 section
+                    // 8.3.7 says.
+                    pathOp.from = "T"
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 2
+                }
+            } else if op.cmd == "C" || op.cmd == "c" {
+                var i: Int = 0
+                while i <= (op.args.count - 6) {
+                    let pathOp = PathOp("C")
+                    var x1 = try number(op.args, i)
+                    var y1 = try number(op.args, i + 1)
+                    var x2 = try number(op.args, i + 2)
+                    var y2 = try number(op.args, i + 3)
+                    var x = try number(op.args, i + 4)
+                    var y = try number(op.args, i + 5)
+                    if op.cmd == "c" {
+                        x1 += lastOp.x
+                        y1 += lastOp.y
+                        x2 += lastOp.x
+                        y2 += lastOp.y
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    pathOp.setCubicPoints(x1, y1, x2, y2, x, y)
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 6
+                }
+            } else if op.cmd == "S" || op.cmd == "s" {
+                var i: Int = 0
+                while i <= (op.args.count - 4) {
+                    let pathOp = PathOp("C")
+                    // The first control point is the reflection of the second
+                    // of the curve before, if it is a cubic one, and else the
+                    // current point.
+                    var x1 = lastOp.x
+                    var y1 = lastOp.y
+                    if lastOp.from == "C" || lastOp.from == "S" {
+                        x1 = 2*lastOp.x - lastOp.x2
+                        y1 = 2*lastOp.y - lastOp.y2
+                    }
+                    var x2 = try number(op.args, i)
+                    var y2 = try number(op.args, i + 1)
+                    var x = try number(op.args, i + 2)
+                    var y = try number(op.args, i + 3)
+                    if op.cmd == "s" {
+                        x2 += lastOp.x
+                        y2 += lastOp.y
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    pathOp.setCubicPoints(x1, y1, x2, y2, x, y)
+                    // Each set of four numbers is another S, whose next one
+                    // reflects its control point too, as SVG 1.1 section
+                    // 8.3.6 says.
+                    pathOp.from = "S"
+                    operations.append(pathOp)
+                    lastOp = pathOp
+                    i += 4
+                }
+            } else if op.cmd == "A" || op.cmd == "a" {
+                var i: Int = 0
+                while i <= (op.args.count - 7) {
+                    let rx = try number(op.args, i)
+                    let ry = try number(op.args, i + 1)
+                    let rotation = try number(op.args, i + 2)
+                    let largeArc = op.args[i + 3] != "0"
+                    let sweep = op.args[i + 4] != "0"
+                    var x = try number(op.args, i + 5)
+                    var y = try number(op.args, i + 6)
+                    if op.cmd == "a" {
+                        x += lastOp.x
+                        y += lastOp.y
+                    }
+                    lastOp = addArc(&operations, lastOp, rx, ry, rotation, largeArc, sweep, x, y)
+                    i += 7
+                }
+            } else if op.cmd == "Z" || op.cmd == "z" {
+                let pathOp = PathOp("Z")
+                pathOp.x = x0
+                pathOp.y = y0
+                operations.append(pathOp)
+                lastOp = pathOp
+            }
+            let from = Character(op.cmd.uppercased())
+            for pathOp in operations[first...] {
+                pathOp.from = from
+            }
+        }
+        return operations
+    }
+
+    /// Appends the cubic curves that draw the elliptical arc from the current
+    /// point to (x, y), as SVG 1.1 section F.6.5 describes: the arc is split
+    /// into pieces of at most a quarter turn, each approximated by one curve.
+    /// Returns the last operation appended, or lastOp when the arc is empty.
+    private static func addArc(_ operations: inout [PathOp], _ lastOp: PathOp,
+            _ rx: Float, _ ry: Float, _ rotation: Float, _ largeArc: Bool, _ sweep: Bool,
+            _ x: Float, _ y: Float) -> PathOp {
+        let x1 = lastOp.x
+        let y1 = lastOp.y
+        if x1 == x && y1 == y {
+            return lastOp
+        }
+        var rx = abs(rx)
+        var ry = abs(ry)
+        if rx == 0.0 || ry == 0.0 {
+            let line = PathOp("L", x, y)
+            operations.append(line)
+            return line
+        }
+        let phi = Double(rotation) * Double.pi / 180.0
+        let cosPhi = cos(phi)
+        let sinPhi = sin(phi)
+        let dx = Double(x1 - x) / 2.0
+        let dy = Double(y1 - y) / 2.0
+        let x1p = cosPhi * dx + sinPhi * dy
+        let y1p = -sinPhi * dx + cosPhi * dy
+        let lambda = (x1p * x1p) / (Double(rx) * Double(rx)) + (y1p * y1p) / (Double(ry) * Double(ry))
+        if lambda > 1.0 {
+            rx *= Float(lambda.squareRoot())
+            ry *= Float(lambda.squareRoot())
+        }
+        // The center is on the line through the middle of the chord, this far
+        // from it. Radii that were scaled to fit put it on the chord itself: the
+        // arc is half the ellipse, and what follows is exact. Computing it there
+        // would be the square root of the difference of two nearly equal numbers,
+        // which the ports do not round alike.
+        var coef = 0.0
+        if lambda <= 1.0 {
+            let rx2 = Double(rx) * Double(rx)
+            let ry2 = Double(ry) * Double(ry)
+            let num = rx2 * ry2 - rx2 * y1p * y1p - ry2 * x1p * x1p
+            let den = rx2 * y1p * y1p + ry2 * x1p * x1p
+            coef = max(0.0, num / den).squareRoot()
+            if largeArc == sweep {
+                coef = -coef
+            }
+        }
+        let cxp = coef * Double(rx) * y1p / Double(ry)
+        let cyp = -coef * Double(ry) * x1p / Double(rx)
+        let cx = cosPhi * cxp - sinPhi * cyp + Double(x1 + x) / 2.0
+        let cy = sinPhi * cxp + cosPhi * cyp + Double(y1 + y) / 2.0
+        let ux = (x1p - cxp) / Double(rx)
+        let uy = (y1p - cyp) / Double(ry)
+        let vx = (-x1p - cxp) / Double(rx)
+        let vy = (-y1p - cyp) / Double(ry)
+        let theta = atan2(uy, ux)
+        var delta = atan2(ux * vy - uy * vx, ux * vx + uy * vy)
+        if !sweep && delta > 0.0 {
+            delta -= 2.0 * Double.pi
+        } else if sweep && delta < 0.0 {
+            delta += 2.0 * Double.pi
+        }
+        // The arc is drawn in pieces of at most a quarter turn. A sweep that is
+        // a whole number of quarter turns is not split once more for a rounding
+        // error: it is computed with atan2, whose last bit differs between the
+        // ports, so that the same arc would be drawn with another number of
+        // curves in each.
+        let quarters = abs(delta) / (Double.pi / 2.0)
+        // Radii scaled up past what a Float holds, or end points whose
+        // difference is past it, make the sweep NaN: the arc is left out, as
+        // the other ports leave it, and not converted to an Int, which traps
+        // (review of 11 October 2026, #36).
+        if !quarters.isFinite {
+            return lastOp
+        }
+        var segments = Int((quarters - 1e-9).rounded(.up))
+        if segments < 1 && quarters > 0.0 {
+            segments = 1    // A sweep smaller than the tolerance is still one piece.
+        }
+        if segments == 0 {
+            return lastOp
+        }
+        let step = delta / Double(segments)
+        let t = 4.0 / 3.0 * tan(step / 4.0)
+        var pathOp = lastOp
+        for i in 0..<segments {
+            let a1 = theta + Double(i) * step
+            let a2 = a1 + step
+            let p1x = cos(a1)
+            let p1y = sin(a1)
+            let p2x = cos(a2)
+            let p2y = sin(a2)
+            let c1 = onEllipse(cx, cy, Double(rx), Double(ry), cosPhi, sinPhi, p1x - t * p1y, p1y + t * p1x)
+            let c2 = onEllipse(cx, cy, Double(rx), Double(ry), cosPhi, sinPhi, p2x + t * p2y, p2y - t * p2x)
+            let p2 = (i == segments - 1) ?
+                    [x, y] : onEllipse(cx, cy, Double(rx), Double(ry), cosPhi, sinPhi, p2x, p2y)
+            pathOp = PathOp("C")
+            pathOp.setCubicPoints(c1[0], c1[1], c2[0], c2[1], p2[0], p2[1])
+            pathOp.inner = i < segments - 1
+            operations.append(pathOp)
+        }
+        return pathOp
+    }
+
+    // Maps a point of the unit circle to the ellipse with the center
+    // (cx, cy), the radii rx and ry and the rotation with the given cosine and sine.
+    private static func onEllipse(_ cx: Double, _ cy: Double, _ rx: Double, _ ry: Double,
+            _ cosPhi: Double, _ sinPhi: Double, _ u: Double, _ v: Double) -> [Float] {
+        return [
+                Float(cx + rx * u * cosPhi - ry * v * sinPhi),
+                Float(cy + rx * u * sinPhi + ry * v * cosPhi)]
+    }
+}

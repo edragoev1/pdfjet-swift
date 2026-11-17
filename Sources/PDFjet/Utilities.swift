@@ -1,0 +1,149 @@
+/**
+ * Utilities.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
+extension String {
+    /// Returns this string without leading and trailing characters with a code
+    /// point of U+0020 or below, like String.trim in Java. Unlike
+    /// CharacterSet.whitespacesAndNewlines it leaves a no-break space and the
+    /// other Unicode spaces in place.
+    public func trim() -> String {
+        let scalars = self.unicodeScalars
+        var start = scalars.startIndex
+        var end = scalars.endIndex
+        while start < end && scalars[start].value <= 0x20 {
+            start = scalars.index(after: start)
+        }
+        while end > start && scalars[scalars.index(before: end)].value <= 0x20 {
+            end = scalars.index(before: end)
+        }
+        return String(scalars[start..<end])
+    }
+
+    /// Splits this string on the ASCII whitespace that Java's \s matches: space,
+    /// tab, line feed, vertical tab, form feed and carriage return. Empty tokens
+    /// are dropped, and a no-break space does not split.
+    func splitOnWhitespace() -> [String] {
+        var tokens = [String]()
+        var token = String.UnicodeScalarView()
+        for scalar in self.unicodeScalars {
+            if String.isASCIIWhitespace(scalar) {
+                if !token.isEmpty {
+                    tokens.append(String(token))
+                    token = String.UnicodeScalarView()
+                }
+            } else {
+                token.append(scalar)
+            }
+        }
+        if !token.isEmpty {
+            tokens.append(String(token))
+        }
+        return tokens
+    }
+
+    /// Returns true for the six ASCII whitespace scalars. It walks scalars rather
+    /// than Characters because Swift folds "\r\n" into a single Character.
+    static func isASCIIWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        let value = scalar.value
+        return value == 0x20 || (value >= 0x09 && value <= 0x0D)
+    }
+
+    /// Returns true if the scalar is whitespace as Character.isWhitespace in
+    /// Java defines it: U+0009 to U+000D, U+001C to U+001F, and the space,
+    /// line and paragraph separators, except the no-break spaces U+00A0,
+    /// U+2007 and U+202F.
+    static func isJavaWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        let value = scalar.value
+        if (value >= 0x09 && value <= 0x0D) || (value >= 0x1C && value <= 0x1F) {
+            return true
+        }
+        if value == 0x00A0 || value == 0x2007 || value == 0x202F {
+            return false
+        }
+        switch scalar.properties.generalCategory {
+        case .spaceSeparator, .lineSeparator, .paragraphSeparator:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Returns true if more than half of the unicode scalars of this string are
+    /// CJK: CJK Unified Ideographs (4E00-9FD5), Hiragana (3040-309F),
+    /// Katakana (30A0-30FF) or Hangul Jamo (1100-11FF).
+    func isCJK() -> Bool {
+        var numOfCJK = 0
+        var count = 0
+        for scalar in self.unicodeScalars {
+            count += 1
+            let ch = scalar.value
+            if (ch >= 0x4E00 && ch <= 0x9FFF) ||
+                    (ch >= 0x3400 && ch <= 0x4DBF) ||
+                    (ch >= 0xF900 && ch <= 0xFAFF) ||
+                    (ch >= 0x20000 && ch <= 0x3FFFF) ||
+                    (ch >= 0x3040 && ch <= 0x309F) ||
+                    (ch >= 0x30A0 && ch <= 0x30FF) ||
+                    (ch >= 0x1100 && ch <= 0x11FF) {
+                numOfCJK += 1
+            }
+        }
+        return numOfCJK > (count / 2)
+    }
+}
+
+// The characters that do not start a line of Chinese or Japanese text: closing
+// brackets and quotes, punctuation, iteration marks, the prolonged sound mark
+// and small kana. And those that do not end one: opening brackets and quotes.
+private let notAtLineStart = Set(")]},.:;!?、。，．・：；？！゛゜ヽヾゝゞ々〻ー‐゠–〜～）］｝」』】〕〉》〙〗〟’”｠»ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ".unicodeScalars)
+private let notAtLineEnd = Set("([{（［｛「『【〔〈《〘〖〝‘“｟«".unicodeScalars)
+
+/// Returns true for a character that does not start a line of Chinese or
+/// Japanese text: those of notAtLineStart, and a combining mark, as the dakuten
+/// U+3099, which stays with the letter before it.
+private func cannotStartLine(_ ch: Unicode.Scalar) -> Bool {
+    return notAtLineStart.contains(ch) || TextBlock.staysWithPrevious(ch)
+}
+
+/// Returns where a full line of Chinese or Japanese text ends when the next
+/// character does not fit on it, by the line breaking rules of these languages
+/// (kinsoku shori): when the next character does not start a line, the one
+/// before it moves to the next line with it, and so do opening brackets at the
+/// end of the line. A line that has no other place to break ends where it is full.
+func cjkLineEnd(_ line: [Unicode.Scalar], _ next: Unicode.Scalar) -> Int {
+    var end = line.count
+    if cannotStartLine(next) {
+        while end > 0 {
+            end -= 1
+            if !cannotStartLine(line[end]) {
+                break
+            }
+        }
+    }
+    while end > 0 && notAtLineEnd.contains(line[end - 1]) {
+        end -= 1
+    }
+    // A word in Latin letters or digits moves whole to the next line, unless it
+    // fills the line.
+    if end > 0 && isLatinWordCharacter(line[end - 1]) && isLatinWordCharacter(end < line.count ? line[end] : next) {
+        var start = end
+        while start > 0 && isLatinWordCharacter(line[start - 1]) {
+            start -= 1
+        }
+        if start > 0 {
+            end = start
+        }
+    }
+    return (end > 0) ? end : line.count
+}
+
+// Returns true for a letter or a digit of a word in Latin letters, up to the end
+// of Latin Extended-B.
+private func isLatinWordCharacter(_ scalar: Unicode.Scalar) -> Bool {
+    let ch = scalar.value
+    return (ch >= 0x30 && ch <= 0x39) || (ch >= 0x41 && ch <= 0x5A) || (ch >= 0x61 && ch <= 0x7A)
+        || (ch >= 0x00C0 && ch <= 0x024F && ch != 0x00D7 && ch != 0x00F7)
+}

@@ -1,0 +1,52 @@
+/**
+ * PathOp.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+/// A single path operation: a command and its points.
+class PathOp {
+    var cmd: Character
+    // The SVG command it was made from, in upper case, as a smooth curve needs it
+    var from: Character = " "
+    var x1q: Float = 0.0    // Original quadratic control
+    var y1q: Float = 0.0    // point coordinates
+
+    var x1: Float = 0.0     // Control point x1
+    var y1: Float = 0.0     // Control point y1
+    var x2: Float = 0.0     // Control point x2
+    var y2: Float = 0.0     // Control point y2
+    var x: Float = 0.0      // Initial point x
+    var y: Float = 0.0      // Initial point y
+    // Not a vertex of the path data, where a marker goes: a point inside an
+    // elliptical arc, which is drawn in pieces, or the moveto that a command
+    // after Z starts with, at the vertex the Z ends at.
+    var inner = false
+    var args: [String]
+
+    init(_ cmd: Character) {
+        self.cmd = cmd
+        self.args = [String]()
+    }
+
+    init(_ cmd: Character, _ x: Float, _ y: Float) {
+        self.cmd = cmd
+        self.x = x
+        self.y = y
+        self.args = [String]()
+    }
+
+    func setCubicPoints(
+            _ x1: Float, _ y1: Float,
+            _ x2: Float, _ y2: Float,
+            _ x: Float, _ y: Float) {
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+        self.x = x
+        self.y = y
+    }
+}

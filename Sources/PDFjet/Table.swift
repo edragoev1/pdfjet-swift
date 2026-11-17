@@ -1,0 +1,2504 @@
+/**
+ * Table.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Used to create table objects and draw them on a page. A Table is for cells that
+/// need more than a line of text: text that wraps, an image, a barcode or a chart in
+/// a cell, cells that span columns or rows, page totals, a style for each cell. For a
+/// long table of plain one-line rows, BigTable is faster and keeps its memory flat.
+///
+/// Please see Example_20.
+///
+public class Table : Drawable {
+    private var tableData: [[Cell]]
+    private var numOfHeaderRows = 1
+    private var numOfFooterRows = 0
+    // The index of the next row to draw, or -1 when all rows are drawn.
+    private var rendered = 1
+    // True when each cell strokes its own borders, as setJoinedBorders(false)
+    // asks, rather than the table joining them into continuous lines.
+    private var separateBorders = false
+    // True once the header rows are drawn: they are TH cells the first time,
+    // even when no row of the body fits under them on that page.
+    private var headerDrawn = false
+    private var x1: Float = 0.0
+    private var y1: Float = 0.0
+    private var firstPageTopMargin: Float = 0.0
+    private var bottomMargin: Float = 0.0
+    // The Table element of a PDF/UA document, while the table is drawn, and
+    // the TH or TD elements of the last row, by column, that the rows with
+    // the next lines of its wrapped text add to.
+    private var structElement: StructElement?
+    private var cellElements = [StructElement?]()
+    // The P of the text of a cell that wraps, by column, and the page it is
+    // on, that the lines after its first on the page add to, so that the cell
+    // is one paragraph to a screen reader and not one a line
+    private var cellParagraphs = [StructElement?]()
+    private var cellParagraphPages = [Page?]()
+    // The height of each row as it is drawn, measured once for each drawOn,
+    // after the text is wrapped and the spans are worked out, rather than
+    // for each page: a table of 2,546 pages measured its 124,716 rows on
+    // every one of them. Not private, as the tests read it.
+    var heights = [Float]()
+    // The color of every other row of the body, as a 0xRRGGBB value, or
+    // Cell.NO_COLOR; and the rows it colors, found where the heights are.
+    private var alternateRowColor: Int32 = Cell.NO_COLOR
+    private var striped = [Bool]()
+    // The width setWidth gives the table, or 0, and the percentages of it that
+    // setColumnWidthsInPercent gives the columns, or nil.
+    private var tableWidth: Float = 0.0
+    private var columnPercents: [Float]?
+    // The numbers of the columns that setPageSum, setRunningSum and
+    // setBroughtForwardSum add up, read once for each drawOn by column and
+    // decimals, or nil when the table is not being drawn: they were read
+    // again for every page, which took 33 seconds for 40,000 rows.
+    private var columnSums: [Int: ColumnSums]?
+    // The height of the header rows, wrapped, that getTotalHeight measures.
+    var wrappedHeaderHeight: Float = 0.0
+    // The row the page being drawn breaks before, when the rows on it are
+    // closed with a line under them, or -1.
+    private var closeAt = -1
+    // The first wrong index given, which the methods that take one have no
+    // error to return for, and which drawOn fails the document with.
+    private var misuse: String?
+
+    // The number of each row of a column, in units of the decimals, and their
+    // sums from the first row to each row.
+    private final class ColumnSums {
+        var values: [Int64]
+        var sums: [Int64]       // The sum of the values before each row, and of them all
+        // Whether no sum of values can have more than 18 digits, which the sum
+        // of their magnitudes does not: the sum of the rows between two is
+        // then the difference of the sums up to them.
+        var exact = true
+
+        init(_ rows: Int) {
+            values = [Int64](repeating: 0, count: rows)
+            sums = [Int64](repeating: 0, count: rows + 1)
+        }
+    }
+
+    ///
+    /// Create a table object.
+    ///
+    public init() {
+        tableData = [[Cell]]()
+    }
+
+    ///
+    /// Creates a table from a text file with comma, pipe or tab separated values.
+    /// The first line is the header row and uses f1; the other lines use f2.
+    /// Every row gets as many cells as the first line has fields. A quoted field is read as
+    /// RFC 4180 reads it, and a line break inside one goes on to the next line of the file and
+    /// is drawn as a space.
+    ///
+    /// - Parameter f1: the font for the header row.
+    /// - Parameter f2: the font for the other rows.
+    /// - Parameter fileName: the file name.
+    ///
+    public init(_ f1: Font, _ f2: Font, _ fileName: String) throws {
+        tableData = [[Cell]]()
+        var delimiter: String?
+        var numberOfFields = 0
+        var lineNumber = 0
+        // The file is read a line at a time, as the other ports read it, and
+        // a line ends at a line feed, a carriage return or the two together.
+        let lines = try DataFileLines(fileName)
+        while var line = lines.next() {
+            if lineNumber == 0 {
+                // A byte order mark at the start of the file is not part of the text.
+                if line.hasPrefix("\u{FEFF}") {
+                    line.removeFirst()
+                }
+                delimiter = getDelimiter(line)
+            }
+            var row = [Cell]()
+            // The empty fields at the end of the line are kept, a quoted field
+            // holds its delimiters instead of being cut at them, and its line
+            // breaks, which go on to the next lines, are spaces.
+            let fields = try Util.readRecord(line, delimiter!) { lines.next() }
+            if lineNumber == 0 {
+                numberOfFields = fields.count
+            }
+            for field in fields {
+                if lineNumber == 0 {
+                    row.append(Cell(f1, field))
+                } else {
+                    row.append(Cell(f2, field))
+                }
+            }
+            if row.count > numberOfFields {
+                var row2 = [Cell]()
+                for i in 0..<numberOfFields {
+                    row2.append(row[i])
+                }
+                tableData.append(row2)
+            } else if row.count < numberOfFields {
+                let diff = numberOfFields - row.count
+                for _ in 0..<diff {
+                    row.append(Cell(f2, ""))
+                }
+                tableData.append(row)
+            } else {
+                tableData.append(row)
+            }
+            lineNumber += 1
+        }
+    }
+
+    ///
+    /// Sets the location (x, y) of the top left corner of this table on the page.
+    ///
+    /// - Parameter x: the x coordinate of the top left point of the table.
+    /// - Parameter y: the y coordinate of the top left point of the table.
+    ///
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x1 = x
+        self.y1 = y
+        return self
+    }
+
+    ///
+    /// Sets the bottom margin for this table.
+    ///
+    /// - Parameter bottomMargin: the margin.
+    ///
+    @discardableResult
+    public func setBottomMargin(_ bottomMargin: Float) -> Table {
+        self.bottomMargin = bottomMargin
+        return self
+    }
+
+    ///
+    /// Sets the table data.
+    ///
+    /// The table data is a perfect grid of cells.
+    /// All cell should be an unique object and you can not reuse blank cell objects.
+    /// Even if one or more cells have colspan bigger than zero the number of cells in the row will not change.
+    ///
+    /// - Parameter tableData: the table data.
+    ///
+    @discardableResult
+    public func setTableData(_ tableData: [[Cell]]) -> Table {
+        return setTableData(tableData, 0)
+    }
+
+    ///
+    /// Sets the table data and specifies the number of header rows in this data.
+    /// The header rows are drawn again at the top of every page.
+    ///
+    /// - Parameter tableData: the table data.
+    /// - Parameter numOfHeaderRows: the number of header rows in this data.
+    ///
+    @discardableResult
+    public func setTableData(_ tableData: [[Cell]], _ numOfHeaderRows: Int) -> Table {
+        self.tableData = tableData
+        self.numOfHeaderRows = numOfHeaderRows
+        self.rendered = numOfHeaderRows
+        self.headerDrawn = false
+        self.misuse = nil   // An index that was wrong for the data before
+        if numOfHeaderRows < 0 {
+            // -1 was the value of a table drawn whole, and nothing was drawn
+            refuse("The number of header rows cannot be negative.")
+            self.numOfHeaderRows = 0
+            self.rendered = 0
+        }
+        addCellsToCompleteTheGrid()
+        if tableWidth > 0.0 {
+            // The width and the percentages given before the data: they were
+            // lost (the review of 30 October 2026)
+            setWidth(tableWidth)
+        }
+        return self
+    }
+
+    ///
+    /// Makes the last rows of the table data footer rows, which are drawn again
+    /// at the end of the table on every page, under the last row the page
+    /// holds, as the header rows are drawn again at the top. A page leaves room
+    /// for them. In a PDF/UA document they are rows of the table once, where
+    /// the table ends, and artifacts on the other pages.
+    ///
+    /// - Parameter numOfFooterRows: the number of footer rows at the end of the data.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setNumberOfFooterRows(_ numOfFooterRows: Int) -> Table {
+        self.numOfFooterRows = max(0, numOfFooterRows)
+        return self
+    }
+
+    // The index of the first footer row, after the header rows and the rows
+    // of the table.
+    // Records the misuse of an index, which drawOn fails the document with: a
+    // row or column that is not there trapped (the review of 30 October 2026).
+    private func refuse(_ message: String) {
+        if misuse == nil {
+            misuse = message
+        }
+    }
+
+    // Records that the table has no row or column at the index.
+    @discardableResult
+    private func noIndex(_ index: Int) -> Table {
+        refuse("The table has no row or column at the index \(index).")
+        return self
+    }
+
+    // Fails the document when an index was misused, and draws nothing.
+    private func refused(_ pdf: PDF) -> Bool {
+        guard let misuse = misuse else {
+            return false
+        }
+        pdf.fail(misuse)
+        rendered = -1   // Nothing more is drawn, and no more pages are asked for
+        return true
+    }
+
+    private func footerStart() -> Int {
+        return max(numOfHeaderRows, tableData.count - numOfFooterRows)
+    }
+
+    // Adds empty cells to the rows that are shorter than the first row, or,
+    // when the first row is empty, than the first row that is not, in the font
+    // of its first cell: an empty row was drawn from its first cell (review of
+    // 11 October 2026, #18).
+    private func addCellsToCompleteTheGrid() {
+        guard let first = tableData.firstIndex(where: { !$0.isEmpty }) else {
+            // Rows of no cells are a table of no rows, which draws nothing.
+            tableData = []
+            return
+        }
+        let numOfColumns = tableData[first].count
+        let font = tableData[first][0].font
+        for i in 0..<tableData.count {
+            let diff = numOfColumns - tableData[i].count
+            for _ in 0..<max(diff, 0) {
+                tableData[i].append(Cell(font, ""))
+            }
+        }
+    }
+
+    ///
+    /// Aligns to the right the cells whose text is a number, such as 1,234.50,
+    /// (1,234.50), -5 or 1.5E+3. The periods, commas and apostrophes are ignored,
+    /// and the number can be in parentheses.
+    ///
+    @discardableResult
+    public func rightAlignNumbers() -> Table {
+        for row in tableData {
+            for cell in row {
+                if cell.text != nil && Table.isNumber(cell.text!) {
+                    cell.setTextAlignment(Alignment.RIGHT)
+                }
+            }
+        }
+        return self
+    }
+
+    // Returns true if the text, without its periods, commas and apostrophes and
+    // the parentheses around it, is an optional sign, ASCII digits and an
+    // optional exponent, with optional spaces before and after.
+    static func isNumber(_ text: String) -> Bool {
+        var scalars = [Unicode.Scalar](text.unicodeScalars)
+        if scalars.count >= 2 && scalars[0] == "(" && scalars[scalars.count - 1] == ")" {
+            scalars = [Unicode.Scalar](scalars[1..<(scalars.count - 1)])
+        }
+        var buf = String.UnicodeScalarView()
+        for scalar in scalars {
+            if scalar != "." && scalar != "," && scalar != "'" {
+                buf.append(scalar)
+            }
+        }
+        let number = [Unicode.Scalar](String(buf).trim().unicodeScalars)
+        var i = 0
+        if i < number.count && (number[i] == "+" || number[i] == "-") {
+            i += 1
+        }
+        var start = i
+        while i < number.count && number[i].value >= 0x30 && number[i].value <= 0x39 {
+            i += 1
+        }
+        if i == start {
+            return false
+        }
+        if i < number.count && (number[i] == "e" || number[i] == "E") {
+            i += 1
+            if i < number.count && (number[i] == "+" || number[i] == "-") {
+                i += 1
+            }
+            start = i
+            while i < number.count && number[i].value >= 0x30 && number[i].value <= 0x39 {
+                i += 1
+            }
+            if i == start {
+                return false
+            }
+        }
+        return i == number.count
+    }
+
+    ///
+    /// Makes the cell of a footer row show the sum of its column over the rows
+    /// of each page: the page total. The numbers are read as rightAlignNumbers
+    /// reads them, with commas and apostrophes between the thousands and a
+    /// period before the decimals, and a cell that has no number is left out.
+    /// The sum has the number of decimals, rounded half away from zero, and
+    /// commas between the thousands. Until the table is drawn the cell has the
+    /// sum of all the rows, so that autoAdjustColumnWidths leaves room for it;
+    /// its text is not wrapped.
+    ///
+    /// - Parameter row: the index of a footer row, see setNumberOfFooterRows.
+    /// - Parameter column: the index of the column.
+    /// - Parameter decimals: the number of decimals, from 0 to 9.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setPageSum(_ row: Int, _ column: Int, _ decimals: Int) -> Table {
+        return setSum(row, column, decimals, Cell.PAGE_SUM)
+    }
+
+    ///
+    /// Makes the cell of a footer row show the sum of its column over all the
+    /// rows up to the end of each page: the total carried forward, which is
+    /// the total of the table on its last page. The numbers are read and the
+    /// sum is written as setPageSum reads and writes them.
+    ///
+    /// - Parameter row: the index of a footer row, see setNumberOfFooterRows.
+    /// - Parameter column: the index of the column.
+    /// - Parameter decimals: the number of decimals, from 0 to 9.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setRunningSum(_ row: Int, _ column: Int, _ decimals: Int) -> Table {
+        return setSum(row, column, decimals, Cell.RUNNING_SUM)
+    }
+
+    ///
+    /// Makes the cell of a header row show the sum of its column over all the
+    /// rows of the pages before: the total brought forward, which the cell that
+    /// setRunningSum marks shows at the end of the page before. A header row
+    /// with such a cell is drawn from the second page on, under the header
+    /// rows above it, and not on the first page, which has nothing to bring
+    /// forward; in a PDF/UA document it is an artifact, as the header rows are
+    /// on those pages. The numbers are read and the sum is written as
+    /// setPageSum reads and writes them.
+    ///
+    /// - Parameter row: the index of a header row, see setTableData.
+    /// - Parameter column: the index of the column.
+    /// - Parameter decimals: the number of decimals, from 0 to 9.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setBroughtForwardSum(_ row: Int, _ column: Int, _ decimals: Int) -> Table {
+        return setSum(row, column, decimals, Cell.BROUGHT_FORWARD_SUM)
+    }
+
+    private func setSum(_ row: Int, _ column: Int, _ decimals: Int, _ kind: UInt32) -> Table {
+        if row < 0 || row >= tableData.count || column < 0 || column >= tableData[row].count {
+            return self
+        }
+        let places = max(0, min(9, decimals))
+        let cell = tableData[row][column]
+        cell.properties = (cell.properties & ~Cell.SUM_BITS) | kind | (UInt32(places) << Cell.SUM_DECIMALS)
+        let end = (kind == Cell.BROUGHT_FORWARD_SUM) ? footerStart() : min(row, footerStart())
+        cell.setText(Table.formatSum(sumOf(column, numOfHeaderRows, end, places), places))
+        return self
+    }
+
+    // Writes the sums in the cells of the rows from start to stop that
+    // setPageSum, setRunningSum and setBroughtForwardSum mark: those of the
+    // rows of the page, from first to end, those of all the rows to end, and
+    // those of all the rows before first.
+    private func setSums(_ start: Int, _ stop: Int, _ first: Int, _ end: Int) {
+        var r = start
+        while r < stop && r < tableData.count {
+            for (j, cell) in tableData[r].enumerated() where (cell.properties & Cell.SUM_KIND) != 0 {
+                let kind = cell.properties & Cell.SUM_KIND
+                let places = Int((cell.properties >> Cell.SUM_DECIMALS) & 0xF)
+                let from = (kind == Cell.PAGE_SUM) ? first : numOfHeaderRows
+                let to = (kind == Cell.BROUGHT_FORWARD_SUM) ? first : end
+                cell.setText(Table.formatSum(sumOf(j, from, to, places), places))
+            }
+            r += 1
+        }
+    }
+
+    private func setFooterSums(_ first: Int, _ end: Int) {
+        setSums(footerStart(), tableData.count, first, end)
+    }
+
+    // True when the row, or the row whose wrapped text it holds, has a cell
+    // that brings a total forward, which the first page does not draw.
+    private func isBroughtForwardRow(_ row: Int) -> Bool {
+        var r = row
+        while r > 0 && isContinuation(r) {
+            r -= 1
+        }
+        return tableData[r].contains { ($0.properties & Cell.SUM_KIND) == Cell.BROUGHT_FORWARD_SUM }
+    }
+
+    // The largest sum, and number, in units of the decimals: 18 digits.
+    private static let MAX_SUM: Int64 = 999_999_999_999_999_999
+
+    // The sum of the numbers in the column of the rows from first to end, in
+    // units of the decimals. A number that would take the sum past 18 digits
+    // is left out.
+    private func sumOf(_ column: Int, _ first: Int, _ end: Int, _ decimals: Int) -> Int64 {
+        let first = max(0, first)
+        let end = min(end, tableData.count)
+        if first >= end {
+            return 0
+        }
+        let key = column * 16 + decimals
+        var sums = columnSums?[key]
+        if sums == nil {
+            sums = readColumn(column, decimals)
+            if columnSums != nil {
+                columnSums![key] = sums
+            }
+        }
+        let column = sums!
+        if column.exact {
+            return column.sums[end] - column.sums[first]
+        }
+        var sum: Int64 = 0
+        for value in column.values[first..<end] where abs(sum + value) <= Table.MAX_SUM {
+            sum += value
+        }
+        return sum
+    }
+
+    // Reads the number of each row of the column, in units of the decimals: 0
+    // for a cell that has no number, or that a cell above it covers. A cell is
+    // read once, from its whole text, and the lines it wraps into add nothing:
+    // they were read as numbers, and 1,234,567.89 wrapped in a narrow column
+    // added 567.89 (the review of 30 October 2026).
+    private func readColumn(_ column: Int, _ decimals: Int) -> ColumnSums {
+        let sums = ColumnSums(tableData.count)
+        var magnitude: Int64 = 0
+        for (r, row) in tableData.enumerated() {
+            sums.sums[r + 1] = sums.sums[r]
+            if column >= row.count {
+                continue
+            }
+            let cell = row[column]
+            if (cell.properties & (Cell.COVERED | Cell.CONTINUED)) != 0 {
+                continue
+            }
+            if let text = cell.wholeText ?? cell.text, let value = Table.numberOf(text, decimals) {
+                sums.values[r] = value
+                if sums.exact {
+                    // A value is at most MAX_SUM, so the sums cannot overflow
+                    // before they are found to be past it.
+                    magnitude += abs(value)
+                    sums.exact = magnitude <= Table.MAX_SUM
+                    sums.sums[r + 1] += value
+                }
+            }
+        }
+        return sums
+    }
+
+    ///
+    /// Returns the number the text is, in units of the decimals, rounded half
+    /// away from zero, or nil when the text is not a number, as isNumber
+    /// reads it, has more than one period, or is more than 18 digits in those
+    /// units. Commas and apostrophes are between the thousands, a period is
+    /// before the decimals, and parentheses make a number negative. The text
+    /// is read as code points, and trimmed of those up to the space, as
+    /// isNumber reads it.
+    ///
+    static func numberOf(_ text: String, _ decimals: Int) -> Int64? {
+        if !isNumber(text) {
+            return nil
+        }
+        var str = [Unicode.Scalar](text.unicodeScalars)
+        var negative = false
+        if str.count >= 2 && str[0] == "(" && str[str.count - 1] == ")" {
+            str = [Unicode.Scalar](str[1..<(str.count - 1)])
+            negative = true
+        }
+        str = str.filter { $0 != "," && $0 != "'" }
+        var from = 0
+        var to = str.count
+        while from < to && str[from].value <= 0x20 {
+            from += 1
+        }
+        while to > from && str[to - 1].value <= 0x20 {
+            to -= 1
+        }
+        var chars = [Unicode.Scalar](str[from..<to])
+        if chars.isEmpty {
+            return nil
+        }
+        if chars[0] == "+" || chars[0] == "-" {
+            negative = negative != (chars[0] == "-")
+            chars.removeFirst()
+        }
+        var exponent = 0
+        if let e = chars.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+            var exp = [Unicode.Scalar](chars[(e + 1)...])
+            var sign = 1
+            if let first = exp.first, first == "+" || first == "-" {
+                sign = (first == "-") ? -1 : 1
+                exp.removeFirst()
+            }
+            if exp.count > 4 || exp.contains(".") {
+                return nil
+            }
+            exponent = sign * Int(Table.digitsValue(exp[...]))
+            chars = [Unicode.Scalar](chars[..<e])
+        }
+        let points = chars.indices.filter { chars[$0] == "." }
+        if points.count > 1 {
+            return nil
+        }
+        let fraction = points.isEmpty ? [] : [Unicode.Scalar](chars[(points[0] + 1)...])
+        var digits = points.isEmpty ? chars : [Unicode.Scalar](chars[..<points[0]]) + fraction
+        // A space inside the number, as in ". 5", is not in a number: isNumber
+        // reads past it, and Java's parse threw on it (review of 11 October
+        // 2026, #15)
+        if digits.contains(where: { $0 < "0" || $0 > "9" }) {
+            return nil
+        }
+        while let first = digits.first, first == "0" {
+            digits.removeFirst()
+        }
+        if digits.isEmpty {
+            return 0
+        }
+        // The number is the digits times 10 to the shift, in units of the
+        // decimals.
+        let shift = exponent - fraction.count + decimals
+        var value: Int64
+        if shift >= 0 {
+            if digits.count + shift > 18 {
+                return nil
+            }
+            value = Table.digitsValue(digits[...])
+            for _ in 0..<shift {
+                value *= 10
+            }
+        } else {
+            let keep = digits.count + shift
+            if keep < 0 {
+                return 0
+            }
+            if keep > 18 {
+                return nil
+            }
+            value = (keep == 0) ? 0 : Table.digitsValue(digits[..<keep])
+            if digits[keep].value >= 0x35 {
+                value += 1
+            }
+            if value > MAX_SUM {
+                return nil
+            }
+        }
+        return negative ? -value : value
+    }
+
+    // The value of at most 18 ASCII digits, or 0 when they are not all digits,
+    // as Go's strconv.ParseInt leaves it.
+    private static func digitsValue(_ digits: ArraySlice<Unicode.Scalar>) -> Int64 {
+        var value: Int64 = 0
+        for digit in digits {
+            if digit.value < 0x30 || digit.value > 0x39 {
+                return 0
+            }
+            value = value * 10 + Int64(digit.value - 0x30)
+        }
+        return value
+    }
+
+    ///
+    /// Returns the sum in units of the decimals as text: the decimals after a
+    /// period, and commas between the thousands.
+    ///
+    static func formatSum(_ sum: Int64, _ decimals: Int) -> String {
+        var digits = Array(String(abs(sum)))
+        while digits.count <= decimals {
+            digits.insert("0", at: 0)
+        }
+        let point = digits.count - decimals
+        var text = (sum < 0) ? "-" : ""
+        for i in 0..<point {
+            if i > 0 && (point - i) % 3 == 0 {
+                text += ","
+            }
+            text.append(digits[i])
+        }
+        if decimals > 0 {
+            text += "." + String(digits[point...])
+        }
+        return text
+    }
+
+    ///
+    /// Keeps the row with the specified index on the same page as the next
+    /// row, as a heading row is kept with the rows under it: a page break does
+    /// not fall between them, and moves both to the next page. Rows kept with
+    /// the next one one after another are kept together, unless together they
+    /// are taller than a page. Call it before the table is drawn.
+    ///
+    /// - Parameter index: the index of the row.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func keepRowWithNext(_ index: Int) -> Table {
+        if index >= 0 && index < tableData.count {
+            for cell in tableData[index] {
+                cell.properties |= Cell.KEPT_WITH_NEXT
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Removes the horizontal lines between the rows from index1 to index2.
+    ///
+    @discardableResult
+    public func removeLineBetweenRows(_ index1: Int, _ index2: Int) -> Table {
+        if index1 < index2 && index1 < 0 {
+            return noIndex(index1)
+        }
+        if index1 < index2 && index2 >= tableData.count {
+            return noIndex(index2)
+        }
+        var j = index1
+        while j < index2 {
+            var row = tableData[j]
+            for cell in row {
+                cell.setBorder(Border.BOTTOM, false)
+            }
+            row = tableData[j + 1]
+            for cell in row {
+                cell.setBorder(Border.TOP, false)
+            }
+            j += 1
+        }
+        return self
+    }
+
+    ///
+    /// Sets the text alignment in the specified column.
+    /// Supported values: Alignment.LEFT, Alignment.RIGHT, Alignment.CENTER and Alignment.JUSTIFY.
+    ///
+    /// - Parameter index: the index of the specified column.
+    /// - Parameter alignment: the specified alignment.
+    ///
+    @discardableResult
+    public func setTextAlignmentInColumn(_ index: Int, _ alignment: Alignment) -> Table {
+        if index < 0 {
+            return noIndex(index)
+        }
+        for row in tableData {
+            if index < row.count {
+                let cell = row[index]
+                cell.setTextAlignment(alignment)
+                if let textBlock = cell.getTextBlock() {
+                    textBlock.setTextAlignment(alignment)
+                }
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the color of the text in the specified column.
+    ///
+    /// - Parameter index: the index of the specified column.
+    /// - Parameter color: the color specified as an integer.
+    ///
+    @discardableResult
+    public func setTextColorInColumn(_ index: Int, _ color: Int32) -> Table {
+        if index < 0 {
+            return noIndex(index)
+        }
+        for row in tableData {
+            if index < row.count {
+                let cell = row[index]
+                cell.setTextColor(color)
+                if let textBlock = cell.getTextBlock() {
+                    textBlock.setTextColor(color)
+                }
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the font and the font size of the cells in the specified column.
+    ///
+    /// - Parameter index: the column index.
+    /// - Parameter font: the font.
+    ///
+    @discardableResult
+    public func setFontInColumn(_ index: Int, _ font: Font) -> Table {
+        if index < 0 {
+            return noIndex(index)
+        }
+        for row in tableData {
+            if index < row.count {
+                let cell = row[index]
+                cell.setFont(font).setFontSize(font.size)
+                if let textBlock = cell.getTextBlock() {
+                    textBlock.setFont(font).setFontSize(font.getSize())
+                }
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the color of the text in the specified row.
+    ///
+    /// - Parameter index: the index of the specified row.
+    /// - Parameter color: the color specified as an integer.
+    ///
+    @discardableResult
+    public func setTextColorInRow(_ index: Int, _ color: Int32) -> Table {
+        if index < 0 {
+            return noIndex(index)
+        }
+        if index < tableData.count {
+            let row = tableData[index]
+            for cell in row {
+                cell.setTextColor(color)
+                if let textBlock = cell.getTextBlock() {
+                    textBlock.setTextColor(color)
+                }
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the font and the font size of the cells in the specified row.
+    ///
+    /// - Parameter index: the row index.
+    /// - Parameter font: the font.
+    ///
+    @discardableResult
+    public func setFontInRow(_ index: Int, _ font: Font) -> Table {
+        if index < 0 {
+            return noIndex(index)
+        }
+        if index < tableData.count {
+            let row = tableData[index]
+            for cell in row {
+                cell.setFont(font).setFontSize(font.size)
+                if let textBlock = cell.getTextBlock() {
+                    textBlock.setFont(font).setFontSize(font.getSize())
+                }
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Colors every other row of the body of the table, the second, the fourth
+    /// and so on, counting the rows of the data and not those of each page, as
+    /// BigTable.setShadingColor shades its rows. The lines a row wraps into
+    /// have its color, and a cell with a background of its own keeps it; the
+    /// header and the footer rows are not striped. Color.transparent turns the
+    /// stripes off.
+    ///
+    /// - Parameter color: the color as a 0xRRGGBB value, for example Color.whitesmoke.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setAlternateRowColor(_ color: Int32) -> Table {
+        self.alternateRowColor = (color == Color.transparent) ? Cell.NO_COLOR : color & 0xFFFFFF
+        return self
+    }
+
+    ///
+    /// Colors every other row of the body of the table, as setAlternateRowColor
+    /// does with a 0xRRGGBB value, with a color of red, green and blue values
+    /// from 0 to 1. nil turns the stripes off.
+    ///
+    /// - Parameter color: the red, green and blue values.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setAlternateRowColor(_ color: [Float]?) -> Table {
+        self.alternateRowColor = Util.toPackedRGB(color)
+        return self
+    }
+
+    // The rows of the body that setAlternateRowColor colors: the second row of
+    // the data, the fourth and so on, with the lines each wraps into.
+    private func getStripedRows() -> [Bool] {
+        if alternateRowColor == Cell.NO_COLOR {
+            return []
+        }
+        var rows = [Bool](repeating: false, count: tableData.count)
+        var count = 0
+        var r = numOfHeaderRows
+        while r < footerStart() {
+            if !isContinuation(r) {
+                count += 1
+            }
+            rows[r] = (count % 2 == 0)
+            r += 1
+        }
+        return rows
+    }
+
+    ///
+    /// Sets the font, the text color and the background color of the header
+    /// rows, the rows setTableData names, as setFontInRow and setTextColorInRow
+    /// set them for one row. Call it after setTableData and before
+    /// autoAdjustColumnWidths, which measures the text in the font.
+    ///
+    /// - Parameter font: the font, or nil to keep the fonts of the cells.
+    /// - Parameter textColor: the text color, or Color.transparent to keep it.
+    /// - Parameter backgroundColor: the background color, or Color.transparent to keep it.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setHeaderRowStyle(_ font: Font?, _ textColor: Int32, _ backgroundColor: Int32) -> Table {
+        return setRowStyle(0, numOfHeaderRows, font, textColor, backgroundColor)
+    }
+
+    ///
+    /// Sets the font, the text color and the background color of the footer
+    /// rows, the rows setNumberOfFooterRows names, as setHeaderRowStyle sets
+    /// those of the header rows. Call it after setNumberOfFooterRows.
+    ///
+    /// - Parameter font: the font, or nil to keep the fonts of the cells.
+    /// - Parameter textColor: the text color, or Color.transparent to keep it.
+    /// - Parameter backgroundColor: the background color, or Color.transparent to keep it.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setFooterRowStyle(_ font: Font?, _ textColor: Int32, _ backgroundColor: Int32) -> Table {
+        let start = (numOfFooterRows > 0) ? footerStart() : tableData.count
+        return setRowStyle(start, tableData.count, font, textColor, backgroundColor)
+    }
+
+    private func setRowStyle(_ start: Int, _ end: Int, _ font: Font?, _ textColor: Int32,
+            _ backgroundColor: Int32) -> Table {
+        var r = start
+        while r < end && r < tableData.count {
+            if let font = font {
+                setFontInRow(r, font)
+            }
+            setTextColorInRow(r, textColor)
+            if backgroundColor != Color.transparent {
+                for cell in tableData[r] {
+                    cell.setBackgroundColor(backgroundColor)
+                }
+            }
+            r += 1
+        }
+        return self
+    }
+
+    ///
+    /// Sets the width of the table. The columns share it by the percentages
+    /// setColumnWidthsInPercent gives them, whichever of the two is called
+    /// first; without them, by the widths they have, as fitToWidth shares it.
+    ///
+    /// - Parameter width: the width of the table.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setWidth(_ width: Float) -> Table {
+        self.tableWidth = width
+        if columnPercents != nil {
+            applyColumnPercents()
+            return self
+        }
+        return fitToWidth(width)
+    }
+
+    ///
+    /// Gives the columns, from the first, their percentages of the width of the
+    /// table that setWidth sets, whichever of the two is called first. The
+    /// columns that have none share what is left of 100 equally, and the widths
+    /// are then made to add up to the width of the table, so percentages that
+    /// do not add up to 100 are shares of it. Text wraps to the widths.
+    ///
+    /// - Parameter percents: the percentages of the columns.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func setColumnWidthsInPercent(_ percents: Float...) -> Table {
+        self.columnPercents = percents
+        if tableWidth > 0.0 {
+            applyColumnPercents()
+        }
+        return self
+    }
+
+    private func applyColumnPercents() {
+        guard let percents = columnPercents, !tableData.isEmpty else {
+            return
+        }
+        let columns = tableData[0].count
+        var shares = [Float](repeating: 0.0, count: columns)
+        var given: Float = 0.0
+        var rest = columns
+        for i in 0..<min(columns, percents.count) {
+            shares[i] = max(0.0, percents[i])
+            given += shares[i]
+            rest -= 1
+        }
+        let each: Float = (rest > 0) ? max(0.0, 100.0 - given) / Float(rest) : 0.0
+        let total = given + each * Float(rest)
+        if total <= 0.0 {
+            // Percentages that are all 0 share the width equally, as columns
+            // with none do.
+            for i in 0..<columns {
+                setColumnWidth(i, tableWidth / Float(columns))
+            }
+            return
+        }
+        for i in 0..<columns {
+            let share = (i < percents.count) ? shares[i] : each
+            setColumnWidth(i, tableWidth * share / total)
+        }
+    }
+
+    ///
+    /// Makes the table the width given, sharing it among the columns by the
+    /// widths they have: after autoAdjustColumnWidths, by the text each holds.
+    /// Text wraps to the widths.
+    ///
+    /// - Parameter width: the width of the table.
+    /// - Returns: this Table object.
+    ///
+    @discardableResult
+    public func fitToWidth(_ width: Float) -> Table {
+        if tableData.isEmpty {
+            return self
+        }
+        let columns = tableData[0].count
+        var total: Float = 0.0
+        for i in 0..<columns {
+            total += getColumnWidth(i)
+        }
+        if total <= 0.0 {
+            return self
+        }
+        let widths = (0..<columns).map { getColumnWidth($0) * width / total }
+        for (i, w) in widths.enumerated() {
+            setColumnWidth(i, w)
+        }
+        return self
+    }
+
+    ///
+    /// Sets the width of the column with the specified index.
+    ///
+    /// - Parameter index: the index of specified column.
+    /// - Parameter width: the specified width.
+    ///
+    @discardableResult
+    public func setColumnWidth(_ index: Int, _ width: Float) -> Table {
+        if index < 0 {
+            return noIndex(index)
+        }
+        for row in tableData {
+            if index < row.count {
+                row[index].setWidth(width)
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Returns the column width of the column at the specified index.
+    ///
+    /// - Parameter index: the index of the column.
+    /// - Returns: the width of the column.
+    ///
+    public func getColumnWidth(_ index: Int) -> Float {
+        return getCellAt(0, index).getWidth()
+    }
+
+    ///
+    /// Returns the cell at the specified row and column.
+    ///
+    /// - Parameter row: the specified row.
+    /// - Parameter col: the specified column.
+    ///
+    /// - Returns: the cell at the specified row and column.
+    ///
+    public func getCellAt(_ row: Int, _ col: Int) -> Cell {
+        let r = (row >= 0) ? row : tableData.count + row    // A row counted from the last
+        if r < 0 || r >= tableData.count {
+            noIndex(row)
+            return notInTheTable()
+        }
+        if col < 0 || col >= tableData[r].count {
+            noIndex(col)
+            return notInTheTable()
+        }
+        return tableData[r][col]
+    }
+
+    // Returns a cell that is not in the table, for a wrong index, in the font
+    // of the first cell, or a font of no PDF when the table has no cells.
+    private func notInTheTable() -> Cell {
+        return Cell((tableData.first { !$0.isEmpty }?[0].font ?? (try? Font(CoreFont.HELVETICA)))!)
+    }
+
+    ///
+    /// Returns a list of cells for the specified row.
+    ///
+    /// - Parameter index: the index of the specified row.
+    ///
+    /// - Returns: the list of cells.
+    ///
+    public func getRow(_ index: Int) -> [Cell] {
+        if index < 0 || index >= tableData.count {
+            noIndex(index)
+            return []
+        }
+        return tableData[index]
+    }
+
+    ///
+    /// Returns a list of cells for the specified column.
+    ///
+    /// - Parameter index: the index of the specified column.
+    ///
+    /// - Returns: the list of cells.
+    ///
+    public func getColumn(_ index: Int) -> [Cell] {
+        var column = [Cell]()
+        if index < 0 {
+            noIndex(index)
+            return column
+        }
+        for row in tableData {
+            if index < row.count {
+                column.append(row[index])
+            }
+        }
+        return column
+    }
+
+    ///
+    /// Draws this table on the specified page.
+    ///
+    /// - Parameter page: the page to draw this table on.
+    ///
+    /// - Returns: the x and y coordinates of the bottom right corner of the table.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        if tableData.isEmpty {
+            return [x1, y1]     // An empty table draws nothing.
+        }
+        if let page = page, refused(page.pdf) {
+            return [x1, y1]
+        }
+        wrapAroundCellText()
+        applyRowSpans()
+        setRightBorderOnLastColumn()
+        setBottomBorderOnLastRow()
+        heights = getRowHeights()
+        striped = getStripedRows()
+        columnSums = [:]
+        defer { columnSums = nil }
+        let xy = drawPage(page, 0)
+        return [x1 + getWidth(), xy[1]]
+    }
+
+    ///
+    /// Draws this table on as many new pages as it needs.
+    /// The pages are created detached and added to the list; add them to the PDF afterwards.
+    ///
+    /// - Parameter pdf: the PDF document.
+    /// - Parameter pages: the list that receives the new pages.
+    /// - Parameter pageSize: the page size, for example Letter.PORTRAIT.
+    /// - Returns: the x and y coordinates of the bottom right corner of the table on the last page,
+    ///   or of its top right corner when the table was already drawn and no page was added.
+    ///
+    @discardableResult
+    public func drawOn(_ pdf: PDF, _ pages: inout [Page], _ pageSize: PageSize) -> [Float]? {
+        return drawOn(pdf, nil, &pages, pageSize)
+    }
+
+    ///
+    /// Draws this table as drawOn(pdf, &pages, pageSize) does, starting on first:
+    /// a page that has other content above the table, such as a heading, which
+    /// setFirstPageTopMargin puts the table under. The next pages are new, and
+    /// are added to the list; first is not.
+    ///
+    /// - Parameter pdf: the PDF document.
+    /// - Parameter first: the page the table starts on, or nil for a new one.
+    /// - Parameter pages: the list that receives the new pages.
+    /// - Parameter pageSize: the page size, for example Letter.PORTRAIT.
+    /// - Returns: the x and y coordinates of the bottom right corner of the table on the last page,
+    ///   or of its top right corner when the table was already drawn and no page was added.
+    ///
+    @discardableResult
+    public func drawOn(_ pdf: PDF, _ first: Page?, _ pages: inout [Page], _ pageSize: PageSize) -> [Float]? {
+        if tableData.isEmpty {
+            return [x1, y1]     // An empty table needs no page.
+        }
+        if refused(pdf) {
+            return [x1, y1]
+        }
+        wrapAroundCellText()
+        applyRowSpans()
+        setRightBorderOnLastColumn()
+        setBottomBorderOnLastRow()
+        heights = getRowHeights()
+        striped = getStripedRows()
+        columnSums = [:]
+        defer { columnSums = nil }
+        // A table with no rows left to draw needs no page, and ends where it starts.
+        var xy: [Float] = [x1, y1]
+        var pageNumber: Int = startsOnNextPage(first, pageSize) ? 2 : 1
+        while (hasMoreData()) {
+            var page = first
+            if pageNumber > 1 || first == nil {
+                page = Page(pdf, pageSize, false)
+                pages.append(page!)
+            }
+            xy = drawPage(page, pageNumber)
+            pageNumber += 1
+        }
+        return [x1 + getWidth(), xy[1]]
+    }
+
+    // Draws the header rows and the rows that fit on the page under them. The
+    // borders of the cells are written when the page is done, as continuous
+    // lines, unless the page strokes with a dash pattern, which would go on
+    // from one cell to the next and look different.
+    private func drawPage(_ page: Page?, _ pageNumber: Int) -> [Float] {
+        guard let page = page, !separateBorders, page.strokeDashPattern == "[] 0" else {
+            return drawTableRows(page, drawHeaderRows(page, pageNumber))
+        }
+        let outer = page.tableLines
+        let lines = TableLines()
+        page.tableLines = lines
+        defer { page.tableLines = outer }
+        let xy = drawTableRows(page, drawHeaderRows(page, pageNumber))
+        lines.flush(page)
+        return xy
+    }
+
+    // Returns true when the header and the footer rows do not fit on the first
+    // page, under its top margin, and do on the next: the table starts there, as
+    // a first row that does not fit does.
+    private func startsOnNextPage(_ first: Page?, _ pageSize: PageSize) -> Bool {
+        if firstPageTopMargin <= 0.0 {
+            return false
+        }
+        let height = first?.height ?? pageSize.getHeight()
+        var rows = headerHeight()
+        var r = footerStart()
+        while r < heights.count {
+            rows += heights[r]
+            r += 1
+        }
+        return firstPageTopMargin + rows > height && y1 + rows <= height
+    }
+
+    // Returns the height of the header rows.
+    private func headerHeight() -> Float {
+        var height: Float = 0.0
+        for r in 0..<min(numOfHeaderRows, heights.count) {
+            height += heights[r]
+        }
+        return height
+    }
+
+    // Returns true when the header rows are drawn again at the top of the next
+    // pages: unless they take more than half of the page under the top of the
+    // table, where they would leave a line or two of the body to each page and
+    // the table would run to hundreds of them (found by fuzzing, 8 October
+    // 2026). Such a header is drawn on the first page alone.
+    private func repeatsHeaderOn(_ page: Page?) -> Bool {
+        guard let page = page else {
+            return true
+        }
+        return headerHeight() <= (page.height - bottomMargin - y1) / 2.0
+    }
+
+    private func drawHeaderRows(_ page: Page?, _ pageNumber: Int) -> [Float] {
+        let x = x1
+        var y = y1
+        if pageNumber == 1 && firstPageTopMargin > 0.0 {
+            y = firstPageTopMargin
+        }
+        // In a PDF/UA document the table is a Table element, which the rows
+        // drawn on the next pages go on adding to. The header rows are TH
+        // cells the first time they are drawn, and artifacts on the next pages.
+        let first = (rendered == numOfHeaderRows) && !headerDrawn
+        if let page = page, first || structElement == nil {
+            structElement = page.addStructElement(
+                    page.structParent, StructElem.TABLE, nil, true)
+        }
+        if let page = page, !first && !repeatsHeaderOn(page) {
+            return [x, y]
+        }
+        var height: Float = 0.0
+        for i in 0..<min(numOfHeaderRows, tableData.count) where !(first && isBroughtForwardRow(i)) {
+            height += self.heights[i]
+        }
+        if runsOff(page, "header", y, height) {
+            return [x, y]
+        }
+        if let page = page, !first && numOfHeaderRows > 0 {
+            page.addArtifactBMC()
+        }
+        let heights = self.heights
+        // The rows that bring a total forward are drawn from the second page
+        // on, with the total of the rows before the page.
+        var last = -1
+        for i in 0..<min(numOfHeaderRows, tableData.count) where !(first && isBroughtForwardRow(i)) {
+            last = i
+        }
+        if rendered != -1 {
+            setSums(0, numOfHeaderRows, rendered, rendered)
+        }
+        for i in 0..<min(numOfHeaderRows, tableData.count) {
+            if first && isBroughtForwardRow(i) {
+                continue
+            }
+            let row = tableData[i]
+            if let page = page {
+                if i == last {
+                    // A line under the header, below the cells that have lines:
+                    // a table without lines has none.
+                    for cell in row where (cell.properties & Border.ALL) != 0 {
+                        cell.setBorder(Border.BOTTOM, true)
+                    }
+                }
+                drawRow(page, row, x, y, heights, i, heights.count, first ? StructElem.TH : nil)
+            }
+            y += heights[i]
+        }
+        if let page = page, !first && numOfHeaderRows > 0 {
+            page.addEMC()
+        }
+        if page != nil {
+            headerDrawn = true
+        }
+        return [x, y]
+    }
+
+    // Draws the cells of the row. In a PDF/UA document the row is a TR element
+    // and each cell a TH or TD element, which holds what the cell draws; a row
+    // that goes on with the wrapped text of the row above adds to its elements.
+    // With no cell structure the row is not tagged, as it is an artifact. A
+    // cell that spans rows is drawn down to the last of them before the row at
+    // pageEnd, which is on the next page.
+    private func drawRow(
+            _ page: Page,
+            _ row: [Cell],
+            _ x: Float,
+            _ y: Float,
+            _ heights: [Float],
+            _ rowIndex: Int,
+            _ pageEnd: Int,
+            _ cellStructure: StructElem?) {
+        let parent = page.structParent
+        let tagged = (structElement != nil && cellStructure != nil)
+        let continued = (row[0].properties & Cell.CONTINUED) != 0
+        var rowElement: StructElement?
+        if tagged && !continued && !allCovered(row) {
+            rowElement = page.addStructElement(structElement, StructElem.TR, nil)
+            if cellElements.count != row.count {
+                cellElements = [StructElement?](repeating: nil, count: row.count)
+            }
+        }
+        var x = x
+        var i = 0
+        while i < row.count {
+            let cell = row[i]
+            let colspan = Table.colSpanIn(row, i)
+            let covered = (cell.properties & Cell.COVERED) != 0
+            if tagged && !covered {
+                if !continued {
+                    cellElements[i] = page.addStructElement(rowElement, cellStructure!,
+                            getAttributes(cellStructure!, colspan, tableRowsSpanned(rowIndex, cell.rowsSpanned)))
+                }
+                page.structParent = (i < cellElements.count) ? cellElements[i] : nil
+            }
+            var w: Float = 0.0
+            for _ in 0..<colspan {
+                w += row[i].getWidth()
+                i += 1
+            }
+            if !covered {
+                // A cell that spans rows is as tall as all the rows it covers
+                // on this page.
+                var cellHeight: Float = 0.0
+                let end = min(rowIndex + cell.rowsSpanned, heights.count, max(pageEnd, rowIndex + 1))
+                for r in rowIndex..<end {
+                    cellHeight += heights[r]
+                }
+                page.setBrushColor(cell.textColor)
+                // A row of the body that is striped colors the cells that
+                // have no background of their own, while they are drawn.
+                let stripe = rowIndex < striped.count && striped[rowIndex]
+                        && cell.backgroundColor == Cell.NO_COLOR
+                if stripe {
+                    cell.backgroundColor = alternateRowColor
+                }
+                let mcidParent = page.mcidParent
+                let grouped = tagged && cell.text != nil &&
+                        cellParagraph(page, rowIndex, i - colspan, continued)
+                let close = closesPage(cell, rowIndex, i - colspan, end, pageEnd)
+                if close {
+                    cell.properties |= Border.BOTTOM
+                }
+                cell.drawOn(page, x, y, w, cellHeight)
+                if close {
+                    cell.properties &= ~Border.BOTTOM
+                }
+                if grouped {
+                    page.mcidParent = mcidParent
+                }
+                if stripe {
+                    cell.backgroundColor = Cell.NO_COLOR
+                }
+            }
+            x += w
+        }
+        page.structParent = parent
+    }
+
+    // True when the cell at the row and column, drawn down to the row before
+    // end, is drawn with a line under it, which it does not have, as the
+    // last of the rows of a page the table goes on from: when the cell has
+    // lines, as a header row's line is drawn, and is not in the wrapped text
+    // of a cell that spans rows, which draws the line under the both of them.
+    private func closesPage(_ cell: Cell, _ r: Int, _ column: Int, _ end: Int, _ pageEnd: Int) -> Bool {
+        return closeAt != -1 && pageEnd == closeAt && end == closeAt
+                && (cell.properties & Border.ALL) != 0
+                && (cell.properties & Border.BOTTOM) == 0
+                && spanAbove(r, column) == nil
+    }
+
+    // True when every cell of the row is one that a cell above it spans over,
+    // so the row holds no cell of its own and is not a row of the table.
+    private func allCovered(_ row: [Cell]) -> Bool {
+        for cell in row where (cell.properties & Cell.COVERED) == 0 {
+            return false
+        }
+        return !row.isEmpty
+    }
+
+    // The number of rows of the table, its TR elements, that a cell spanning
+    // count rows of the drawing from the row covers: the rows of the wrapped
+    // text of a row are not rows of the table, and neither is a row every cell
+    // of which a cell above it covers.
+    private func tableRowsSpanned(_ r: Int, _ count: Int) -> Int {
+        if count < 2 {
+            return count
+        }
+        var rows = 0
+        var s = r
+        while s < r + count && s < tableData.count {
+            if !isContinuation(s) && !allCovered(tableData[s]) {
+                rows += 1
+            }
+            s += 1
+        }
+        return rows
+    }
+
+    // The attributes of a table cell element: the scope of a header cell and
+    // the number of rows and columns a cell spans, or nil when it has none.
+    private func getAttributes(
+            _ cellStructure: StructElem, _ colspan: Int, _ rowspan: Int) -> String? {
+        var spans = ""
+        if colspan > 1 {
+            spans += " /ColSpan \(colspan)"
+        }
+        if rowspan > 1 {
+            spans += " /RowSpan \(rowspan)"
+        }
+        if cellStructure == StructElem.TH {
+            return "<</O /Table /Scope /Column" + spans + ">>"
+        }
+        return spans.isEmpty ? nil : "<</O /Table" + spans + ">>"
+    }
+
+    // Draws the rows from the next row to draw, as many as fit on the page,
+    // and the footer rows under them. With no page it measures them all and
+    // leaves the next row to draw as it is.
+    private func drawTableRows(_ page: Page?, _ xy: [Float]) -> [Float] {
+        let x = xy[0]
+        var y = xy[1]
+        let footer = footerStart()
+        let done = (rendered == -1)
+        let first = done ? footer : rendered
+        let heights = self.heights
+        // Where the rows start on the next pages, under the header rows.
+        var top = y1
+        if repeatsHeaderOn(page) {
+            top += headerHeight()
+        }
+        // Where the rows end on a page, over the footer rows.
+        var bottom: Float = (page == nil) ? 0.0 : page!.height - bottomMargin
+        for r in footer..<tableData.count {
+            bottom -= heights[r]
+        }
+        // The rows of the page are found before any of them is drawn, so that
+        // a cell that spans rows past the end of the page is drawn down to the
+        // last row of the page, and goes on at the top of the next.
+        var end = footer
+        var more = false
+        if let page = page {
+            (end, more) = rowsOnPage(first, footer, y, top, bottom)
+            // The rows of a page that the table goes on from are closed with
+            // a line under them, as the end of the table is, the line the
+            // first row of the next page draws over itself: the grid was open
+            // at the bottom of every page but the last. A footer row draws
+            // that line itself.
+            closeAt = (more && footer == tableData.count && endsWithLine()) ? end : -1
+            drawSpansFromAbove(page, x, y, first, end)
+        }
+        for r in first..<max(first, end) {
+            if let page = page {
+                if y + heights[r] > page.height {
+                    // The first row of the first page, which starts lower than the next
+                    // pages do, under a first-page top margin, goes on the next page when it
+                    // fits there: it was refused, though the next page had room for it
+                    // (review of 17 October 2026).
+                    if r == first && y > top && top + heights[r] <= page.height {
+                        end = r
+                        more = true
+                        break
+                    }
+                    // A row of a cell drawn whole, such as a TextBlock or an
+                    // image, is taller than a page: drawn, it ran off the page,
+                    // and what did not fit was lost with no error (issue #4,
+                    // 15 October 2026). A row that only reaches into the bottom
+                    // margin is drawn, as before.
+                    page.pdf.fail("The row at index \(r) of the table is "
+                            + "\(String(format: "%.0f", heights[r])) points tall, "
+                            + "and runs off the page, which has "
+                            + "\(String(format: "%.0f", page.height - bottomMargin - top)) points for it: "
+                            + "a cell with a TextBlock, an image or another drawable is drawn whole "
+                            + "and cannot be split across pages. "
+                            + "Put the text in a text cell, which is split across pages, or make the cell smaller.")
+                    rendered = -1   // Nothing more is drawn, and no more pages are asked for
+                    closeAt = -1
+                    return [x, y]
+                }
+                drawRow(page, tableData[r], x, y, heights, r, end, StructElem.TD)
+            }
+            y += heights[r]
+        }
+        closeAt = -1
+        if more {
+            rendered = end
+            setFooterSums(first, end)
+            return [x, drawFooterRows(page, x, y, heights, false)]
+        }
+        if !done {
+            // The rows of the table are all drawn, and the footer rows end it.
+            setFooterSums(first, footer)
+            y = drawFooterRows(page, x, y, heights, true)
+        }
+        if page != nil {
+            rendered = -1   // We are done!
+        }
+        return [x, y]
+    }
+
+    // The row after the rows from index that go on the page, where they start
+    // at y and end at bottom, and true when rows before the footer are left
+    // for the next page, where they start at top.
+    private func rowsOnPage(
+            _ start: Int, _ footer: Int, _ y: Float, _ top: Float, _ bottom: Float) -> (Int, Bool) {
+        let first = start
+        var index = start
+        var y = y
+        // The rows before the first of these are not kept with the next row,
+        // the lines of the rows before the second are cut where the page
+        // ends, as rows of their own, and so are the rows that a cell spans
+        // before the third.
+        var cutRowsUntil = -1
+        var cutLinesUntil = -1
+        var cutSpansUntil = -1
+        while index < footer {
+            // The rows a cell spans, the lines a row wraps into and the rows
+            // kept with the next one are drawn together, so that a page break
+            // never cuts one of them in two. The footer rows are not in them.
+            let keepSpans = (index >= cutSpansUntil)
+            let keepLines = keepSpans && (index >= cutLinesUntil)
+            let keepRows = keepLines && (index >= cutRowsUntil)
+            let end = min(rowGroupEnd(index, keepSpans, keepLines, keepRows), footer)
+            var groupHeight: Float = 0.0
+            for r in index..<end {
+                groupHeight += heights[r]
+            }
+            if (y + groupHeight) > bottom {
+                if keepSpans && groupHeight > bottom - top {
+                    // Rows that would not fit the next page either are drawn
+                    // from here: first each on its own, then, for a row that
+                    // is taller than a page, each line on its own, and then,
+                    // for a cell that spans rows taller than a page, each of
+                    // the rows, the cell being drawn on each page over the
+                    // rows it covers there. They are cut where the page ends.
+                    if keepRows {
+                        cutRowsUntil = end
+                    } else if keepLines {
+                        cutLinesUntil = end
+                    } else {
+                        cutSpansUntil = end
+                    }
+                    continue
+                }
+                // Rows that do not fit go on the next page, where they fit,
+                // even the first rows of this one, which starts lower than the
+                // next when there is something above the table. Only a line
+                // taller than a page is drawn where it is, as it fits no page,
+                // and leaving it for the next page would ask for pages forever.
+                if index > first || groupHeight <= bottom - top {
+                    return (index, true)
+                }
+            }
+            for r in index..<end {
+                y += heights[r]
+            }
+            index = end
+        }
+        return (index, false)
+    }
+
+    // Draws, over the first row of a page, the rest of each cell of the page
+    // before that spans rows down into it: its background and its borders, as
+    // far as the row at pageEnd, which is on the next page. The text of the
+    // cell was drawn with the cell on the page before.
+    private func drawSpansFromAbove(_ page: Page, _ x: Float, _ y: Float, _ first: Int, _ pageEnd: Int) {
+        if first >= pageEnd || first <= numOfHeaderRows {
+            return  // The first page has no page before it.
+        }
+        let row = tableData[first]
+        let continued = isContinuation(first)
+        var x = x
+        var i = 0
+        while i < row.count {
+            var colspan = 1
+            var w = row[i].getWidth()
+            if continued || (row[i].properties & Cell.COVERED) != 0, let s = spanAbove(first, i) {
+                let cell = tableData[s][i]
+                colspan = Table.colSpanIn(tableData[s], i)
+                w = 0.0
+                for j in i..<(i + colspan) {
+                    w += row[j].getWidth()
+                }
+                var h: Float = 0.0
+                for r in first..<max(first, min(s + cell.rowsSpanned, pageEnd)) {
+                    h += heights[r]
+                }
+                if cell.backgroundColor != Cell.NO_COLOR {
+                    cell.drawBackground(page, x, y, w, h)
+                }
+                // A span that goes on to the next page as well is closed
+                // at the bottom of this one.
+                let end = min(s + cell.rowsSpanned, pageEnd)
+                let close = closesPage(cell, s, i, end, pageEnd)
+                if close {
+                    cell.properties |= Border.BOTTOM
+                }
+                cell.drawBorders(page, x, y, w, h)
+                if close {
+                    cell.properties &= ~Border.BOTTOM
+                }
+            }
+            x += w
+            i += colspan
+        }
+    }
+
+    // The row of the cell in the column that spans rows down over the row, or
+    // nil when there is none: the first cell above the row that is neither
+    // covered nor in a row of wrapped text.
+    private func spanAbove(_ r: Int, _ column: Int) -> Int? {
+        var s = r - 1
+        while s >= 0 {
+            let cell = tableData[s][column]
+            if (cell.properties & Cell.COVERED) != 0 || isContinuation(s) {
+                s -= 1
+                continue
+            }
+            return (cell.rowsSpanned > r - s) ? s : nil
+        }
+        return nil
+    }
+
+    // Draws the footer rows at y and returns the y under them. In a PDF/UA
+    // document they are rows of the table where it ends, and artifacts on the
+    // pages before.
+    private func drawFooterRows(_ page: Page?, _ x: Float, _ y: Float, _ heights: [Float], _ last: Bool) -> Float {
+        let footer = footerStart()
+        var height: Float = 0.0
+        for r in footer..<tableData.count {
+            height += heights[r]
+        }
+        if runsOff(page, "footer", y, height) {
+            return y
+        }
+        let artifact = (page != nil && !last && footer < tableData.count)
+        if artifact {
+            page!.addArtifactBMC()
+        }
+        var y = y
+        for r in footer..<tableData.count {
+            if let page = page {
+                if r == footer {
+                    for cell in tableData[r] {
+                        cell.setBorder(Border.TOP, true)
+                    }
+                }
+                drawRow(page, tableData[r], x, y, heights, r, heights.count, last ? StructElem.TD : nil)
+            }
+            y += heights[r]
+        }
+        if artifact {
+            page!.addEMC()
+        }
+        return y
+    }
+
+    // Tells if the header or footer rows of the height, drawn at y, run off the
+    // page, which fails the document as a row of the body that does: what did
+    // not fit was lost with no error, a page total among it (the review of 30
+    // October 2026). Rows that only reach into the bottom margin are drawn, as
+    // those of the body are.
+    private func runsOff(_ page: Page?, _ rows: String, _ y: Float, _ height: Float) -> Bool {
+        guard let page = page, height > 0.0, y + height > page.height else {
+            return false
+        }
+        page.pdf.fail("The \(rows) rows of the table are \(String(format: "%.0f", height)) points tall, "
+                + "and run off the page, which has "
+                + "\(String(format: "%.0f", max(page.height - bottomMargin - y, 0.0))) points for them. "
+                + "Make them smaller, or give the table more of the page.")
+        rendered = -1   // Nothing more is drawn, and no more pages are asked for
+        return true
+    }
+
+    // Works out what each cell that spans rows covers, after the text is
+    // wrapped: a row of the table is drawn as one row for each line its
+    // tallest cell needs, so a cell that spans two rows of the table spans as
+    // many rows of the drawing as those two were wrapped into. The cells the
+    // span covers are marked, and draw nothing.
+    // The height of the whole table, its rows wrapped as drawOn wraps them,
+    // without drawing it: for Markdown, which keeps a table that fits on a
+    // page whole. The table is left as it was.
+    func getTotalHeight() -> Float {
+        let data = tableData
+        let header = numOfHeaderRows
+        let footer = numOfFooterRows
+        let done = rendered
+        defer {
+            tableData = data
+            numOfHeaderRows = header
+            numOfFooterRows = footer
+            rendered = done
+        }
+        wrapAroundCellText()
+        applyRowSpans()
+        var total: Float = 0.0
+        wrappedHeaderHeight = 0.0
+        for (r, height) in getRowHeights().enumerated() {
+            total += height
+            if r < numOfHeaderRows {
+                wrappedHeaderHeight += height
+            }
+        }
+        return total
+    }
+
+    private func applyRowSpans() {
+        for row in tableData {
+            for cell in row {
+                cell.properties &= ~Cell.COVERED
+                cell.rowsSpanned = 1
+            }
+        }
+        for r in 0..<tableData.count {
+            if isContinuation(r) {
+                continue    // A span starts in a row of the table, not in the wrap of one.
+            }
+            let row = tableData[r]
+            var i = 0
+            while i < row.count {
+                let cell = row[i]
+                let colspan = Table.colSpanIn(row, i)
+                if cell.getRowSpan() > 1 && (cell.properties & Cell.COVERED) == 0 {
+                    let end = rowAfter(r, cell.getRowSpan())
+                    let ownEnd = rowAfter(r, 1)
+                    cell.rowsSpanned = end - r
+                    // The rows the wrapped text of this cell takes keep their
+                    // text and lose the border that would cross the cell.
+                    for r2 in (r + 1)..<max(r + 1, ownEnd) {
+                        setSpanned(r2, i, colspan, false)
+                    }
+                    for r2 in ownEnd..<max(ownEnd, end) {
+                        setSpanned(r2, i, colspan, true)
+                    }
+                }
+                i += colspan
+            }
+        }
+    }
+
+    // Marks the columns of the row that a span covers: a covered cell draws
+    // nothing, and a row of the wrapped text of the spanning cell keeps its
+    // text without the border under it.
+    private func setSpanned(_ r: Int, _ column: Int, _ colspan: Int, _ covered: Bool) {
+        let row = tableData[r]
+        var i = 0
+        while i < row.count {
+            let cell = row[i]
+            if i >= column && i < column + colspan {
+                if covered {
+                    cell.properties |= Cell.COVERED
+                } else {
+                    cell.setBorder(Border.BOTTOM, false)
+                }
+            }
+            i += Table.colSpanIn(row, i)
+        }
+    }
+
+    // The index of the row after the count rows of the table that start at r,
+    // counting the rows the wrapped text of each of them takes.
+    private func rowAfter(_ r: Int, _ count: Int) -> Int {
+        var index = r
+        var i = 0
+        while i < count && index < tableData.count {
+            index += 1
+            while index < tableData.count && isContinuation(index) {
+                index += 1
+            }
+            i += 1
+        }
+        return index
+    }
+
+    // True when the row holds the wrapped text of the row above it.
+    // Makes the lines of the text of a cell that wraps one paragraph, as a
+    // screen reader reads it: the P the first of them on a page begins gets
+    // the marked content of the lines after it on that page, which were each a
+    // P of their own (the review of PDFjet Forms, 5 October 2026). A line on
+    // the next page begins a P of its own there, as an element is of one page.
+    // Returns whether the page's marked content goes to such a P, false for a
+    // cell whose text does not wrap, which is a P of its own as before.
+    private func cellParagraph(_ page: Page, _ r: Int, _ i: Int, _ continued: Bool) -> Bool {
+        let columns = tableData[r].count
+        if cellParagraphs.count != columns {
+            cellParagraphs = [StructElement?](repeating: nil, count: columns)
+            cellParagraphPages = [Page?](repeating: nil, count: columns)
+        }
+        var element = cellParagraphs[i]
+        if !continued || element == nil || cellParagraphPages[i] !== page {
+            element = nil
+            let next = r + 1
+            if next < tableData.count && isContinuation(next) &&
+                    i < tableData[next].count && tableData[next][i].text != nil {
+                element = page.addStructElement(page.structParent, StructElem.P, nil)
+            }
+            cellParagraphs[i] = element
+            cellParagraphPages[i] = page
+        }
+        guard let element else {
+            return false
+        }
+        page.mcidParent = element
+        return true
+    }
+
+    private func isContinuation(_ r: Int) -> Bool {
+        let row = tableData[r]
+        return !row.isEmpty && (row[0].properties & Cell.CONTINUED) != 0
+    }
+
+    // True when the row, or the row whose wrapped text it holds, is kept with
+    // the next row.
+    private func isKeptWithNext(_ r: Int) -> Bool {
+        let row = tableData[r]
+        return !row.isEmpty && (row[0].properties & Cell.KEPT_WITH_NEXT) != 0
+    }
+
+    // The height of each row of the table as it is drawn. A cell that spans
+    // rows is not what makes its first row tall; the rows it covers hold it
+    // together, and the last of them grows when they do not.
+    private func getRowHeights() -> [Float] {
+        var heights = [Float](repeating: 0.0, count: tableData.count)
+        for r in 0..<tableData.count {
+            heights[r] = getMaxCellHeight(tableData[r])
+        }
+        for r in 0..<tableData.count {
+            let row = tableData[r]
+            for i in 0..<row.count {
+                let cell = row[i]
+                if cell.rowsSpanned < 2 {
+                    continue
+                }
+                let end = min(r + cell.rowsSpanned, tableData.count)
+                var have: Float = 0.0
+                for r2 in r..<end {
+                    have += heights[r2]
+                }
+                let needed = cell.getHeight(getTotalWidth(row, i))
+                if needed > have && end > r {
+                    heights[end - 1] += needed - have
+                }
+            }
+        }
+        return heights
+    }
+
+    // The row after the rows that a page break keeps on one page: with
+    // keepSpans those that a span holds together, with keepLines the lines the
+    // last of them wraps into, and with keepRows the rows that the last of
+    // them is kept with.
+    private func rowGroupEnd(_ index: Int, _ keepSpans: Bool, _ keepLines: Bool, _ keepRows: Bool) -> Int {
+        var end = index + 1
+        var r = index
+        while r < end && r < tableData.count {
+            for cell in tableData[r] where keepSpans && r + cell.rowsSpanned > end {
+                end = r + cell.rowsSpanned
+            }
+            if r + 1 == end && end < tableData.count {
+                if keepLines && isContinuation(end) {
+                    end += 1
+                } else if keepRows && isKeptWithNext(r) {
+                    end += 1
+                }
+            }
+            r += 1
+        }
+        return min(end, tableData.count)
+    }
+
+    private func getMaxCellHeight(_ row: [Cell]) -> Float {
+        var maxCellHeight: Float = 0.0
+        var spanned: Float = 0.0
+        for i in 0..<row.count {
+            let cell = row[i]
+            if (cell.properties & Cell.COVERED) != 0 {
+                continue    // A cell the one above it draws over.
+            }
+            let cellHeight = cell.getHeight(getTotalWidth(row, i))
+            if cell.rowsSpanned > 1 {
+                // A cell that spans rows is as tall as all of them together,
+                // which getRowHeights shares out; it is the height of the row
+                // only when nothing else is in it.
+                spanned = max(spanned, cellHeight / Float(cell.rowsSpanned))
+                continue
+            }
+            if cellHeight > maxCellHeight {
+                maxCellHeight = cellHeight
+            }
+        }
+        return (maxCellHeight > 0.0) ? maxCellHeight : spanned
+    }
+
+    ///
+    /// Returns true if the table contains more data that needs to be drawn on a page.
+    ///
+    private func hasMoreData() -> Bool {
+        return self.rendered != -1
+    }
+
+    ///
+    /// Returns the width of this table when drawn on a page.
+    ///
+    /// - Returns: the width of this table.
+    ///
+    public func getWidth() -> Float {
+        var tableWidth: Float = 0.0
+        if tableData.count > 0 {
+            let row = tableData[0]
+            for cell in row {
+                tableWidth += cell.getWidth()
+            }
+        }
+        return tableWidth
+    }
+
+    ///
+    /// Returns the number of rows below the header rows that are drawn so far,
+    /// counting each line of wrapped cell text as a row, or -1 when all rows
+    /// are drawn.
+    ///
+    /// - Returns: the number of rendered rows.
+    ///
+    public func getRowsRendered() -> Int {
+        return rendered == -1 ? rendered : rendered - numOfHeaderRows
+    }
+
+    ///
+    /// Sets whether the borders of the cells are joined into continuous lines,
+    /// which they are by default: the borders that touch, on the same row or
+    /// column and of the same color and width, are one line across or down the
+    /// table, and the PDF is smaller. With false each cell strokes its own
+    /// borders, one short line for each side. The page looks the same either
+    /// way, and each cell keeps its own borders, sides, color and width.
+    ///
+    /// - Parameter joined: true to join the borders, false to draw each cell's own.
+    /// - Returns: this table.
+    ///
+    @discardableResult
+    public func setJoinedBorders(_ joined: Bool) -> Table {
+        self.separateBorders = !joined
+        return self
+    }
+
+    ///
+    /// Sets all table cells borders to `false` or `true`.
+    ///
+    @discardableResult
+    public func setCellBorders(_ borders: Bool) -> Table {
+        for row in tableData {
+            for cell in row {
+                cell.setBorders(borders)
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the color of the cell border lines.
+    /// Color.transparent leaves it unchanged.
+    ///
+    /// - Parameter color: the color of the cell border lines.
+    ///
+    @discardableResult
+    public func setCellBorderColor(_ color: Int32) -> Table {
+        if color == Color.transparent {
+            return self
+        }
+        for row in tableData {
+            for cell in row {
+                cell.setBorderColor(color)
+            }
+        }
+        return self
+    }
+
+    /// Sets the color of the cell border lines from an array of red, green and blue values between 0.0 and 1.0.
+    @discardableResult
+    public func setCellBorderColor(_ rgbColor: [Float]) -> Table {
+        for row in tableData {
+            for cell in row {
+                cell.setBorderColor(rgbColor)
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the width of the cell border lines.
+    ///
+    /// - Parameter width: the width of the border lines.
+    ///
+    @discardableResult
+    public func setCellBorderWidth(_ width: Float) -> Table {
+        for row in tableData {
+            for cell in row {
+                cell.setBorderWidth(width)
+            }
+        }
+        return self
+    }
+
+    ///
+    /// Sets the padding of every cell of the table, as setCellBorders sets their
+    /// borders: side at the left and the right of the text, vertical over and
+    /// under it, in points. A table whose cells have borders reads better with
+    /// more than the 2 points of a new cell on every side, such as 4 at the sides
+    /// and 3 over and under. A cell set afterwards keeps its own padding, and the
+    /// rows a wrapped cell adds under it have the side padding of the cell, none
+    /// over them and a new cell's under them.
+    ///
+    /// - Parameter side: the padding at the left and the right of each cell.
+    /// - Parameter vertical: the padding over and under the text of each cell.
+    ///
+    @discardableResult
+    public func setCellPadding(_ side: Float, _ vertical: Float) -> Table {
+        for row in tableData {
+            for cell in row {
+                cell.setLeftPadding(side)
+                cell.setRightPadding(side)
+                cell.setTopPadding(vertical)
+                cell.setBottomPadding(vertical)
+            }
+        }
+        return self
+    }
+
+    // Sets the right border on all cells in the last column.
+    private func setRightBorderOnLastColumn() {
+        for row in tableData {
+            if !row.isEmpty && row[0].getBorder(Border.LEFT) == false {
+                return
+            }
+        }
+        // Only run this code if all the cells in the first column have left border.
+        for row in tableData {
+            var cell: Cell?
+            var i = 0
+            while i < row.count {
+                cell = row[i]
+                i += Table.colSpanIn(row, i)
+            }
+            cell?.setBorder(Border.RIGHT, true)
+        }
+    }
+
+    // True when the table ends with a line under its last row: when all the
+    // cells in its first row have top border.
+    private func endsWithLine() -> Bool {
+        if tableData.isEmpty {
+            return false
+        }
+        for cell in tableData[0] {
+            if cell.getBorder(Border.TOP) == false {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Sets the bottom border on all cells in the last row.
+    private func setBottomBorderOnLastRow() {
+        // Only run this code if all the cells in the first row have top border.
+        if !endsWithLine() {
+            return
+        }
+        let lastRow = tableData[tableData.count - 1]
+        for cell in lastRow {
+            cell.setBorder(Border.BOTTOM, true)
+        }
+    }
+
+    ///
+    /// Auto adjusts the widths of all columns so that they are just wide enough to
+    /// hold the text without truncation.
+    ///
+    @discardableResult
+    public func autoAdjustColumnWidths() -> Table {
+        if tableData.isEmpty {
+            return self
+        }
+        // As many widths as the longest row has cells, as a row may be longer
+        // than the first (review of 11 October 2026, #17)
+        let columns = tableData.map { $0.count }.max() ?? 0
+        var maxColWidths = [Float](repeating: 0.0, count: columns)
+        for row in tableData {
+            for i in 0..<row.count {
+                let cell = row[i]
+                if cell.getColSpan() == 1 {
+                    if let textBlock = cell.getTextBlock() {
+                        let tokens = textBlock.textContent.splitOnWhitespace()
+                        for token in tokens {
+                            var tokenWidth = textBlock.font.stringWidth(textBlock.fallbackFont, token)
+                            tokenWidth += cell.getLeftPadding() + cell.getRightPadding()
+                            if tokenWidth > maxColWidths[i] {
+                                maxColWidths[i] = tokenWidth
+                            }
+                        }
+                    } else if let drawable = cell.drawable {
+                        let drawableWidth = Cell.measure(drawable)[0] + cell.getLeftPadding() + cell.getRightPadding()
+                        if drawableWidth > maxColWidths[i] {
+                            maxColWidths[i] = drawableWidth
+                        }
+                    } else if cell.text != nil {
+                        var textWidth: Float = 0.0
+                        if (cell.properties & Cell.LINE_BREAKS) != 0 {
+                            // As wide as its widest line
+                            for line in Table.lines(cell.text!) {
+                                textWidth = max(textWidth,
+                                        cell.font.stringWidth(cell.fallbackFont, cell.fontSize, line))
+                            }
+                        } else {
+                            textWidth = cell.font.stringWidth(cell.fallbackFont, cell.fontSize, cell.text)
+                        }
+                        textWidth += cell.getLeftPadding() + cell.getRightPadding()
+                        if textWidth > maxColWidths[i] {
+                            maxColWidths[i] = textWidth
+                        }
+                    }
+                }
+            }
+        }
+        for row in tableData {
+            for i in 0..<row.count {
+                row[i].setWidth(maxColWidths[i])
+            }
+        }
+        return self
+    }
+
+    // The number of columns the cell of the row at the index spans: at least
+    // its own, and no more than the row has from it.
+    static func colSpanIn(_ row: [Cell], _ index: Int) -> Int {
+        return max(1, min(row[index].getColSpan(), row.count - index))
+    }
+
+    func getTotalWidth(_ row: [Cell], _ index: Int) -> Float {
+        let cell = row[index]
+        let colspan = Table.colSpanIn(row, index)
+        var cellWidth = Float(0.0)
+        for i in 0..<colspan {
+            cellWidth += row[index + i].getWidth()
+        }
+        cellWidth -= (cell.getLeftPadding() + row[index + (colspan - 1)].getRightPadding())
+        return cellWidth
+    }
+
+    ///
+    /// Wraps around the text in all cells so it fits the column width.
+    /// This method should be called after all calls to setColumnWidth and autoAdjustColumnWidths.
+    ///
+    func wrapAroundCellText() {
+        var tableData2 = [[Cell]]()
+        var lines = [[String]?]()
+        var numOfHeaderRows2 = 0
+        // The footer rows are the rows of the wrap of the rows they were.
+        let footer = (numOfFooterRows > 0) ? footerStart() : tableData.count
+        var footer2 = 0
+        for (r, row) in tableData.enumerated() {
+            let first = tableData2.count
+            if r == footer {
+                footer2 = first
+            }
+            // A copy of the row, as its cells are given the lines of their text:
+            // the caller's cells kept their first line, and a table made again of
+            // them lost the rest (review of 11 October 2026, #12)
+            let row = row.map { $0.copy() }
+            tableData2.append(row)
+            // Every cell of the row is wrapped once, here. The lines it needs
+            // are what the cells stacked below it get, and the most lines any
+            // cell of the row needs is how many rows to stack. The rows added
+            // below a header row are header rows too.
+            lines.removeAll(keepingCapacity: true)
+            var maxNumVerCells = 1
+            for i in 0..<row.count {
+                // A cell that draws a line of text of its own draws no cell
+                // text, so there is nothing to wrap. A cell that shows a sum
+                // is not wrapped either, as its text is the sum of each page.
+                let cellLines = (row[i].text == nil || row[i].drawable is BaselineDrawable
+                        || (row[i].properties & Cell.SUM_BITS) != 0)
+                        ? nil : wrapCellText(row, i)
+                lines.append(cellLines)
+                if let cellLines = cellLines, cellLines.count > maxNumVerCells {
+                    maxNumVerCells = cellLines.count
+                }
+            }
+            // A cell whose text wraps is one cell drawn as the rows its lines
+            // take, so the border under it belongs under the last of them and
+            // not under every line of it. A cell that spans rows is drawn over
+            // all of them at once and so draws its own bottom border under the
+            // whole of it; applyRowSpans clears the rows of its wrap.
+            var bottomBorder = [Bool](repeating: false, count: row.count)
+            for (i, cell) in row.enumerated() {
+                bottomBorder[i] = maxNumVerCells > 1 && cell.getRowSpan() == 1
+                        && cell.getBorder(Border.BOTTOM)
+                if bottomBorder[i] {
+                    cell.setBorder(Border.BOTTOM, false)
+                }
+            }
+            // The lines of a wrapped cell are as far apart as the rows of the wrap
+            // are, Cell's bottom padding, and the bottom padding of the cell is
+            // under its last line, so that a table of more padding, as
+            // setCellPadding gives, has its lines evenly apart (the review of
+            // 9 October 2026: the padding was between the first two lines).
+            var bottomPadding = [Float](repeating: 0.0, count: row.count)
+            if maxNumVerCells > 1 {
+                for (j, cell) in row.enumerated() {
+                    bottomPadding[j] = cell.getBottomPadding()
+                    cell.setBottomPadding(2.0)  // Cell's, which the rows of the wrap have
+                }
+            }
+            var k = 1
+            while k < maxNumVerCells {
+                var row2 = [Cell]()
+                for (j, cell) in row.enumerated() {
+                    let cell2 = Cell(cell.getFont())
+                    cell2.setFallbackFont(cell.getFallbackFont())
+                    cell2.setFontSize(cell.fontSize)
+                    cell2.setWidth(cell.getWidth())
+                    cell2.setLeftPadding(cell.getLeftPadding())
+                    cell2.setRightPadding(cell.getRightPadding())
+                    cell2.backgroundColor = cell.backgroundColor
+                    cell2.setBorderWidth(cell.getBorderWidth())
+                    cell2.borderColor = cell.borderColor
+                    cell2.textColor = cell.textColor
+                    cell2.setColSpan(cell.getColSpan())
+                    cell2.setTextAlignment(cell.getTextAlignment())
+                    cell2.properties = cell.properties
+                    cell2.setVerticalAlignment(cell.getVerticalAlignment())
+                    cell2.setTopPadding(0.0)
+                    if k == maxNumVerCells - 1 {
+                        cell2.setBottomPadding(bottomPadding[j])
+                    }
+                    cell2.setBorder(Border.TOP, false)
+                    cell2.setBorder(Border.BOTTOM, bottomBorder[j] && k == maxNumVerCells - 1)
+                    cell2.properties |= Cell.CONTINUED
+                    cell2.properties &= ~Cell.SUM_BITS
+                    row2.append(cell2)
+                }
+                tableData2.append(row2)
+                k += 1
+            }
+            for j in 0..<row.count {
+                if let cellLines = lines[j] {
+                    var wholeText = row[j].wholeText
+                    if wholeText == nil && cellLines.count > 1 {
+                        wholeText = row[j].text
+                    }
+                    for (n, line) in cellLines.enumerated() {
+                        tableData2[first + n][j].setText(line)
+                    }
+                    row[j].wholeText = wholeText
+                }
+            }
+            // The stacked rows are wrapped in their turn, as they were when
+            // the rows were all added first and the table wrapped in one pass
+            // afterwards: a line that ends in a space loses it here.
+            for i in (first + 1)..<tableData2.count {
+                let row2 = tableData2[i]
+                for j in 0..<row2.count where row2[j].text != nil {
+                    for (n, line) in wrapCellText(row2, j).enumerated() {
+                        tableData2[i + n][j].setText(line)
+                    }
+                }
+            }
+            if r < numOfHeaderRows {
+                numOfHeaderRows2 = tableData2.count
+            }
+        }
+        if rendered != -1 {
+            rendered += numOfHeaderRows2 - numOfHeaderRows
+        }
+        numOfHeaderRows = numOfHeaderRows2
+        if footer < tableData.count {
+            numOfFooterRows = tableData2.count - footer2
+        }
+        tableData = tableData2
+    }
+
+    // Text fits the width of a column when it is no more than this much wider:
+    // autoAdjustColumnWidths makes a column as wide as its text and its
+    // padding, and that width less the padding can come out a little less
+    // than the width of the text in floating point.
+    private static let FIT_TOLERANCE: Float = 0.01
+
+    // The lines the text of the cell needs to fit the width of its column.
+    // A token wider than the column is broken between two of its characters.
+    func wrapCellText(_ row: [Cell], _ index: Int) -> [String] {
+        let cell = row[index]
+        let cellWidth = getTotalWidth(row, index) + Table.FIT_TOLERANCE
+        if (cell.properties & Cell.LINE_BREAKS) != 0 && cell.text!.unicodeScalars.contains("\n") {
+            // Each line of the text wrapped on its own
+            var lines = [String]()
+            for line in Table.lines(cell.text!) {
+                lines.append(contentsOf: Table.wrapText(cell, line, cellWidth))
+            }
+            return lines
+        }
+        return Table.wrapText(cell, cell.text!, cellWidth)
+    }
+
+    // The lines of the text, split at each \n as in Java's text.split("\n", -1),
+    // at the scalar, since a \r\n is one Character.
+    private static func lines(_ text: String) -> [String] {
+        return text.unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { String(String.UnicodeScalarView($0)) }
+    }
+
+    // Whether the text is wider than the width. A start of the text wider than
+    // the width, found by doubling, is looked at first, so that a token broken
+    // into thousands of lines is not measured whole for each: the time grew
+    // with the square of its length.
+    private static func widerThan(_ text: String, _ width: Float, _ measure: (String) -> Float) -> Bool {
+        let scalars = text.unicodeScalars
+        var n = 64
+        while let cut = scalars.index(scalars.startIndex, offsetBy: n, limitedBy: scalars.endIndex),
+                cut < scalars.endIndex {
+            if measure(String(scalars[..<cut])) > width {
+                return true
+            }
+            n *= 2
+        }
+        return measure(text) > width
+    }
+
+    // The lines of the text of the cell, wrapped at the width.
+    private static func wrapText(_ cell: Cell, _ text: String, _ cellWidth: Float) -> [String] {
+        var lines = [String]()
+        var buf = String()
+        func width(_ text: String) -> Float {
+            return cell.font.stringWidth(cell.fallbackFont, cell.fontSize, text)
+        }
+        for token in text.splitOnWhitespace() {
+            var token = token
+            while true {
+                let joined = buf.isEmpty ? token : buf + " " + token
+                if !Table.widerThan(joined, cellWidth, width) {
+                    buf = joined
+                    break
+                }
+                // The token is broken at a soft hyphen, the line ending with a
+                // hyphen, as far along as fits (review of 11 October 2026, #21)
+                let line = buf.isEmpty ? buf : buf + " "
+                if let (head, rest) = TextBlock.softHyphenBreak(token, cellWidth, { width(line + $0) }) {
+                    lines.append(line + head)
+                    buf = ""
+                    token = rest
+                    continue
+                }
+                if !buf.isEmpty {
+                    lines.append(buf.trim())
+                    buf = ""
+                    continue
+                }
+                // A token wider than the column starts a line of its own:
+                // after the words before it, or the end of another such token,
+                // it was "listic e" (5 October 2026). It is broken between its
+                // characters, and a line has at least one character, even one
+                // wider than the column. The rest is broken again, at a soft
+                // hyphen if one fits: "1234<SHY>5678" was 123 / 4<SHY>56 / 78,
+                // where TextBlock and TextFrame draw 123 / 4- / 567 / 8
+                // (review of 12 October 2026, T4).
+                // A token with no soft hyphen is broken in place, to its end:
+                // the rest of it, an array of its characters made for each
+                // line, made the time grow with the square of its length.
+                let inPlace = !token.unicodeScalars.contains("\u{00AD}")
+                let scalars = token.unicodeScalars
+                var from = scalars.startIndex
+                while true {
+                    var end = from
+                    while end < scalars.endIndex {
+                        let next = scalars.index(after: end)
+                        if end > from && width(String(scalars[from..<next])) > cellWidth {
+                            break
+                        }
+                        end = next
+                    }
+                    if end == scalars.endIndex {
+                        // The rest, which fits, or a character wider than the column
+                        buf = String(scalars[from...])
+                        from = end
+                        break
+                    }
+                    lines.append(String(scalars[from..<end]).trim())
+                    from = end
+                    if !inPlace {
+                        break
+                    }
+                }
+                if from == scalars.endIndex {
+                    break
+                }
+                token = String(scalars[from...])
+            }
+        }
+        lines.append(buf.trim())
+        return lines
+    }
+
+    ///
+    /// Use this method to find out how many vertically stacked cell are needed after call to wrapAroundCellText.
+    ///
+    /// - Returns: the number of vertical cells needed to wrap around the cell text.
+    ///
+    func getNumVerCells(_ row: [Cell], _ index: Int) -> Int {
+        if row[index].text == nil {
+            return 1
+        }
+        return wrapCellText(row, index).count
+    }
+
+    // The delimiter of the line: the commonest of a comma, a pipe and a tab.
+    // The ones inside a quoted field are not counted, or a file whose values
+    // hold commas could be split on the wrong character altogether.
+    private func getDelimiter(_ str: String) -> String {
+        var comma = 0
+        var pipe = 0
+        var tab = 0
+        var quoted = false
+        for scalar in str.unicodeScalars {
+            if scalar == "\"" {
+                quoted = !quoted
+            } else if quoted {
+                continue
+            } else if scalar == "," {
+                comma += 1
+            } else if scalar == "|" {
+                pipe += 1
+            } else if scalar == "\t" {
+                tab += 1
+            }
+        }
+        if comma >= pipe {
+            if comma >= tab {
+                return ","
+            }
+            return "\t"
+        } else {
+            if pipe >= tab {
+                return "|"
+            }
+            return "\t"
+        }
+    }
+
+    /// Keeps only the columns with the specified indexes.
+    @discardableResult
+    public func setVisibleColumns(_ visible: Int...) -> Table {
+        if tableData.isEmpty {
+            return self
+        }
+        if visible.isEmpty {
+            refuse(Table.noVisibleColumn)
+            return self
+        }
+        let columns = tableData.map { $0.count }.max() ?? 0
+        for index in visible where index < 0 || index >= columns {
+            return noIndex(index)
+        }
+        var list = [[Cell]]()
+        for row in tableData {
+            var row2 = [Cell]()
+            var i = 0
+            while i < row.count {
+                if visible.contains(i) {
+                    row2.append(row[i])
+                }
+                i += 1
+            }
+            list.append(row2)
+        }
+        tableData = list
+        return self
+    }
+
+    // The message of setVisibleColumns with no column, which left rows of no
+    // cells, the same in the four ports.
+    private static let noVisibleColumn = "The table has no visible column: name at least one."
+
+    /// Sets the top margin on the first page when the table spans several pages.
+    @discardableResult
+    public func setFirstPageTopMargin(_ firstPageTopMargin: Float) -> Table {
+        self.firstPageTopMargin = firstPageTopMargin
+        return self
+    }
+}   // End of Table.swift

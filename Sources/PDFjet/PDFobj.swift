@@ -1,0 +1,1615 @@
+/**
+ * PDFobj.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// An object of a PDF that was read with PDF.read, which holds the tokens of
+/// its dictionary and its stream. See Example_34, Example_48 and Example_50.
+///
+public final class PDFobj {
+    var number = 0                  // The object number
+    var offset = 0                  // The object offset
+    var end = 0                     // Where the object ends at the latest
+    var read = 0                    // The offset up to which its tokens were read
+    ///
+    /// The tokens of the object dictionary. Edit them in place to change an
+    /// object that was read, for example the /MediaBox or /Rotate of a page:
+    /// getDict returns a copy, since Swift arrays are values.
+    ///
+    final var dict = [String]()
+    var streamOffset = 0
+    var stream: [UInt8]?            // The compressed stream
+    final var data = [UInt8]()      // The decompressed data
+    final var undecoded = false     // The stream is decoded when the data is first asked for
+    final var undecodable = false   // A stream that cannot be decoded has no data, as in the other ports
+    final var budget: DecodeBudget? // What the streams of the PDF this was read from may still decode to
+    var gsNumber = -1
+    var root = false                // The catalog that the trailer's /Root names
+    // The objects of a font added to the objects, of which this is the Type0
+    // font, filled in when they are added to a PDF
+    var fontObjects: FontObjects?
+    // The /Resources a page inherits from the page tree, when it is a large
+    // dictionary in a node: shared by the pages under the node, not copied
+    // into each (see PDF.addInheritedEntries). An array is a value that is
+    // copied when it is changed, so the pages hold the node's one array.
+    var inheritedResources: [String]?
+    var inheritedFrom = 0       // The number of that node
+    // The objects of the PDF it was read from, by number, for the masks of an
+    // image copied into another PDF; nil for an object not read
+    var readObjects: ReadObjects?
+    // The number in the PDF being written of an object that a page that was
+    // read uses, like a stamp: this object stands for it among the objects,
+    // and only merge reads the number
+    var writtenNumber = 0
+    // The soft mask and the stencil mask of an image that was read, held by
+    // the image, as the other objects are held weakly: copied after the list
+    // read() returned was let go, it lost them (the review of 28 October 2026)
+    var masks = [Int: PDFobj]()
+
+    /// Creates an empty PDF object.
+    init() {
+
+    }
+
+    /// Returns the object number.
+    ///
+    /// - Returns: the object number.
+    public final func getNumber() -> Int {
+        return self.number
+    }
+
+    ///
+    /// Returns the object dictionary.
+    ///
+    /// - Returns: the object dictionary.
+    ///
+    public final func getDict() -> [String] {
+        return self.dict
+    }
+
+    ///
+    /// Returns the uncompressed stream data. A stream that is not a
+    /// cross-reference or an object stream is decoded the first time its data
+    /// is asked for, and the data is kept in the object: the first call
+    /// changes the object, so two threads do not call it at once on the same
+    /// object. The streams of one PDF that `read` returns share a budget of
+    /// 256 MiB of decoded data, `maxDecodedTotal`: a stream past what is left
+    /// of it, or one that cannot be decoded, has no data.
+    ///
+    /// - Returns: the uncompressed stream data, empty when there is none.
+    ///
+    public final func getData() -> [UInt8] {
+        if undecoded {
+            // A stream that is not a cross-reference or an object stream is
+            // decoded when its data is first asked for, not when the PDF is
+            // read, so that reading a PDF of large images takes the memory
+            // of none of them.
+            undecoded = false
+            data = (try? decodeStream(stream!)) ?? []
+        }
+        return self.data
+    }
+
+    /// What all the streams of one PDF may decode to together, 256 MiB: a PDF
+    /// of a few megabytes can hold hundreds of streams that each decode to
+    /// hundreds of megabytes, and each one alone is within the limit of a
+    /// stream. A test asks for a lower one through read(from:password:decodedTotal:)
+    /// of PDF, rather than change this one that the tests running at the same
+    /// time read with.
+    static let maxDecodedTotal = MAX_DECODED_LENGTH
+
+    /// How many times the length of a PDF the reader may read in all to find
+    /// the objects that its cross-reference sections list and the endstream of
+    /// the streams whose /Length is wrong. Each of those reads ends where its
+    /// object does, but a PDF can list one object many times, and the last
+    /// object of a section ends at the end of the PDF.
+    static let readPerByte = 8
+
+    // The bytes of a PDF for each object of its object streams that takes
+    // nothing of the budget, as many as a PDF of its length can hold of its own;
+    // those past them take PDF.objectCost of it. Each one took it, and a real PDF of 5 MB
+    // of 1.1 million objects was refused (review of 12 October 2026, R32).
+    static let bytesPerFreeObject = 8
+
+    /// What the streams of one PDF may still decode to, shared by its objects.
+    /// It also holds what the reader may still read of the PDF, readPerByte
+    /// times its length, so that no PDF is read in more than linear time:
+    /// thousands of streams with a wrong /Length and no endstream each searched
+    /// to the end of the PDF.
+    final class DecodeBudget {
+        let total: Int
+        var left: Int
+        var readLeft: Int
+        var freeObjects: Int
+
+        init(_ size: Int, _ total: Int = PDFobj.maxDecodedTotal) {
+            self.total = total
+            left = total
+            readLeft = PDFobj.readPerByte * size
+            freeObjects = size / PDFobj.bytesPerFreeObject
+        }
+    }
+
+    /// The error of a PDF whose streams decode to more than the budget together.
+    struct DecodedTotalError: Error, CustomStringConvertible {
+        let total: Int
+        var description: String { "the streams of the PDF decode to more than \(total) bytes together" }
+    }
+
+    ///
+    /// Copies the stream from the buffer, decrypts it when the PDF is encrypted,
+    /// and decodes it with the filters of its /Filter entry. The decrypted
+    /// stream replaces the encrypted one, so that it can be copied.
+    ///
+    final func setStreamAndData(
+            _ buffer: inout [UInt8], _ length: Int, _ decryptor: Decryptor?,
+            _ budget: DecodeBudget) throws {
+        if stream == nil {
+            self.budget = budget
+            var length = length
+            let actual = PDFobj.streamLength(buffer, streamOffset, length, end, budget)
+            if actual != length {
+                length = actual
+                setLength(length)
+            }
+            // A /Length the PDF does not have is checked before the stream is
+            // made, so that a file of a few bytes that says its stream is a
+            // gigabyte takes no memory.
+            if length < 0 || streamOffset < 0 || length > buffer.count - streamOffset {
+                throw PDFjetError(message: "The stream of an object is not in the PDF.")
+            }
+            var copied = Array(buffer[streamOffset..<streamOffset + length])
+            if let decryptor = decryptor {
+                copied = decryptor.decryptStream(self, copied)
+                setLength(copied.count)
+            }
+            stream = copied
+            let type = getValue("/Type")
+            if type == "/XRef" || type == "/ObjStm" {
+                data = try decodeStream(copied)     // The objects in it are read now
+            } else {
+                undecoded = true
+            }
+        }
+    }
+
+    // Returns the decoded stream. A cross-reference stream or an object stream
+    // that cannot be decoded throws, as the objects in it cannot be read. Any
+    // other stream that cannot be decoded, like an image or the content of a
+    // page that is cut short, has no data: the rest of the PDF is read, and a
+    // merge copies the stream as it is.
+    private final func decodeStream(_ stream: [UInt8]) throws -> [UInt8] {
+        let type = getValue("/Type")
+        if type == "/XRef" || type == "/ObjStm" {
+            do {
+                return try decode(stream)
+            } catch {
+                if let budget = budget, budget.left < MAX_DECODED_LENGTH,
+                        String(describing: error).contains("decodes to more than") {
+                    throw DecodedTotalError(total: budget.total)
+                }
+                throw error
+            }
+        }
+        do {
+            return try decode(stream)
+        } catch {
+            undecodable = true
+            return []
+        }
+    }
+
+    // Returns the length of the stream that starts at the offset. It is the
+    // /Length when the endstream keyword follows it, as it must; when it does
+    // not -- a /Length that is missing, too short or too long -- the stream
+    // ends at the end of line before the next endstream, as MuPDF and pdf.js
+    // read it. A stream with no endstream after it keeps its /Length.
+    //
+    // The endstream is looked for before end, where the object ends at the
+    // latest, and within what is left of what the budget may read: a PDF of
+    // thousands of streams with a wrong /Length and no endstream was searched
+    // to its end for each of them. A search the budget does not finish keeps
+    // the /Length too.
+    private static func streamLength(
+            _ buf: [UInt8], _ offset: Int, _ length: Int, _ end: Int, _ budget: DecodeBudget) -> Int {
+        if offset < 0 || offset > buf.count || endstreamAfter(buf, offset, length, budget) != -1 {
+            return length
+        }
+        let keyword = Array("endstream".utf8)
+        let end = max(min(end, buf.count, offset + budget.readLeft), offset)
+        var found = endstreamOf(buf, offset, end)
+        if found == -1 {
+            found = offset
+            while found + keyword.count <= end && !startsWith(buf, found, keyword) {
+                found += 1
+            }
+        }
+        if found + keyword.count > end {
+            budget.readLeft -= end - offset
+            return length
+        }
+        budget.readLeft -= found - offset
+        if found > offset && buf[found - 1] == 0x0A {
+            found -= 1
+        }
+        if found > offset && buf[found - 1] == 0x0D {
+            found -= 1
+        }
+        return found - offset
+    }
+
+    // Returns the offset of the endstream keyword that ends the stream at the
+    // offset from, by the offset to, or -1. The streams and objects in the
+    // stream's own bytes, as an embedded PDF has, unfiltered, are skipped: an
+    // endstream ends the stream only when no stream or object opened in its
+    // bytes is still open.
+    static func endstreamOf(_ buf: [UInt8], _ from: Int, _ to: Int) -> Int {
+        let to = min(to, buf.count)
+        let stream = Array("stream".utf8)
+        let end = Array("end".utf8)
+        let endobj = Array("endobj".utf8)
+        var streams = 0
+        var objects = 0
+        var i = max(from, 0)
+        while i < to {
+            let c = buf[i]
+            if c == 0x73 && i + 6 <= to && startsWith(buf, i, stream) {   // s
+                if i - 3 >= from && startsWith(buf, i - 3, end) {
+                    if streams == 0 {
+                        return (objects == 0) ? i - 3 : -1
+                    }
+                    streams -= 1
+                } else if opensStream(buf, i) {
+                    streams += 1
+                }
+            } else if c == 0x65 && startsWith(buf, i, endobj) {             // e
+                if objects > 0 {
+                    objects -= 1
+                }
+            } else if c >= 0x30 && c <= 0x39 && PDF.isObjectStart(buf, i) {
+                objects += 1
+                while i < to && buf[i] != 0x6A {    // Past the obj
+                    i += 1
+                }
+            }
+            i += 1
+        }
+        return -1
+    }
+
+    // Returns true when the stream keyword at the offset opens a stream: after
+    // the >> of its dictionary and white space, and before an end of line, as
+    // the syntax of a stream object has it.
+    private static func opensStream(_ buf: [UInt8], _ off: Int) -> Bool {
+        let after = off + 6
+        if after >= buf.count || (buf[after] != 0x0D && buf[after] != 0x0A) {
+            return false
+        }
+        var i = off - 1
+        while i >= 0 && isWhiteSpace(buf[i]) {
+            i -= 1
+        }
+        return i >= 1 && buf[i] == 0x3E && buf[i - 1] == 0x3E
+    }
+
+    // Returns the offset after the endobj keyword that follows the endstream at
+    // the offset, after white space, or -1.
+    static func endobjAfter(_ buf: [UInt8], _ endstream: Int) -> Int {
+        var i = endstream + 9
+        while i < buf.count && isWhiteSpace(buf[i]) {
+            i += 1
+        }
+        return startsWith(buf, i, Array("endobj".utf8)) ? i + 6 : -1
+    }
+
+    // Returns the offset of the endstream keyword that follows the /Length of
+    // the stream at the offset, after white space, or -1. The white space is
+    // taken from the budget, as streams whose /Length ends in the same run of
+    // white space each read it.
+    static func endstreamAfter(_ buf: [UInt8], _ offset: Int, _ length: Int, _ budget: DecodeBudget) -> Int {
+        if offset < 0 || length < 0 || length > buf.count - offset {
+            return -1
+        }
+        var i = offset + length
+        let end = min(buf.count, i + max(budget.readLeft, 0))
+        while i < end && isWhiteSpace(buf[i]) {
+            i += 1
+        }
+        budget.readLeft -= i - (offset + length)
+        return startsWith(buf, i, Array("endstream".utf8)) ? i : -1
+    }
+
+    static func isWhiteSpace(_ c: UInt8) -> Bool {
+        return c == 0x00 || c == 0x09 || c == 0x0A || c == 0x0C || c == 0x0D || c == 0x20
+    }
+
+    private static func startsWith(_ buf: [UInt8], _ off: Int, _ str: [UInt8]) -> Bool {
+        if off < 0 || off > buf.count - str.count {
+            return false
+        }
+        for i in 0..<str.count where buf[off + i] != str[i] {
+            return false
+        }
+        return true
+    }
+
+    // Sets the /Length of the stream, replacing a reference to the length, and
+    // adds it to a stream dictionary that has none.
+    private final func setLength(_ length: Int) {
+        guard let i = dict.firstIndex(of: "/Length") else {
+            if let open = dict.firstIndex(of: "<<") {
+                dict.insert(contentsOf: ["/Length", String(length)], at: open + 1)
+            }
+            return
+        }
+        if i + 1 >= dict.count {
+            return
+        }
+        if i + 3 < dict.count && dict[i + 3] == "R" {
+            dict.removeSubrange((i + 2)...(i + 3))
+        }
+        dict[i + 1] = String(length)
+    }
+
+    // Decodes the stream with each filter of its /Filter entry in turn. A
+    // filter that is not supported, like DCTDecode, ends the decoding, and the
+    // data is what the filters before it decoded.
+    private final func decode(_ stream: [UInt8]) throws -> [UInt8] {
+        var decoded = stream
+        for (i, filter) in getFilters().enumerated() {
+            switch filter {
+            case "/Crypt":
+                break   // decryptStream reads it (review of 30 October 2026, B10)
+            case "/FlateDecode", "/Fl":
+                decoded = applyDecodeParms(self.decoded(try inflateStream(decoded, maxDecodedLength())), i)
+            case "/LZWDecode", "/LZW":
+                let earlyChange = getDecodeParm(getDecodeParms(i), "/EarlyChange", 1)
+                decoded = applyDecodeParms(self.decoded(try lzwDecode(decoded, maxDecodedLength(), earlyChange)), i)
+            case "/ASCIIHexDecode", "/AHx":
+                decoded = try decodedHex(asciiHexDecode(decoded))
+            case "/ASCII85Decode", "/A85":
+                decoded = self.decoded(try ascii85Decode(decoded, maxDecodedLength()))
+            case "/RunLengthDecode", "/RL":
+                decoded = self.decoded(try runLengthDecode(decoded, maxDecodedLength()))
+            default:
+                return decoded
+            }
+        }
+        return decoded
+    }
+
+    // Returns what a stream of the object may decode to: the limit of a
+    // stream, or what is left of the PDF's budget when that is less. A budget
+    // with nothing left decodes nothing, which the decoders report as too long.
+    private final func maxDecodedLength() -> Int {
+        if let budget = budget, budget.left < MAX_DECODED_LENGTH {
+            return budget.left
+        }
+        return MAX_DECODED_LENGTH
+    }
+
+    // Takes the decoded data from the PDF's budget and returns it.
+    private final func decoded(_ data: [UInt8]) -> [UInt8] {
+        if let budget = budget {
+            budget.left = max(0, budget.left - data.count)
+        }
+        return data
+    }
+
+    // Takes the output of ASCIIHexDecode from the PDF's budget, as the other
+    // filters' is (review of 11 October 2026, #32). ASCII85Decode stops at the
+    // budget itself, as a 'z' of it is four bytes.
+    private final func decodedHex(_ data: [UInt8]) throws -> [UInt8] {
+        if data.count > maxDecodedLength() {
+            throw PDFjetError(message: "The stream decodes to more than \(maxDecodedLength()) bytes")
+        }
+        return decoded(data)
+    }
+
+    // Returns the filters of the stream, whose /Filter can be an object of its
+    // own, a name or an array: the data was the bytes as they are.
+    final func getFilters() -> [String] {
+        guard let k = dict.firstIndex(of: "/Filter"), PDF.isReference(dict, k + 1) else {
+            return getValues("/Filter")
+        }
+        guard let filter = readObjects?.object(Int(dict[k + 1])!) else {
+            return []
+        }
+        return PDF.valueOf(filter).filter { $0 != "[" && $0 != "]" }
+    }
+
+    // Returns true for a stream with a /Crypt filter that is the Identity one,
+    // whose name is the default: the stream is not encrypted. With parameters
+    // in an object of their own that cannot be read, the name is not known,
+    // and the stream is taken to be encrypted, as most are.
+    final func hasIdentityCrypt() -> Bool {
+        for (i, filter) in getFilters().enumerated() where filter == "/Crypt" {
+            let parms = getDecodeParms(i)
+            if parms.isEmpty && decodeParmsHaveUnreadReference() {
+                return false
+            }
+            guard let j = parms.firstIndex(of: "/Name") else {
+                return true
+            }
+            return tokenAt(parms, j + 1) == "/Identity"
+        }
+        return false
+    }
+
+    // Returns true when /DecodeParms is a reference, or an array with one, to an
+    // object that cannot be read. A null for a /Crypt in an array that is read
+    // is the Identity filter, not a name not known.
+    private final func decodeParmsHaveUnreadReference() -> Bool {
+        var tokens = valueTokens("/DecodeParms")
+        if PDF.isReference(tokens, 0) {
+            let value = referencedDecodeParms(tokens[0])
+            if value.isEmpty {
+                return true
+            }
+            tokens = value
+        }
+        for j in tokens.indices where PDF.isReference(tokens, j) {
+            if referencedDecodeParms(tokens[j]).isEmpty {
+                return true
+            }
+        }
+        return false
+    }
+
+    // Returns the elements of the array that is the value of the key, or the
+    // value itself when it is not an array.
+    private final func getValues(_ key: String) -> [String] {
+        guard let k = dict.firstIndex(of: key), k + 1 < dict.count else {
+            return []
+        }
+        if dict[k + 1] != "[" {
+            return [dict[k + 1]]
+        }
+        var values = [String]()
+        var i = k + 2
+        while i < dict.count && dict[i] != "]" {
+            values.append(dict[i])
+            i += 1
+        }
+        return values
+    }
+
+    // Undoes the predictor in the parameters of the filter at the index, of
+    // an image too: the data of an image is its samples, which a copy of the
+    // image does not use, as it copies the stream.
+    private final func applyDecodeParms(_ decoded: [UInt8], _ index: Int) -> [UInt8] {
+        let parms = getDecodeParms(index)
+        return applyPredictor(
+                decoded,
+                getDecodeParm(parms, "/Predictor", 1),
+                getDecodeParm(parms, "/Colors", 1),
+                getDecodeParm(parms, "/BitsPerComponent", 8),
+                getDecodeParm(parms, "/Columns", 1))
+    }
+
+    // Returns the tokens of the parameters dictionary of the filter at the
+    // index. /DecodeParms is a dictionary for a single filter, or an array with
+    // a dictionary or null for each filter.
+    final func getDecodeParms(_ index: Int) -> [String] {
+        guard let k = dict.firstIndex(of: "/DecodeParms"), k + 1 < dict.count else {
+            return []
+        }
+        if PDF.isReference(dict, k + 1) {
+            // An object of its own, a dictionary for a single filter or an
+            // array of them: the array was taken for the dictionary of the
+            // first filter, and its second filter's predictor applied to the
+            // first's output.
+            let value = referencedDecodeParms(dict[k + 1])
+            if value.first != "[" {
+                return index == 0 ? value : []
+            }
+            return decodeParmsElement(value, 0, index)
+        }
+        return decodeParmsElement(dict, k + 1, index)
+    }
+
+    // Returns the parameters of the filter at the index of the value of
+    // /DecodeParms that starts at i of the tokens.
+    private final func decodeParmsElement(_ dict: [String], _ from: Int, _ index: Int) -> [String] {
+        var i = from
+        let array = dict[i] == "["
+        if array {
+            i += 1
+        }
+        var element = 0
+        while i < dict.count && dict[i] != "]" {
+            let start = i
+            if dict[i] == "<<" {
+                var level = 0
+                repeat {
+                    let token = dict[i]
+                    i += 1
+                    if token == "<<" {
+                        level += 1
+                    } else if token == ">>" {
+                        level -= 1
+                    }
+                } while level > 0 && i < dict.count
+            } else if i + 2 < dict.count && dict[i + 2] == "R" {
+                i += 3
+            } else {
+                i += 1      // null
+            }
+            if element == index {
+                if dict[start] == "<<" {
+                    return Array(dict[start..<i])
+                }
+                // In an object of its own
+                if PDF.isReference(dict, start) {
+                    return referencedDecodeParms(dict[start])
+                }
+                return []
+            }
+            if !array {
+                break
+            }
+            element += 1
+        }
+        return []
+    }
+
+    // Returns the tokens of the parameters dictionary that is an object of its
+    // own, or nothing when the object cannot be read.
+    private final func referencedDecodeParms(_ number: String) -> [String] {
+        guard let n = Int(number), let parms = readObjects?.object(n) else {
+            return []
+        }
+        return PDF.valueOf(parms)
+    }
+
+    // Returns the value of /DecodeParms for a copy of the object, with the
+    // parameters that are objects of their own, the value or an element of
+    // its array, written in their place. One that cannot be read is left a
+    // reference, which the copy refuses.
+    final func copiedDecodeParms() -> [String] {
+        var tokens = valueTokens("/DecodeParms")
+        if PDF.isReference(tokens, 0) {
+            let value = referencedDecodeParms(tokens[0])
+            if !value.isEmpty {
+                tokens = value
+            }
+        }
+        if tokens.first != "[" {
+            return tokens
+        }
+        var copied = [String]()
+        copied.reserveCapacity(tokens.count)
+        var i = 0
+        while i < tokens.count {
+            if PDF.isReference(tokens, i) {
+                let value = referencedDecodeParms(tokens[i])
+                if !value.isEmpty {
+                    copied.append(contentsOf: value)
+                    i += 3
+                    continue
+                }
+            }
+            copied.append(tokens[i])
+            i += 1
+        }
+        return copied
+    }
+
+    // Returns the integer value of the key in the parameters dictionary. A
+    // value that is not a 32-bit integer gets the default, as in the Java and
+    // C# ports.
+    final func getDecodeParm(_ parms: [String], _ key: String, _ defaultValue: Int) -> Int {
+        if let i = parms.firstIndex(of: key), i + 1 < parms.count, let value = Int32(parms[i + 1]) {
+            return Int(value)
+        }
+        return defaultValue
+    }
+
+    /// Sets the stream.
+    final func setStream(_ stream: inout [UInt8]) {
+        self.stream = stream
+    }
+
+    final func setNumber(_ number: Int) {
+        self.number = number
+    }
+
+    ///
+    /// Returns the dictionary value for the specified key. The key is an entry
+    /// of the dictionary of the object, and not of a dictionary inside it: the
+    /// /Type of a /Group before the /Type of a page is not the type of the page.
+    ///
+    /// - Parameter key: the specified key.
+    ///
+    /// - Returns: the value, or "" when the object has no such key.
+    ///
+    public final func getValue(_ key: String) -> String {
+        guard let open = dict.firstIndex(of: "<<") else {
+            return ""
+        }
+        let entry = PDF.entryIndex(Array(dict[open...]), key)
+        if entry == -1 {
+            return ""
+        }
+        let i = entry + open
+        if i + 1 >= dict.count {
+            return ""
+        }
+        let token = dict[i + 1]
+        if token == "<<" {
+            return valueUpTo(i + 2, ">>", "<< ")
+        } else if token == "[" {
+            return valueUpTo(i + 2, "]", "[ ")
+        }
+        return token
+    }
+
+    // Returns the tokens of the value of the key: one, a reference to an
+    // object, as 5 0 R, or an array or a dictionary with the arrays and
+    // dictionaries in it, from its opening token to its closing one.
+    final func valueTokens(_ key: String) -> [String] {
+        guard let open = dict.firstIndex(of: "<<") else {
+            return []
+        }
+        let entry = PDF.entryIndex(Array(dict[open...]), key)
+        if entry == -1 {
+            return []
+        }
+        let start = open + entry + 1
+        if start + 2 < dict.count && dict[start + 2] == "R" {
+            return Array(dict[start..<(start + 3)])
+        }
+        var depth = 0
+        var j = start
+        while j < dict.count {
+            switch dict[j] {
+            case "[", "<<":
+                depth += 1
+            case "]", ">>":
+                depth -= 1
+            default:
+                break
+            }
+            if depth <= 0 {
+                return Array(dict[start...j])
+            }
+            j += 1
+        }
+        return Array(dict[min(start, dict.count)...])
+    }
+
+    // Returns the tokens from the index up to the closing one, with the
+    // opening before them and the closing after them.
+    private final func valueUpTo(_ start: Int, _ closing: String, _ opening: String) -> String {
+        var buffer = opening
+        var i = start
+        while i < dict.count && dict[i] != closing {
+            buffer.append(dict[i])
+            buffer.append(" ")
+            i += 1
+        }
+        buffer.append(closing)
+        return buffer
+    }
+
+    // Returns the object numbers of the key, which is one reference or an
+    // array of them. A dictionary that ends in the middle of them, or a token
+    // that is not a number where one belongs, ends the list: a PDF that was
+    // read can hold anything.
+    // The index of the key among this dictionary's own entries, not those of
+    // the dictionaries in it, or -1 when it has none
+    final func entryIndexOf(_ key: String) -> Int {
+        guard let open = dict.firstIndex(of: "<<") else {
+            return dict.firstIndex(of: key) ?? -1  // Tokens with no dictionary, as an object made by hand
+        }
+        let i = PDF.entryIndex(Array(dict[open...]), key)
+        return i == -1 ? -1 : i + open
+    }
+
+    final func getObjectNumbers(_ key: String) -> [Int] {
+        var numbers = [Int]()
+        // The key of this dictionary, not one of a dictionary in it: the
+        // /Contents of an annotation of /Annots before the page's own was
+        // taken for the page's (review of 17 October 2026)
+        var i = entryIndexOf(key)
+        while i >= 0 && i < dict.count {
+            let token = dict[i]
+            if token == key {
+                i += 1
+                if i >= dict.count {
+                    break
+                }
+                if dict[i] == "[" {
+                    while true {
+                        i += 1
+                        if i >= dict.count || dict[i] == "]" {
+                            break
+                        }
+                        guard let number = Int(dict[i]) else {
+                            break
+                        }
+                        numbers.append(number)
+                        i += 1  // 0
+                        i += 1  // R
+                    }
+                } else if let number = Int(dict[i]) {
+                    numbers.append(number)
+                }
+
+                break
+            }
+            i += 1
+        }
+        return numbers
+    }
+
+    /// Returns the width and height of the page, which its /MediaBox gives as
+    /// the two corners of a rectangle, in either order. A page with no
+    /// /MediaBox of its own, one that is not four numbers, or an empty one is
+    /// letter size, as MuPDF and pdf.js draw it. PDF.getPageObjects gives a
+    /// page the box it inherits from the page tree, which a page of another
+    /// program's PDF often does not carry itself, and the numbers of a box
+    /// that is an object of its own or refers to them.
+    ///
+    /// - Returns: the page size.
+    public final func getPageSize() -> PageSize {
+        for i in 0..<dict.count {
+            if dict[i] == "/MediaBox" {
+                if tokenAt(dict, i + 1) != "[" {
+                    break
+                }
+                var box = [Float](repeating: 0.0, count: 4)
+                for j in 0..<4 {
+                    // Only a number in decimal, as in the four ports: Java read
+                    // 595f, and Go, Swift and Java hex (review of 17 October 2026)
+                    let token = tokenAt(dict, i + 2 + j)
+                    guard Util.isDecimalNumber(token), let value = Float(token) else {
+                        return Letter.PORTRAIT
+                    }
+                    box[j] = value
+                }
+                let width = abs(box[2] - box[0])
+                let height = abs(box[3] - box[1])
+                // A box of a NaN or infinite size is no size, as one of 0 is
+                // not: a page of NaN by 792 stopped Swift where it was
+                // watermarked (review of 12 October 2026, K1).
+                if !(width > 0 && height > 0) || !width.isFinite || !height.isFinite {
+                    return Letter.PORTRAIT
+                }
+                return PageSize(width, height)
+            }
+        }
+        return Letter.PORTRAIT
+    }
+
+    // The /Length of the stream of this object, which is a number or a
+    // reference to an object that holds one. A dictionary that ends where the
+    // length is read, or a length that is not a number, throws, as it fails
+    // in the other three ports. A length that is an object of its own is found
+    // by its number in numbered, which holds the newest version of each
+    // object: an object of a PDF that was updated is in it once, as the last
+    // one of its number.
+    final func getLength(_ numbered: [Int: PDFobj]) throws -> Int {
+        // The entry of the dictionary, and not a /Length inside another value or
+        // that is the value of another entry, "/Height/Length", as pdf.js tests
+        // it in issue19611.
+        guard let open = dict.firstIndex(of: "<<") else {
+            return 0
+        }
+        let key = PDF.entryIndex(Array(dict[open...]), "/Length")
+        if key == -1 {
+            return 0
+        }
+        let i = key + open
+        guard i + 1 < dict.count else {
+            throw PDFjetError(message: "The /Length of a stream is not a number.")
+        }
+        let number = try PDFobj.toLength(dict[i + 1])
+        guard i + 2 < dict.count else {
+            throw PDFjetError(message: "The dictionary ends after the /Length.")
+        }
+        if dict[i + 2] == "0" {
+            guard i + 3 < dict.count else {
+                throw PDFjetError(message: "The dictionary ends after the /Length.")
+            }
+            if dict[i + 3] == "R" {
+                return try PDFobj.getLength(number, from: numbered)
+            }
+        }
+        return number
+    }
+
+    // Returns the length stored in the object with the number, or 0 when the
+    // PDF has no such object.
+    private static func getLength(
+            _ number: Int,
+            from numbered: [Int: PDFobj]) throws -> Int {
+        guard let obj = numbered[number] else {
+            return 0
+        }
+        guard obj.dict.count > 3 else {
+            throw PDFjetError(message: "The /Length of a stream is not a number.")
+        }
+        return try toLength(obj.dict[3])
+    }
+
+    // Returns the length the token holds, which a PDF that was read can write
+    // as anything. A real number and null are other programs' ways to write it,
+    // and were refused: the stream ends at its endstream when the length is
+    // wrong, as with null, for which it is 0 (review of 30 October 2026, B11).
+    private static func toLength(_ token: String) throws -> Int {
+        if token == "null" {
+            return 0
+        }
+        if let number = Int(token) {
+            return number
+        }
+        guard Util.isDecimalNumber(token), let value = Double(token), abs(value) <= Double(Int32.max) else {
+            throw PDFjetError(message: "The /Length of a stream is not a number.")
+        }
+        return Int(value)
+    }
+
+    // Returns the object with the number, or nil when the PDF that was read
+    // does not have one: a reference can name an object that is not in the file.
+    private final func getObject(
+            number: Int,
+            from objects: [PDFobj]) -> PDFobj? {
+        if number < 1 || number > objects.count {
+            return nil
+        }
+        return objects[number - 1]
+    }
+
+    // Returns the token at the index, or an empty string when the dictionary
+    // of an object that was read ends before it.
+    private final func tokenAt(_ dict: [String], _ index: Int) -> String {
+        if index < 0 || index >= dict.count {
+            return ""
+        }
+        return dict[index]
+    }
+
+    // Returns the object that the token names, or nil when the token is not
+    // the number of an object the PDF has: a page of a file that was changed
+    // can name an object that is not in it.
+    private final func objectAt(_ objects: [PDFobj], _ token: String) -> PDFobj? {
+        guard let number = Int(token) else {
+            return nil
+        }
+        return getObject(number: number, from: objects)
+    }
+
+    // Returns the index to insert at, which is the end of the dictionary when
+    // the index is past it.
+    private final func indexAt(_ dict: [String], _ index: Int) -> Int {
+        return (index < 0) ? 0 : min(index, dict.count)
+    }
+
+    ///
+    /// Returns the content object of this page.
+    /// The content of a page can be split into several streams, listed in an
+    /// array that is either in the page dictionary or an object of its own.
+    /// Together they are one content stream, so they are returned joined in
+    /// a new object, which is not in the objects list.
+    ///
+    /// - Returns: the content object, or nil if the page has no contents.
+    ///
+    public final func getContentObject(_ objects: [PDFobj]) -> PDFobj? {
+        var numbers = getObjectNumbers("/Contents")
+        if numbers.count == 1 {
+            guard let object = getObject(number: numbers[0], from: objects) else {
+                return nil
+            }
+            if object.stream != nil {
+                return object
+            }
+            // "/Contents 39 0 R" where the object is "[ 41 0 R 43 0 R ]"
+            numbers = [Int]()
+            var i = object.dict.firstIndex(of: "[") ?? -1
+            while i != -1 && i + 3 < object.dict.count && object.dict[i + 3] == "R" {
+                guard let number = Int(object.dict[i + 1]) else {
+                    break
+                }
+                numbers.append(number)
+                i += 3
+            }
+        }
+        if numbers.isEmpty {
+            return nil
+        }
+        if numbers.count == 1 {
+            return getObject(number: numbers[0], from: objects)
+        }
+        let content = PDFobj()
+        // Each stream copied into the content is charged to the budget, as the
+        // copy is memory of its own, which decoding the stream does not pay
+        // for: /Contents [4 0 R 4 0 R ...] of a stream of 16 MB made gigabytes
+        // of a PDF of a few KB (review of 11 October 2026, #29), and 64 pages
+        // of /Contents [4 0 R 5 0 R] held 1 GB against the budget of 256 MB
+        // (review of 12 October 2026, R16). Past the budget, the page has no
+        // content, as a stream past it has no data.
+        for number in numbers {
+            guard let object = getObject(number: number, from: objects) else {
+                continue
+            }
+            let data = object.getData()
+            if object.stream != nil && !object.undecodable {
+                if let budget = object.budget {
+                    budget.left -= data.count + 1
+                    if budget.left < 0 {
+                        budget.left = 0
+                        return nil
+                    }
+                }
+                content.data.append(contentsOf: data)
+                content.data.append(UInt8(ascii: "\n"))     // A stream can end in the middle of a line.
+            }
+        }
+        return content
+    }
+
+    /// Returns the resources object of this page.
+    ///
+    /// - Parameter objects: the objects of the PDF.
+    /// - Returns: the resources object, or nil if the page has none.
+    public final func getResourcesObject(_ objects: [PDFobj]) -> PDFobj? {
+        if let inherited = inheritedResources {
+            // The dictionary the page shares with the others under its node,
+            // as an object of its own, which is read and not changed
+            let resources = PDFobj()
+            resources.dict = inherited
+            return resources
+        }
+        var i = 0
+        while i < dict.count {
+            if dict[i] == "/Resources" {
+                if i + 1 >= dict.count {
+                    return nil
+                }
+                let token = dict[i + 1]
+                if token == "<<" {
+                    return self
+                }
+                guard let number = Int(token) else {
+                    return nil
+                }
+                return getObject(number: number, from: objects)
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    // Gives the page a copy of the /Resources it shares with the others
+    // under its node, before a resource is added to it, so that the resource
+    // is the page's alone, as it was when every page had a copy. A page with
+    // no /Resources gets an empty one: the fonts added to it were lost, with
+    // no error (review of 30 October 2026, B5).
+    private final func ownResources() {
+        if inheritedResources == nil && entryIndexOf("/Resources") != -1 {
+            return
+        }
+        if let open = dict.firstIndex(of: "<<") {
+            dict.insert(contentsOf: ["/Resources"] + (inheritedResources ?? ["<<", ">>"]), at: open + 1)
+        }
+        inheritedResources = nil
+    }
+
+    /// Adds a core font to the resources of this page.
+    ///
+    /// - Parameter coreFont: the core font.
+    /// - Parameter objects: the objects of the PDF.
+    /// - Returns: the font.
+    public final func addResource(
+            _ coreFont: Int,
+            _ objects: inout [PDFobj]) throws -> Font {
+        ownResources()
+        let font = try Font(coreFont)
+        font.fontID = font.name.replacingOccurrences(of: "-", with: "_").uppercased()
+
+        let obj = PDFobj()
+        obj.dict.append("<<")
+        obj.dict.append("/Type")
+        obj.dict.append("/Font")
+        obj.dict.append("/Subtype")
+        obj.dict.append("/Type1")
+        obj.dict.append("/BaseFont")
+        obj.dict.append("/" + font.name)
+        if font.name != "Symbol" && font.name != "ZapfDingbats" {
+            obj.dict.append("/Encoding")
+            obj.dict.append("/WinAnsiEncoding")
+        }
+        obj.dict.append(">>")
+        obj.number = objects.count + 1
+        objects.append(obj)
+
+        // The first /Resources of the page is the one, and the font is added
+        // to it once: adding it to the page again, after a resources object
+        // that names the page itself has grown the page dictionary, never
+        // ended.
+        var i = 0
+        while i < dict.count {
+            if dict[i] == "/Resources" {
+                let token = tokenAt(dict, i + 1)
+                if token == "<<" {                  // Direct resources object
+                    addFontResource(self, objects, font.fontID!, obj.number)
+                } else if let object = objectAt(objects, token) {  // Indirect
+                    addFontResource(object, objects, font.fontID!, obj.number)
+                }
+                break
+            }
+            i += 1
+        }
+
+        return font
+    }
+
+    private final func addFontResource(
+            _ obj: PDFobj,
+            _ objects: [PDFobj],
+            _ fontID: String,
+            _ number: Int) {
+        var fonts: Bool = false
+        var i = 0
+        while i < obj.dict.count {
+            if obj.dict[i] == "/Font" {
+                fonts = true
+                break
+            }
+            i += 1
+        }
+        if !fonts {
+            // Direct resources follow "/Resources <<" in the page dictionary; an
+            // indirect resources object has no /Resources key, and its entries
+            // follow its first "<<".
+            if let k = obj.dict.firstIndex(of: "/Resources") {
+                i = k + 2
+            } else {
+                i = (obj.dict.firstIndex(of: "<<") ?? -1) + 1
+            }
+            obj.dict.insert(contentsOf: ["/Font", "<<", ">>"], at: indexAt(obj.dict, i))
+        }
+
+        i = 0
+        while i < obj.dict.count {
+            if obj.dict[i] == "/Font" {
+                let token = tokenAt(obj.dict, i + 1)
+                if token == "<<" {
+                    obj.dict.insert("/" + fontID, at: i + 2)
+                    obj.dict.insert(String(number), at: i + 3)
+                    obj.dict.insert("0", at: i + 4)
+                    obj.dict.insert("R", at: i + 5)
+                    return
+                } else if let o2 = objectAt(objects, token) {
+                    var j = 0
+                    while j < o2.dict.count {
+                        if o2.dict[j] == "<<" {
+                            o2.dict.insert("/" + fontID, at: j + 1)
+                            o2.dict.insert(String(number), at: j + 2)
+                            o2.dict.insert("0", at: j + 3)
+                            o2.dict.insert("R", at: j + 4)
+                            return
+                        }
+                        j += 1
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+
+    private final func insertNewObject(
+            _ dict: inout [String],
+            _ list: inout [String],
+            _ type: String) {
+        if dict.contains(list[0]) {
+            return
+        }
+        for i in 0..<dict.count {
+            if dict[i] == type {
+                dict.insert(contentsOf: list, at: indexAt(dict, i + 2))
+                return
+            }
+        }
+        if tokenAt(dict, 3) == "<<" {
+            dict.insert(contentsOf: list, at: 4)
+            return
+        }
+    }
+
+    private final func addResource(
+            _ type: String,
+            _ obj: PDFobj,
+            _ objects: [PDFobj],
+            _ objNumber: Int) {
+        let tag = (type == "/Font") ? "/F" : "/Im"
+        let number = String(objNumber)
+        var list = [tag + number, number, "0", "R"]
+        for i in 0..<obj.dict.count {
+            if obj.dict[i] == type {
+                let token = tokenAt(obj.dict, i + 1)
+                if token == "<<" {
+                    insertNewObject(&obj.dict, &list, type)
+                } else if let object = objectAt(objects, token) {
+                    insertNewObject(&object.dict, &list, type)
+                }
+                return
+            }
+        }
+
+        // Handle the case where the page originally does not have any font resources.
+        list = [type, "<<", tag + number, number, "0", "R", ">>"]
+        for i in 0..<obj.dict.count {
+            if obj.dict[i] == "/Resources" {
+                obj.dict.insert(contentsOf: list, at: indexAt(obj.dict, i + 2))
+                return
+            }
+        }
+        for i in 0..<obj.dict.count {
+            if obj.dict[i] == "<<" {
+                obj.dict.insert(contentsOf: list, at: i + 1)
+                return
+            }
+        }
+    }
+
+    /// Adds an image to the resources of this page.
+    ///
+    /// - Parameter image: the image.
+    /// - Parameter objects: the objects of the PDF.
+    public final func addResource(
+            _ image: Image,
+            _ objects: inout [PDFobj]) {
+        ownResources()
+        for i in 0..<dict.count {
+            if dict[i] == "/Resources" {
+                let token = tokenAt(dict, i + 1)
+                if token == "<<" {      // Direct resources object
+                    addResource("/XObject", self, objects, image.objNumber!)
+                } else if let object = objectAt(objects, token) {  // Indirect
+                    addResource("/XObject", object, objects, image.objNumber!)
+                }
+                return
+            }
+        }
+    }
+
+    /// Adds a font to the resources of this page.
+    ///
+    /// - Parameter font: the font.
+    /// - Parameter objects: the objects of the PDF.
+    public final func addResource(
+            _ font: Font,
+            _ objects: inout [PDFobj]) {
+        ownResources()
+        font.referenced = true
+        for i in 0..<dict.count {
+            if dict[i] == "/Resources" {
+                let token = tokenAt(dict, i + 1)
+                if token == "<<" {      // Direct resources object
+                    addResource("/Font", self, objects, font.objNumber)
+                } else if let object = objectAt(objects, token) {  // Indirect
+                    addResource("/Font", object, objects, font.objNumber)
+                }
+                return
+            }
+        }
+    }
+
+    // Puts a content stream before the content streams of this page and
+    // another after them, in a /Contents array of its own, or gives a page
+    // that has none the second. Returns false when the /Contents is not a
+    // stream or an array of them, and changes nothing.
+    final func wrapContents(_ before: [UInt8], _ after: [UInt8], _ objects: inout [PDFobj]) -> Bool {
+        let i = entryIndexOf("/Contents")
+        guard i >= 0 else {
+            // A page with no content: addContent added nothing, and the
+            // drawing was lost
+            guard let last = dict.lastIndex(of: ">>") else {
+                return false
+            }
+            // The content before, which saves the graphics state that the
+            // content after restores, in the one stream
+            dict.insert(contentsOf: ["/Contents", "["] + PDFobj.addStream(before + after, &objects) + ["]"], at: last)
+            return true
+        }
+        let start = i + 1
+        var refs: [String]
+        var end: Int
+        if tokenAt(dict, start) == "[" {
+            guard let arrayEnd = PDFobj.arrayEnd(dict, start + 1) else {
+                return false
+            }
+            end = arrayEnd
+            refs = Array(dict[(start + 1)..<(end - 1)])
+        } else {
+            guard PDF.isReference(dict, start), let contents = objectAt(objects, dict[start]) else {
+                return false
+            }
+            end = start + 3
+            if contents.data.isEmpty && contents.stream == nil {
+                // An array of streams that is an object of its own
+                guard let k = contents.dict.firstIndex(of: "["),
+                        let arrayEnd = PDFobj.arrayEnd(contents.dict, k + 1) else {
+                    return false
+                }
+                refs = Array(contents.dict[(k + 1)..<(arrayEnd - 1)])
+            } else {
+                refs = Array(dict[start..<end])
+            }
+        }
+        let value = ["["] + PDFobj.addStream(before, &objects) + refs + PDFobj.addStream(after, &objects) + ["]"]
+        dict.replaceSubrange(start..<end, with: value)
+        return true
+    }
+
+    // Returns the index after the "]" of the array of references that starts
+    // at the index, or nil when it is not one.
+    private static func arrayEnd(_ tokens: [String], _ from: Int) -> Int? {
+        var j = from
+        while j < tokens.count {
+            if tokens[j] == "]" {
+                return j + 1
+            }
+            if !PDF.isReference(tokens, j) {
+                return nil
+            }
+            j += 3
+        }
+        return nil
+    }
+
+    // Adds a stream object of the content, and returns its reference.
+    private static func addStream(_ content: [UInt8], _ objects: inout [PDFobj]) -> [String] {
+        let obj = PDFobj()
+        obj.setNumber(objects.count + 1)
+        var stream = content
+        obj.setStream(&stream)
+        objects.append(obj)
+        return [String(obj.number), "0", "R"]
+    }
+
+    // Returns the lower left corner of the /MediaBox of this page, or 0, 0 when
+    // it has none that is four numbers.
+    final func mediaBoxOrigin() -> (x: Float, y: Float) {
+        guard let i = dict.firstIndex(of: "/MediaBox"), tokenAt(dict, i + 1) == "[" else {
+            return (0, 0)
+        }
+        var box = [Float]()
+        for j in 0..<4 {
+            let token = tokenAt(dict, i + 2 + j)
+            guard Util.isDecimalNumber(token), let value = Float(token), value.isFinite else {
+                return (0, 0)
+            }
+            box.append(value)
+        }
+        return (min(box[0], box[2]), min(box[1], box[3]))
+    }
+
+    /// Adds a content stream to this page.
+    public final func addContent(_ content: inout [UInt8], _ objects: inout [PDFobj]) {
+        let obj = PDFobj()
+        obj.setNumber(objects.count + 1)
+        obj.setStream(&content)
+        objects.append(obj)
+
+        let objNumber = String(obj.number)
+        // The page's own /Contents, not an annotation's in it
+        var i = entryIndexOf("/Contents")
+        while i >= 0 && i < dict.count {
+            if dict[i] == "/Contents" {
+                i += 1
+                let token = tokenAt(dict, i)
+                if token == "[" {
+                    // Array of content objects, which can end before its "]".
+                    i += 1
+                    while i < dict.count {
+                        if dict[i] == "]" {
+                            dict.insert("R", at: i)
+                            dict.insert("0", at: i)
+                            dict.insert(objNumber, at: i)
+                            return
+                        }
+                        i += 3  // Skip the number, the 0 and the R
+                    }
+                    return
+                } else {
+                    // Single content object
+                    guard let obj2 = objectAt(objects, token) else {
+                        return
+                    }
+                    if obj2.data.count == 0 && obj2.stream == nil {
+                        // This is not a stream object!
+                        var j = 0
+                        while j < obj2.dict.count {
+                            if obj2.dict[j] == "]" {
+                                obj2.dict.insert("R", at: j)
+                                obj2.dict.insert("0", at: j)
+                                obj2.dict.insert(objNumber, at: j)
+                                return
+                            }
+                            j += 1
+                        }
+                    }
+                    if tokenAt(dict, i + 1) != "0" || tokenAt(dict, i + 2) != "R" {
+                        return  // Not a whole "n 0 R" to put in an array.
+                    }
+                    dict.insert("[", at: i)
+                    dict.insert("]", at: i + 4)
+                    dict.insert("R", at: i + 4)
+                    dict.insert("0", at: i + 4)
+                    dict.insert(objNumber, at: i + 4)
+                    return
+                }
+            }
+            i += 1
+        }
+    }
+
+    ///
+    /// Adds new content object before the existing content objects.
+    /// The original code was provided by Stefan Ostermann author of ScribMaster and HandWrite Pro.
+    /// Additional code to handle PDFs with indirect array of stream objects was written by EDragoev.
+    ///
+    /// - Parameter content: the content stream to add.
+    /// - Parameter objects: the objects of the PDF, which receive the new content object.
+    ///
+    public final func addPrefixContent(_ content: inout [UInt8], _ objects: inout [PDFobj]) {
+        let obj = PDFobj()
+        obj.setNumber(objects.count + 1)
+        obj.setStream(&content)
+        objects.append(obj)
+
+        let objNumber = String(obj.number)
+        // The page's own /Contents, not an annotation's in it
+        var i = entryIndexOf("/Contents")
+        while i >= 0 && i < dict.count {
+            if dict[i] == "/Contents" {
+                i += 1
+                let token = tokenAt(dict, i)
+                if token == "[" {
+                    // Array of content object streams
+                    i += 1
+                    dict.insert("R", at: indexAt(dict, i))
+                    dict.insert("0", at: indexAt(dict, i))
+                    dict.insert(objNumber, at: indexAt(dict, i))
+                    return
+                } else {
+                    // Single content object
+                    guard let obj2 = objectAt(objects, token) else {
+                        return
+                    }
+                    if obj2.data.count == 0 && obj2.stream == nil {
+                        // This is not a stream object!
+                        var j = 0
+                        while j < obj2.dict.count {
+                            if obj2.dict[j] == "[" {
+                                j += 1
+                                obj2.dict.insert("R", at: j)
+                                obj2.dict.insert("0", at: j)
+                                obj2.dict.insert(objNumber, at: j)
+                                return
+                            }
+                            j += 1
+                        }
+                    }
+                    if tokenAt(dict, i + 1) != "0" || tokenAt(dict, i + 2) != "R" {
+                        return  // Not a whole "n 0 R" to put in an array.
+                    }
+                    dict.insert("[", at: i)
+                    dict.insert("]", at: i + 4)
+                    i += 1
+                    dict.insert("R", at: i)
+                    dict.insert("0", at: i)
+                    dict.insert(objNumber, at: i)
+                    return
+                }
+            }
+            i += 1
+        }
+    }
+
+    private final func getMaxGSNumber(_ obj: PDFobj) -> Int {
+        var maxGSNumber = 0
+        for token in obj.dict {
+            // The names are like /GS1, so they start with /GS, not equal it.
+            if token.hasPrefix("/GS"), let number = Int(token.dropFirst(3)) {
+                maxGSNumber = max(maxGSNumber, number)
+            }
+        }
+        return maxGSNumber
+    }
+
+    // Returns the largest number of the /GS, /Fm and /OC names in the resources
+    // of this page, or 0, so that the names of what is drawn on it are not
+    // those of what it holds. They are all read from the objects of the PDF, in
+    // the resources or in an /ExtGState, /XObject or /Properties dictionary
+    // that is an object of its own.
+    final func maxResourceNumber() -> Int {
+        guard let readObjects = readObjects else {
+            return 0
+        }
+        var tokens: [String]
+        if let inherited = inheritedResources {
+            tokens = inherited
+        } else {
+            let i = entryIndexOf("/Resources")
+            if i == -1 {
+                return 0
+            }
+            tokens = dict
+            if PDF.isReference(dict, i + 1) {
+                guard let resources = readObjects.object(Int(dict[i + 1])!) else {
+                    return 0
+                }
+                tokens = resources.dict
+            }
+        }
+        var maximum = PDFobj.maxNameNumber(tokens)
+        for (i, token) in tokens.enumerated()
+                where (token == "/ExtGState" || token == "/XObject" || token == "/Properties")
+                    && PDF.isReference(tokens, i + 1) {
+            if let entries = readObjects.object(Int(tokens[i + 1])!) {
+                maximum = max(maximum, PDFobj.maxNameNumber(entries.dict))
+            }
+        }
+        return maximum
+    }
+
+    // Returns the largest number of the names in the tokens that are /GS, /Fm
+    // or /OC and one to nine digits, or 0.
+    private static func maxNameNumber(_ tokens: [String]) -> Int {
+        var maximum = 0
+        for token in tokens
+                where (token.hasPrefix("/GS") || token.hasPrefix("/Fm") || token.hasPrefix("/OC"))
+                    && isGSName("/GS" + token.dropFirst(3)) {
+            maximum = max(maximum, Int(token.dropFirst(3))!)
+        }
+        return maximum
+    }
+
+    // Adds the name and its value to a dictionary of the resources of this
+    // page, like /ExtGState, unless it has the name.
+    final func addResourceEntry(
+            _ category: String, _ name: String, _ value: [String], _ objects: inout [PDFobj]) {
+        guard let (resources, index) = resourceEntries(category, &objects) else {
+            return
+        }
+        var i = index
+        while i < resources.dict.count && resources.dict[i] != ">>" {
+            if resources.dict[i] == name {
+                return
+            }
+            i = PDF.valueEnd(resources.dict, i + 1)
+        }
+        resources.dict.insert(contentsOf: [name] + value, at: index)
+    }
+
+    // Returns the object that holds a dictionary of the resources of this page,
+    // like /ExtGState, and the index of its first entry, or nil. The resources
+    // and the dictionary can be objects of their own, and resources without the
+    // dictionary get it.
+    private final func resourceEntries(
+            _ category: String, _ objects: inout [PDFobj]) -> (PDFobj, Int)? {
+        ownResources()
+        var obj: PDFobj?
+        var index = -1
+        var i = 0
+        while i < dict.count {
+            if dict[i] == "/Resources" {
+                let token = tokenAt(dict, i + 1)
+                if token == "<<" {
+                    obj = self
+                    index = i + 2
+                } else if let object = objectAt(objects, token) {
+                    obj = object
+                    var j = 0
+                    while j < obj!.dict.count {
+                        if obj!.dict[j] == "<<" {
+                            index = j + 1
+                            break
+                        }
+                        j += 1
+                    }
+                }
+                break
+            }
+            i += 1
+        }
+        guard let resources = obj, index != -1 else {
+            return nil
+        }
+        // The entries of the resources themselves: a pattern among them has its own.
+        var k = index
+        while k < resources.dict.count && resources.dict[k] != ">>" && resources.dict[k] != category {
+            k = PDF.valueEnd(resources.dict, k + 1)
+        }
+        if k >= resources.dict.count || resources.dict[k] != category {
+            resources.dict.insert(contentsOf: [category, "<<", ">>"], at: index)
+            return (resources, index + 2)
+        }
+        if tokenAt(resources.dict, k + 1) == "<<" {
+            return (resources, k + 2)
+        }
+        guard let object = objectAt(objects, tokenAt(resources.dict, k + 1)) else {     // "/ExtGState 12 0 R"
+            return nil
+        }
+        return (object, (object.dict.firstIndex(of: "<<") ?? -1) + 1)
+    }
+
+    /// Adds the graphics state to the resources of this page.
+    @discardableResult
+    public final func setGraphicsState(_ gs: GraphicsState, _ objects: inout [PDFobj]) -> PDFobj {
+        guard let (resources, index) = resourceEntries("/ExtGState", &objects) else {
+            return self
+        }
+        let entries = gs.entries().split(separator: " ").map(String.init)
+        var name: String
+        if let same = PDFobj.sameState(resources, index, entries) {
+            name = same
+            gsNumber = Int(same.dropFirst(3))! - 1
+        } else {
+            gsNumber = getMaxGSNumber(resources)
+            name = "/GS" + String(gsNumber + 1)
+            resources.dict.insert(contentsOf: [name, "<<"] + entries + [">>"], at: index)
+        }
+        var content = Array("q\n\(name) gs\n".utf8)
+        addPrefixContent(&content, &objects)
+        return self
+    }
+
+    // Returns the name of a /GS state of the /ExtGState dictionary whose
+    // entries at index are these entries and no others, or nil: setting the
+    // same state again reuses it rather than adding another (Stefan
+    // Ostermann's fork of PDFjet, 19 October 2026). Only our own /GS names
+    // with a number are reused, and only for exactly the same entries, so a
+    // state with a blend mode is not taken for one without.
+    private static func sameState(_ obj: PDFobj, _ index: Int, _ entries: [String]) -> String? {
+        var i = index
+        while i < obj.dict.count && obj.dict[i] != ">>" {
+            let key = obj.dict[i]
+            let end = PDF.valueEnd(obj.dict, i + 1)
+            if isGSName(key)
+                    && end - i == entries.count + 3
+                    && obj.dict[i + 1] == "<<"
+                    && Array(obj.dict[(i + 2)..<(end - 1)]) == entries {
+                return key
+            }
+            i = end
+        }
+        return nil
+    }
+
+    // Returns true for /GS and one to nine digits, as Java's matches of
+    // "/GS[0-9]{1,9}".
+    private static func isGSName(_ key: String) -> Bool {
+        let digits = key.utf8.dropFirst(3)
+        return key.hasPrefix("/GS") && (1...9).contains(digits.count)
+                && digits.allSatisfy { $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }
+    }
+}
+
+// The objects of a PDF that was read, by number. Each object holds this, and
+// this holds the objects weakly, so that the objects do not hold one another
+// and are freed with the list that read() returned.
+final class ReadObjects {
+    private struct Weak {
+        weak var obj: PDFobj?
+    }
+    private var objects = [Int: Weak]()
+
+    init(_ objects: [PDFobj]) {
+        for obj in objects {
+            self.objects[obj.number] = Weak(obj: obj)
+        }
+    }
+
+    func object(_ number: Int) -> PDFobj? {
+        return objects[number]?.obj
+    }
+}

@@ -1,0 +1,177 @@
+/**
+ * RadioButton.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Creates a RadioButton, which can be set selected or unselected.
+///
+public class RadioButton : Drawable {
+    private var selected: Bool = false
+    private var x: Float = 0.0
+    private var y: Float = 0.0
+    private var r1: Float = 0.0
+    private var r2: Float = 0.0
+    private var penWidth: Float = 0.0
+    private var font: Font
+    private var fontSize: Float
+    private var label: String = ""
+    private var uri: String?
+
+    private var language: String?
+    private var altDescription: String?
+    private var actualText: String?
+
+    ///
+    /// Creates a RadioButton that is not selected.
+    ///
+    public init(_ font: Font, _ label: String) {
+        self.font = font
+        self.fontSize = font.getSize()
+        self.label = label
+    }
+
+    ///
+    /// Sets the size of the label text. The font keeps its own size.
+    ///
+    /// - Parameter fontSize: the fontSize to use.
+    /// - Returns: this RadioButton.
+    ///
+    @discardableResult
+    public func setFontSize(_ fontSize: Float) -> RadioButton {
+        self.fontSize = fontSize
+        return self
+    }
+
+    ///
+    /// Set the x,y location on the Page.
+    ///
+    /// - Parameter x: the x coordinate on the Page.
+    /// - Parameter y: the y coordinate on the Page.
+    /// - Returns: this RadioButton.
+    ///
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x = x
+        self.y = y
+        return self
+    }
+
+    ///
+    /// Sets the URI for the "click text line" action.
+    ///
+    /// - Parameter uri: the URI.
+    /// - Returns: this RadioButton.
+    ///
+    @discardableResult
+    public func setURIAction(_ uri: String) -> RadioButton {
+        self.uri = uri
+        return self
+    }
+
+    ///
+    /// Selects or deselects this radio button.
+    ///
+    /// - Parameter selected: the selection flag.
+    /// - Returns: this RadioButton.
+    ///
+    @discardableResult
+    public func select(_ selected: Bool) -> RadioButton {
+        self.selected = selected
+        return self
+    }
+
+    ///
+    /// Sets the alternate description of this radio button.
+    ///
+    /// - Parameter altDescription: the alternate description of the radio button.
+    /// - Returns: this RadioButton.
+    ///
+    @discardableResult
+    public func setAltDescription(_ altDescription: String) -> RadioButton {
+        self.altDescription = altDescription
+        return self
+    }
+
+    ///
+    /// Sets the actual text for this radio button.
+    ///
+    /// - Parameter actualText: the actual text for the radio button.
+    /// - Returns: this RadioButton.
+    ///
+    @discardableResult
+    public func setActualText(_ actualText: String) -> RadioButton {
+        self.actualText = actualText
+        return self
+    }
+
+    ///
+    /// Draws this RadioButton on the specified Page.
+    ///
+    /// - Parameter page: the Page where the RadioButton is to be drawn.
+    /// - Returns: x and y coordinates of the bottom right corner of this component.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        self.r1 = font.getAscent(fontSize)/2
+        self.r2 = r1/2
+        self.penWidth = r1/10
+        if page == nil {    // Measured, not drawn
+            return [x + 6*r1 + font.stringWidth(fontSize, label), y + font.getBodyHeight(fontSize)]
+        }
+
+        var link: StructElement?
+        if !(uri ?? "").isEmpty {
+            link = page!.addLinkBDC(StructElem.P, language, actualText, altDescription)
+        } else if label.isEmpty {
+            // A button with no label, nor a description, has nothing to read.
+            page!.addShapeBDC(language, actualText, altDescription)
+        } else {
+            page!.addBDC(StructElem.P, language, actualText, altDescription)
+        }
+        // The pen of the button is its own, and the page is left with the one it had.
+        page!.saveGraphicsState()
+
+        let yBox = y
+        page!.setPenWidth(1.0)
+        page!.setPenColor(Color.black)
+        page!.setStrokeDashPattern("[] 0")
+        page!.setBrushColor(Color.black)
+        page!.drawCircle(x + r1 + penWidth, yBox + r1 + penWidth, r1)
+
+        if self.selected {
+            page!.fillCircle(x + r1 + penWidth, yBox + r1 + penWidth, r2)
+        }
+
+        // A linked label is blue.
+        let textColor: [Float] = !(uri ?? "").isEmpty ? [0.0, 0.0, 1.0] : [0.0, 0.0, 0.0]
+        page!.drawString(font, fontSize, label, x + 3*r1, y + font.getAscent(fontSize), textColor, nil)
+        page!.restoreGraphicsState()
+
+        page!.addEMC()
+
+        if !(uri ?? "").isEmpty {
+            page!.addAnnotation(Annotation(
+                    Annotation.Link,
+                    x + 3*r1,
+                    y,
+                    x + 3*r1 + font.stringWidth(fontSize, label),
+                    y + font.getBodyHeight(fontSize),
+                    nil,    // Vertices
+                    nil,    // Fill Color
+                    0.0,    // Opacity
+                    nil,    // Title
+                    nil,    // Contents
+                    uri,
+                    nil,
+                    language,
+                    actualText,
+                    altDescription).joining(link))
+        }
+
+        return [x + 6*r1 + font.stringWidth(fontSize, label), y + font.getBodyHeight(fontSize)]
+    }
+}   // End of RadioButton.swift

@@ -1,0 +1,1105 @@
+/**
+ * TextFrame.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Paragraphs of text lines, wrapped at the width of the frame, with an optional
+/// border. A frame with a height draws as much of the text as fits and keeps the
+/// rest for the next frame, so text flows from frame to frame. A frame without a
+/// height draws all of the text. Drawing consumes the text: a second drawOn
+/// draws what is left, so build a new frame to draw the same text again.
+///
+/// Use a TextFrame for text that continues from one frame to the next: the
+/// columns of an article, or the pages of a long text. Use a TextColumn to
+/// draw paragraphs in one place, with justified text or a rotation, and a
+/// TextBlock for one run of text in one font. Please see Example_14 and
+/// Example_15.
+///
+public class TextFrame : Drawable {
+    /// Told of each line of text as the frame draws it: the line as drawn, its
+    /// text, font, size and color, at x, the left of its first letter, and y,
+    /// its baseline; and the text line of the paragraph it is a piece of, or
+    /// nil for a list's label, so that a program can tell which of its text a
+    /// point on the page is (hit testing). The pieces of a source are drawn in
+    /// the order of its text, whole words, or a word cut at a soft hyphen
+    /// (ending with a hyphen) or where it does not fit.
+    ///
+    /// Two things to know when matching the pieces with their sources: a space
+    /// at the start of a text line (before a bold word, say) is drawn at the end
+    /// of the piece before it, so it comes with the source before; and a word's
+    /// soft hyphens (U+00AD) where it is not broken stay in the text of its
+    /// piece, drawn as nothing.
+    public typealias Listener = (_ line: TextLine, _ x: Float, _ y: Float, _ source: TextLine?) -> Void
+
+    private var listener: Listener?
+    private var lineSpacing: Float = 1.0
+    private var paragraphs: [Paragraph]
+    private var x: Float = 0.0
+    private var y: Float = 0.0
+    private var w: Float = 0.0
+    private var h: Float = 0.0
+    private var textBottom: Float = 0.0     // The bottom of the text drawn by the last drawOn
+    private var paragraphGap: Float = 0.0
+    private var hasParagraphGap = false
+    private var border = false
+    private var borderColor: [Float] = [0.0, 0.0, 0.0]
+    private var borderWidth: Float = 0.5
+    private var borderPattern = "[] 0"
+
+    // The text that is not drawn yet starts at this paragraph, at this text line
+    // of the paragraph and at this token of the text line. The tokens are nil
+    // when the text line has not been started.
+    private var paragraphIndex = 0
+    private var lineIndex = 0
+    private var tokens: [String]?
+    private var tokenIndex = 0
+
+    // The row of text being drawn: where the text goes next, whether the row can
+    // take more text, whether the frame has a row yet, and where the next row goes.
+    private var xText: Float = 0.0
+    private var yText: Float = 0.0
+    private var rowOpen = false
+    private var rowPlaced = false
+    private var firstRow = false        // The open row is the first of the frame
+    // The text line the row has room for: the row's first text line in the
+    // first row of a frame or of a paragraph, whose ascent placed it; in the
+    // rows after, the tallest text line of the row before, whose height set
+    // the row's baseline. lowerRow and risesOutOfFrame measure a larger text
+    // against it, so that rows of text with smaller inline code in it, at 0.9
+    // of the size, are evenly apart wherever the code falls, and a larger word
+    // still has its room.
+    private var rowLine: TextLine?
+    private var spacingLine: TextLine?  // The text line that set nextBaseline, for rowLine
+    private var rowTallest: TextLine?   // The tallest text line of the row drawn last
+    private var nextBaseline: Float = 0.0
+    private var startsParagraph = false     // The next row starts a paragraph
+    private var rowBottom: Float = 0.0      // The bottom of the last row drawn
+    // True when the row has room for the first word of the next text line,
+    // which goes on from the last word of this one: see Paragraph.addJoined.
+    private var joinReserved = false
+    // True when the next text line starts with the space after the last word
+    // of this one: see Paragraph.spaceMovesToNext.
+    private var leadingSpace = false
+    // True when the row ends where a space moved to the next text line, and
+    // the word that has it goes on the next row: the space is drawn after the
+    // last word of the row, so that the word break is in the text.
+    private var rowEndSpace = false
+    // The paragraph whose structure element the text of the rows belongs to,
+    // and the element. A paragraph is one element however many rows it takes;
+    // one that the frame draws the rest of on another page gets an element of
+    // its own there, since an element belongs to the page it is drawn on.
+    private var elementParagraph: Paragraph?
+    private var element: StructElement?
+    // The paragraph that an earlier frame drew the start of and this one goes
+    // on with, or nil: its label and its heading are not drawn or noted again.
+    private var continuedParagraph: Paragraph?
+    // Whether a list, and an item of it, are open: a run of paragraphs that
+    // have a label is one list.
+    private var inList = false
+    private var inItem = false
+    private var savedParent: StructElement?
+    private var savedMcidParent: StructElement?
+
+    // The text of the row being drawn, drawn when the row is complete, so that it
+    // can be aligned: each part is a text line with some of its text.
+    private var row = [RowPart]()
+
+    private struct RowPart {
+        let textLine: TextLine
+        let text: String
+        let x: Float
+        let paragraph: Paragraph
+        let startsParagraph: Bool   // The first text of the paragraph
+        let endsTextLine: Bool      // The last text of the text line
+    }
+
+    /// Creates a text frame from paragraphs of text lines. An empty line separates
+    /// the paragraphs unless setParagraphGap sets another gap.
+    public init(_ paragraphs: [Paragraph]) {
+        self.paragraphs = paragraphs
+    }
+
+    /// Creates a text frame from strings, one paragraph each, in the font at its
+    /// size. An empty line separates the paragraphs.
+    public init(_ f1: Font, _ inputList: [String]) {
+        self.paragraphs = inputList.map { Paragraph(TextLine(f1, $0)) }
+    }
+
+    /// Sets the location of the top left corner of this text frame.
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x = x
+        self.y = y
+        return self
+    }
+
+    /// Sets the width at which the lines wrap.
+    @discardableResult
+    public func setWidth(_ w: Float) -> TextFrame {
+        self.w = w
+        return self
+    }
+
+    /// Sets the height of this text frame. With a height of 0, the default, the
+    /// frame draws all of its text.
+    @discardableResult
+    public func setHeight(_ h: Float) -> TextFrame {
+        self.h = h
+        return self
+    }
+
+    /// Returns the width of this text frame.
+    public func getWidth() -> Float {
+        return self.w
+    }
+
+    /// Returns the height of this text frame.
+    public func getHeight() -> Float {
+        return self.h
+    }
+
+    /// Sets the listener told of each line of text as it is drawn, or nil for
+    /// none: not of the lines drawOn(nil) only measures.
+    @discardableResult
+    public func setListener(_ listener: Listener?) -> TextFrame {
+        self.listener = listener
+        return self
+    }
+
+    /// Sets the space between the lines of a paragraph, as a factor of the
+    /// font's own: 1 as the font has it, 1.5 half again as much, from 0.8 to 3;
+    /// NaN is taken as 1. The gap between paragraphs is setParagraphGap's, and
+    /// stays as it is.
+    @discardableResult
+    public func setLineSpacing(_ lineSpacing: Float) -> TextFrame {
+        let spacing = lineSpacing.isNaN ? 1.0 : lineSpacing
+        self.lineSpacing = max(0.8, min(3.0, spacing))
+        return self
+    }
+
+    // Draws a line of text, a piece of the source, and tells the listener; not
+    // when the frame only measures (no page), as nothing is drawn then, and
+    // not of an empty piece, which draws nothing: the part a text line leaves
+    // at the end of a row when its first word goes on the next
+    private func drawLine(_ line: TextLine, _ source: TextLine?, _ page: Page?) {
+        if let listener = listener, page != nil, !(line.text ?? "").isEmpty {
+            listener(line, line.x + line.xOffset, line.y, source)
+        }
+        line.drawOn(page)
+    }
+
+    /// Sets the space between paragraphs, in points, 0 or more: from the bottom of
+    /// the text of a paragraph to the top of the text of the next, so paragraphs
+    /// never overlap. The default is one empty line in the size of the next
+    /// paragraph, so a heading is not followed by an empty line of its own size.
+    /// A negative gap is taken as 0.
+    @discardableResult
+    public func setParagraphGap(_ paragraphGap: Float) -> TextFrame {
+        self.paragraphGap = max(0.0, paragraphGap)
+        self.hasParagraphGap = true
+        return self
+    }
+
+    /// Sets whether a border is drawn around this text frame.
+    @discardableResult
+    public func setBorders(_ border: Bool) -> TextFrame {
+        self.border = border
+        return self
+    }
+
+    /// Sets the border color as a 0xRRGGBB value and draws a border around this text frame. Color.transparent removes the border.
+    @discardableResult
+    public func setBorderColor(_ color: Int32) -> TextFrame {
+        if color == Color.transparent {
+            self.border = false
+            return self
+        }
+        let r = Float(((color >> 16) & 0xff))/255.0
+        let g = Float(((color >>  8) & 0xff))/255.0
+        let b = Float(((color)       & 0xff))/255.0
+        return setBorderColor([r, g, b])
+    }
+
+    /// Sets the border color from an array of red, green and blue values and draws a border around this text frame.
+    @discardableResult
+    public func setBorderColor(_ borderColor: [Float]) -> TextFrame {
+        self.borderColor = borderColor
+        self.border = true
+        return self
+    }
+
+    /// Sets the border width.
+    @discardableResult
+    public func setBorderWidth(_ borderWidth: Float) -> TextFrame {
+        self.borderWidth = borderWidth
+        return self
+    }
+
+    /// Sets the dash pattern of the border, for example "[3] 0".
+    @discardableResult
+    public func setBorderDashPattern(_ borderPattern: String) -> TextFrame {
+        self.borderPattern = borderPattern
+        return self
+    }
+
+    ///
+    /// Returns the y coordinate of the bottom of the text drawn by the last
+    /// drawOn, or measured by it with no page: where what comes under the text
+    /// goes. drawOn returns the bottom of the frame when the frame has a height,
+    /// and this the bottom of the text in it. It is 0 before the first drawOn.
+    ///
+    /// - Returns: the y coordinate of the bottom of the text.
+    ///
+    public func getTextBottom() -> Float {
+        return textBottom
+    }
+
+    /// Returns true if some of the text has not been drawn yet.
+    public func hasMoreText() -> Bool {
+        return paragraphIndex < paragraphs.count
+    }
+
+    ///
+    /// Draws the text on as many new pages as it needs, at the location and
+    /// the width of this frame on each: a whole book, page after page. The
+    /// height of the frame is the height of the text on each page; a frame
+    /// without one reaches down to the margin its location leaves at the top,
+    /// so text at 72, 72 keeps 72 points free at the bottom too. The pages are
+    /// created detached and added to the list, so that a footer or a page
+    /// number can be drawn on each before they are added to the PDF. A frame
+    /// with no text left needs no page.
+    ///
+    /// - Parameter pdf: the PDF document.
+    /// - Parameter pages: the list that receives the new pages.
+    /// - Parameter pageSize: the page size, for example Letter.PORTRAIT.
+    /// - Returns: the x and y coordinates of the bottom right corner of this frame
+    ///   on the last page.
+    ///
+    @discardableResult
+    public func drawOn(_ pdf: PDF, _ pages: inout [Page], _ pageSize: PageSize) -> [Float] {
+        var xy: [Float] = [x + w, y]
+        let height = h
+        if !x.isFinite || !y.isFinite || !w.isFinite || !h.isFinite {
+            // No word is placed at NaN, and pages were made until the memory
+            // ran out (review of 12 October 2026, F4)
+            pdf.fail("The text frame's location and size must be numbers, not NaN or infinite.")
+            return xy
+        }
+        if height <= 0 && pageSize.getHeight() - 2 * y <= 0 {
+            // A frame in the bottom half of the page leaves no height above
+            // the margin, and a frame with no height would draw all of the
+            // text on the first page, past its bottom edge.
+            pdf.fail("The text frame has no height and is in the bottom half of the page: " +
+                    "set its height, or put it higher on the page.")
+            return xy
+        }
+        defer { h = height }
+        while hasMoreText() {
+            let page = Page(pdf, pageSize, false)
+            pages.append(page)
+            if height <= 0 {
+                h = page.height - 2 * y
+            }
+            // Each frame draws at least a line, so the text always flows.
+            xy = drawOn(page)
+        }
+        return xy
+    }
+
+    ///
+    /// Draws the text on the page: all of it when this frame has no height, or as
+    /// much as fits in the height, keeping the rest for the next frame. The first
+    /// line of a frame is drawn even when it does not fit, so the text always
+    /// flows, and a word wider than the frame is broken. With no page nothing is
+    /// drawn, the paragraphs get their coordinates and the text is kept.
+    ///
+    /// - Parameter page: the page to draw on.
+    /// - Returns: the x and y coordinates of the bottom right corner of this frame,
+    ///   or of the text when the frame has no height; getTextBottom() gives the
+    ///   bottom of the text in either case.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        if !x.isFinite || !y.isFinite || !w.isFinite || !h.isFinite {
+            // No word is placed at NaN, and the frame hung (the review of 30
+            // October 2026)
+            if let page = page {
+                page.pdf.fail("The text frame's location and size must be numbers, not NaN or infinite.")
+                paragraphIndex = paragraphs.count   // No more text to ask for
+            }
+            return [x + w, y]
+        }
+        let startParagraph = paragraphIndex
+        let startLine = lineIndex
+        let continued = startLine > 0 || tokens != nil
+        // Measured, not drawn, so the text is kept: held only then, as for
+        // every frame it made the words copied at the first change
+        let startTokens = (page == nil) ? tokens : nil
+        let startToken = tokenIndex
+
+        elementParagraph = nil
+        element = nil
+        continuedParagraph = nil
+        if continued {
+            continuedParagraph = paragraphs[startParagraph]
+        }
+        var bottom = drawParagraphs(page)
+        closeList(page)
+        textBottom = bottom
+        if h > 0.0 {
+            bottom = y + h
+        }
+        if border {
+            let rect = Rect(x, y, w, bottom - y)
+            rect.setBorderColor(borderColor)
+            rect.setBorderWidth(borderWidth)
+            rect.setBorderDashPattern(borderPattern)
+            rect.drawOn(page)
+        }
+
+        if page == nil {
+            paragraphIndex = startParagraph
+            lineIndex = startLine
+            tokens = startTokens
+            tokenIndex = startToken
+        }
+        return [x + w, bottom]
+    }
+
+    // Draws the text that is left, as much of it as fits in the height of the
+    // frame, and returns the bottom of the text drawn: of the last row, also
+    // when the frame breaks inside a text line, whose rows drawn are below the
+    // last whole text line (the review of 28 October 2026).
+    private func drawParagraphs(_ page: Page?) -> Float {
+        xText = x
+        rowOpen = false
+        rowPlaced = false
+        firstRow = false
+        startsParagraph = false
+        joinReserved = false
+        leadingSpace = false
+        rowEndSpace = false
+        row.removeAll()
+        rowBottom = y
+        var bottom = y
+        while paragraphIndex < paragraphs.count {
+            let paragraph = paragraphs[paragraphIndex]
+            while lineIndex < paragraph.lines.count {
+                let textLine = paragraph.lines[lineIndex]
+                if !rowOpen && !openRow(textLine) {
+                    drawRow(page, false)
+                    return max(bottom, rowBottom)
+                }
+                if tokens == nil {
+                    if lineIndex == 0 {
+                        paragraph.x1 = x
+                        paragraph.y1 = yText - textLine.font!.getAscent(textLine.fontSize)
+                        paragraph.xText = xText
+                        paragraph.yText = yText
+                    }
+                    tokens = tokenize(textLine)
+                    tokenIndex = 0
+                }
+                if !drawTokens(page, paragraph, textLine) {
+                    drawRow(page, false)
+                    return max(bottom, rowBottom)
+                }
+                paragraph.x2 = xText
+                paragraph.y2 = yText + textLine.font!.getDescent(textLine.fontSize)
+                bottom = paragraph.y2
+                tokens = nil
+                tokenIndex = 0
+                lineIndex += 1
+                if textLine.lineBreaks > 0 && lineIndex < paragraph.lines.count {
+                    // A hard line break: the row ends here, as the last row
+                    // of a paragraph does, not justified, and the next text
+                    // line starts the next row, or a row lower for each more
+                    // break, as <br><br> leaves an empty row
+                    drawRow(page, true)
+                    xText = x
+                    rowOpen = false
+                    spaceAfterRow(textLine)
+                    if textLine.lineBreaks > 1 {
+                        // Each empty row as far apart as the rows of text,
+                        // with the line spacing: without it an empty row was
+                        // a row at spacing 1, half the others' at spacing 2
+                        nextBaseline += Float(textLine.lineBreaks - 1) * lineAdvance(textLine)
+                    }
+                }
+            }
+            drawRow(page, true)
+            xText = x
+            rowOpen = false
+            if let lastLine = paragraph.lines.last {
+                // The next paragraph starts below the descent of this one, after the gap.
+                nextBaseline = yText + lastLine.font!.getDescent(lastLine.fontSize)
+                startsParagraph = true
+            }
+            paragraphIndex += 1
+            lineIndex = 0
+        }
+        return max(bottom, rowBottom)
+    }
+
+    // Starts a row of text for the text line, below the previous row or at the
+    // top of the frame. Returns false when the row does not fit in the height of
+    // the frame. The first row of a frame always fits, so the text keeps flowing.
+    private func openRow(_ textLine: TextLine) -> Bool {
+        var baseline = y + textLine.font!.getAscent(textLine.fontSize)
+        if rowPlaced {
+            baseline = nextBaseline
+            if startsParagraph {
+                // The gap, one empty line of this text by default, then its ascent.
+                let gap = hasParagraphGap ? paragraphGap :
+                        textLine.getHeight() + 2 * textLine.font!.getLineGap(textLine.fontSize)
+                baseline += gap + textLine.font!.getAscent(textLine.fontSize)
+            }
+        }
+        if h > 0.0 && rowPlaced &&
+                (baseline + textLine.font!.getDescent(textLine.fontSize)) > (y + h) {
+            return false
+        }
+        xText = x
+        yText = baseline
+        rowOpen = true
+        rowLine = textLine
+        if rowPlaced, !startsParagraph, let spacing = spacingLine {
+            rowLine = spacing
+        }
+        firstRow = !rowPlaced
+        rowPlaced = true
+        startsParagraph = false
+        return true
+    }
+
+    // Draws the tokens of the text line that are left, wrapping them at the width
+    // of the frame. Returns false when a row does not fit in the height of the
+    // frame; the tokens that are left stay for the next frame.
+    private func drawTokens(_ page: Page?, _ paragraph: Paragraph, _ textLine: TextLine) -> Bool {
+        if risesOutOfFrame(textLine) {
+            return false
+        }
+        let font = textLine.font!
+        let fallbackFont = textLine.fallbackFont
+        let fontSize = textLine.fontSize
+        var buf = String()
+        var runLength: Float = 0.0
+        // Where the rest of the token starts, in a token broken into rows: the
+        // rest is not copied for each row, which made the time grow with the
+        // square of a word of thousands of rows (800,000 characters took 0.8
+        // seconds where 200,000 took 0.08 in Java); it is copied once, when
+        // the frame is full.
+        var start: String.Index? = nil
+        // Found once: each looks through the text of the text lines, and a
+        // word broken into rows comes here for every row
+        let joinsNextLine = paragraph.joinsPrevious(lineIndex + 1)
+        let spaceMoves = !joinsNextLine && paragraph.spaceMovesToNext(lineIndex)
+        while tokenIndex < tokens!.count {
+            if !rowOpen && !openRow(textLine) {
+                if let start = start {
+                    tokens![tokenIndex] = String(tokens![tokenIndex].unicodeScalars[start...])
+                }
+                return false
+            }
+            let available = (x + w) - xText
+            let whole = tokens![tokenIndex]
+            let from = start ?? whole.unicodeScalars.startIndex
+            var token = TextFrame.window(textLine, whole, from, available)
+            // The last word of a text line that the next text line goes on
+            // from has no space after it, and it is measured with the words
+            // joined to it, so that the row does not break between them.
+            let last = (tokenIndex == tokens!.count - 1)
+            let joinsNext = last && joinsNextLine
+            // The space after the last word goes at the start of the next text
+            // line when that one's space is narrower.
+            let spaceToNext = last && spaceMoves
+            // Whether the token is drawn with the space after it; the text is made
+            // only when the token is drawn whole: made for each row of a word
+            // broken into thousands of rows, it copied the rest of the word each time
+            let withSpace = !(joinsNext || spaceToNext)
+            // The first word of a text line starts with the space the text line
+            // before left to it, unless the word starts a row: when it does not
+            // fit, the row is drawn and the word starts the next one, without it.
+            let leading = leadingSpace && tokenIndex == 0 && xText > x
+            leadingSpace = false
+            if leading {
+                token = Single.space + token
+            }
+            // The first word of a text line joined to the word before it is
+            // in the row already when that word made room for it.
+            let reserved = joinReserved && tokenIndex == 0
+            joinReserved = false
+            // The token is measured without the space that follows it, as in
+            // TextColumn: a row is as wide as the text it shows.
+            let tokenWidth = TextFrame.widthWithin(textLine, token, available - runLength)
+            let joined = joinsNext
+                    ? joinedWidth(paragraph, lineIndex, runLength + tokenWidth, available) : 0.0
+            if reserved || (runLength + tokenWidth + joined) <= available {
+                let text = withSpace ? token + Single.space : token
+                buf.append(text)
+                runLength += TextFrame.width(textLine, text)
+                tokenIndex += 1
+                start = nil
+                joinReserved = joinsNext
+                leadingSpace = spaceToNext
+                continue
+            }
+            if joinsNext && buf.isEmpty && xText == x
+                    && (runLength + tokenWidth) <= available {
+                // With the words joined to it the word is wider than the frame,
+                // so they go on the next row.
+                let text = withSpace ? token + Single.space : token
+                buf.append(text)
+                runLength += TextFrame.width(textLine, text)
+                tokenIndex += 1
+                start = nil
+                continue
+            }
+            if let (head, rest) = TextBlock.softHyphenBreak(token, available - runLength, {
+                TextFrame.width(textLine, $0)
+            }) {
+                // The token is broken at a soft hyphen, the row ending with a
+                // hyphen, as far along as fits (review of 11 October 2026, #21)
+                buf.append(head)
+                let consumed = token.unicodeScalars.count - rest.unicodeScalars.count - (leading ? 1 : 0)
+                start = whole.unicodeScalars.index(from, offsetBy: consumed)
+            } else if buf.isEmpty && xText == x {
+                // The token does not fit in an empty row, so the row takes as much of it as fits.
+                let end = headThatFits(textLine, token)
+                if end == token.unicodeScalars.endIndex
+                        && whole.unicodeScalars.index(from, offsetBy: token.unicodeScalars.count)
+                            == whole.unicodeScalars.endIndex {
+                    // The whole token, as one letter wider than the frame:
+                    // the row takes it as it takes a token that fits, and
+                    // stays open, so that the end of the text line is in
+                    // it, not in an empty row after it. The whole of it, not
+                    // only the window: a letter with more marks than the
+                    // window lost the rest. The words joined to it were not
+                    // measured, so no room is kept for them: they go on the
+                    // next row, broken there as they need, and not past the
+                    // right edge of this one
+                    let text = withSpace ? token + Single.space : token
+                    buf.append(text)
+                    runLength += TextFrame.width(textLine, text)
+                    tokenIndex += 1
+                    start = nil
+                    leadingSpace = spaceToNext
+                    continue
+                }
+                buf.append(String(token.unicodeScalars[..<end]))
+                let consumed = token.unicodeScalars.distance(from: token.unicodeScalars.startIndex, to: end)
+                start = whole.unicodeScalars.index(from, offsetBy: consumed)
+            }
+            if leading && buf.isEmpty {
+                // The word starts the next row without the space before it,
+                // which this row then ends with.
+                rowEndSpace = true
+            }
+            addToRow(paragraph, textLine, buf, false)
+            drawRow(page, false)
+            buf = ""
+            runLength = 0.0
+            xText = x
+            rowOpen = false
+            spaceAfterRow(textLine)
+        }
+        addToRow(paragraph, textLine, buf, true)
+        xText += font.stringWidth(fallbackFont, fontSize, buf)
+        return true
+    }
+
+    // Returns the width of the text joined to the end of the text line at the
+    // index: the first word of each text line that goes on from it, up to the
+    // first of them that has more than one word. It stops as soon as the width
+    // after the width before it is more than the width available, since the
+    // words do not fit however many more there are: the sum is the same for
+    // the caller's test, and a paragraph of many text lines of one word each,
+    // all joined, is measured in linear time and not in quadratic time.
+    private func joinedWidth(
+            _ paragraph: Paragraph, _ index: Int, _ before: Float, _ available: Float) -> Float {
+        var width: Float = 0.0
+        var i = index + 1
+        // The caller knows the first one is joined: the test looks through
+        // the text of the text line, and a word broken into rows comes here
+        // for each
+        while i < paragraph.lines.count && (i == index + 1 || paragraph.joinsPrevious(i)) {
+            let textLine = paragraph.lines[i]
+            let words = textLine.text!.splitOnWhitespace()
+            width += TextFrame.width(textLine, words[0])
+            if words.count > 1 || before + width > available {
+                break
+            }
+            i += 1
+        }
+        return width
+    }
+
+    // Returns the rest of the token from the start, or as much of its start as
+    // is wider than the width available, at least 256 characters and up to twice
+    // as many as a row needs: a row is drawn from the start of the rest, and a
+    // start that does not fit is broken as the whole rest would be. It ends
+    // between characters, as headThatFits cuts them, never inside a letter
+    // with its marks: a letter with more marks than the window was cut.
+    private static func window(
+            _ textLine: TextLine, _ token: String, _ start: String.Index, _ available: Float) -> String {
+        let scalars = token.unicodeScalars
+        var size = 256
+        while true {
+            guard var end = scalars.index(start, offsetBy: size, limitedBy: scalars.endIndex) else {
+                return start == scalars.startIndex ? token : String(scalars[start...])
+            }
+            while end < scalars.endIndex && TextBlock.isLeadingVowel(scalars[scalars.index(before: end)].value) {
+                end = scalars.index(after: end)
+            }
+            while end < scalars.endIndex && TextBlock.staysWithPrevious(scalars[end]) {
+                end = scalars.index(after: end)
+            }
+            if end == scalars.endIndex {
+                return start == scalars.startIndex ? token : String(scalars[start...])
+            }
+            let head = String(scalars[start..<end])
+            if width(textLine, head) > available {
+                return head
+            }
+            size *= 2
+        }
+    }
+
+    // Returns the width of the text when it is no more than the limit, and
+    // otherwise a width that is more than the limit: that of as much of the
+    // start of the text as shows that it does not fit, measured in runs that
+    // double in length. A word wider than the frame is then measured a row's
+    // worth at a time and not whole for every row it is broken into, which
+    // made the time grow with the square of the word: 75 seconds for 100,000
+    // characters.
+    private static func widthWithin(_ textLine: TextLine, _ text: String, _ limit: Float) -> Float {
+        let scalars = text.unicodeScalars
+        var end = scalars.startIndex
+        var runes = 0
+        var count = 64
+        while true {
+            while runes < count && end < scalars.endIndex {
+                end = scalars.index(after: end)
+                runes += 1
+            }
+            let width = end == scalars.endIndex
+                    ? TextFrame.width(textLine, text) : TextFrame.width(textLine, String(scalars[..<end]))
+            if end == scalars.endIndex || width > limit {
+                return width
+            }
+            count *= 2
+        }
+    }
+
+    // Returns the end of the longest start of the token that fits in the width
+    // of the frame, and at least its first character. The token is cut
+    // between its characters as TextBlock cuts a word, never before a
+    // combining mark or a Thai vowel that stays with the letter before it
+    // (review of 11 October 2026, #14).
+    func headThatFits(_ textLine: TextLine, _ token: String) -> String.UnicodeScalarView.Index {
+        let scalars = token.unicodeScalars
+        var end = TextFrame.nextCharacterBreakIn(scalars, scalars.startIndex)
+        while end < scalars.endIndex {
+            let next = TextFrame.nextCharacterBreakIn(scalars, end)
+            if textLine.font!.stringWidth(textLine.fallbackFont, textLine.fontSize, String(scalars[..<next])) > w {
+                break
+            }
+            end = next
+        }
+        return end
+    }
+
+    // Returns the index of the next place after the one at the start where
+    // the text may be cut between its characters, as nextCharacterBreak finds
+    // it in an array of scalars: read as far as it, so that a long word is cut
+    // in time proportional to its length.
+    private static func nextCharacterBreakIn(
+            _ scalars: String.UnicodeScalarView,
+            _ start: String.UnicodeScalarView.Index) -> String.UnicodeScalarView.Index {
+        var ch = scalars[start]
+        var i = scalars.index(after: start)
+        while TextBlock.isLeadingVowel(ch.value) && i < scalars.endIndex {
+            ch = scalars[i]
+            i = scalars.index(after: i)
+        }
+        while i < scalars.endIndex && TextBlock.staysWithPrevious(scalars[i]) {
+            i = scalars.index(after: i)
+        }
+        return i
+    }
+
+    // Adds the string to the row, at the current text position.
+    // Returns true when the text line, which goes on the open row, is larger
+    // than the row was placed for, and lowerRow would then move the row past
+    // the height of the frame, where nothing would hold it back. The text line
+    // stays for the next frame. The first row of a frame always fits, as
+    // openRow says.
+    private func risesOutOfFrame(_ textLine: TextLine) -> Bool {
+        guard let rowLine = rowLine, h > 0.0, !firstRow, rowOpen, textLine.fontSize > rowLine.fontSize else {
+            return false
+        }
+        let rise = textLine.font!.getAscent(textLine.fontSize) - rowLine.font!.getAscent(rowLine.fontSize)
+        return yText + rise + textLine.font!.getDescent(textLine.fontSize) > y + h
+    }
+
+    private func addToRow(_ paragraph: Paragraph, _ textLine: TextLine, _ str: String, _ endsTextLine: Bool) {
+        let first = row.isEmpty && lineIndex == 0 && xText == paragraph.xText
+                && yText == paragraph.yText
+        row.append(RowPart(textLine: textLine, text: str, x: xText, paragraph: paragraph,
+                startsParagraph: first, endsTextLine: endsTextLine))
+    }
+
+    // Draws the parts of the row, with every setting of their text lines, including
+    // the vertical offset and the link, as TextColumn does. A paragraph aligned to
+    // the right or to the center moves the row, and a justified one widens the
+    // spaces of every row but its last.
+    // Makes the text that is drawn next belong to the structure element of the
+    // paragraph. A paragraph is one element, however many rows and words it is
+    // drawn in.
+    private func beginParagraphElement(
+            _ page: Page?, _ paragraph: Paragraph?, _ x: Float, _ y: Float) {
+        guard let page = page, let paragraph = paragraph else {
+            return
+        }
+        if paragraph !== elementParagraph {
+            elementParagraph = paragraph
+            closeItem(page)
+            // A paragraph that an earlier frame began goes on here: its label
+            // was drawn where it began, and its heading noted there.
+            let continued = paragraph === continuedParagraph
+            if let label = paragraph.listLabel {
+                // The label of the item is drawn where the item begins, so
+                // that a reader reads it before the text of the item.
+                if !inList {
+                    page.beginStructElement(StructElem.L)
+                    inList = true
+                }
+                page.beginStructElement(StructElem.LI)
+                if !continued {
+                    label.setStructureType(StructElem.LBL)
+                    label.setLocation(x - paragraph.listLabelIndent, y)
+                    drawLine(label, nil, page)
+                }
+                page.beginStructElement(StructElem.LBODY)
+                inItem = true
+            } else {
+                closeList(page)
+            }
+            element = page.addStructElement(page.structParent, paragraph.structureType, nil)
+            if element != nil, !continued, let first = paragraph.lines.first {
+                page.noteHeading(paragraph.structureType, paragraph.text(), x, y - first.fontSize)
+            }
+        }
+        if element == nil {
+            return
+        }
+        savedParent = page.structParent
+        savedMcidParent = page.mcidParent
+        page.structParent = element
+        page.mcidParent = element
+    }
+
+    private func endParagraphElement(_ page: Page?) {
+        guard let page = page, element != nil else {
+            return
+        }
+        page.structParent = savedParent
+        page.mcidParent = savedMcidParent
+    }
+
+    // Ends the item of the list that is open, if there is one.
+    private func closeItem(_ page: Page) {
+        if inItem {
+            page.endStructElement()     // The LBody
+            page.endStructElement()     // The LI
+            inItem = false
+        }
+    }
+
+    // Ends the list that is open, if there is one.
+    private func closeList(_ page: Page?) {
+        guard let page = page else {
+            return
+        }
+        closeItem(page)
+        if inList {
+            page.endStructElement()     // The L
+            inList = false
+        }
+    }
+
+    // Sets the baseline of the next row in the paragraph: below the row drawn
+    // last by its tallest text, as a row is as tall as its tallest text, or by
+    // the text line when the row had no text.
+    private func spaceAfterRow(_ textLine: TextLine) {
+        let tallest = rowTallest ?? textLine
+        nextBaseline = yText + lineAdvance(tallest)
+        spacingLine = tallest
+    }
+
+    // How far the baseline of the next row is below the text line's: its height
+    // and its font's line gap, times the line spacing.
+    private func lineAdvance(_ textLine: TextLine) -> Float {
+        return (textLine.getHeight() + textLine.font!.getLineGap(textLine.fontSize)) * lineSpacing
+    }
+
+    // Moves the row down so that its tallest text is below the row before it,
+    // or the top of the frame: the row was placed for its first text line, and
+    // a larger word after that one rose out of it. Fonts of one size stay on
+    // the baseline they have, or the rows of a paragraph with a word in another
+    // font would not be evenly apart.
+    private func lowerRow() {
+        guard let rowLine = rowLine else {
+            return
+        }
+        let ascent = rowLine.font!.getAscent(rowLine.fontSize)
+        var rise: Float = 0.0
+        for part in row where !part.text.isEmpty && part.textLine.fontSize > rowLine.fontSize {
+            rise = max(rise, part.textLine.font!.getAscent(part.textLine.fontSize) - ascent)
+        }
+        if rise == 0.0 {
+            return
+        }
+        yText += rise
+        for part in row {
+            if part.startsParagraph {
+                part.paragraph.yText += rise
+            }
+            if part.endsTextLine {
+                part.paragraph.y2 = yText + part.textLine.font!.getDescent(part.textLine.fontSize)
+            }
+        }
+    }
+
+    private func drawRow(_ page: Page?, _ lastRowOfParagraph: Bool) {
+        joinReserved = false
+        leadingSpace = false
+        let endSpace = rowEndSpace
+        rowEndSpace = false
+        if row.isEmpty {
+            return
+        }
+        lowerRow()
+        rowTallest = nil
+        for part in row where !part.text.isEmpty {
+            if let tallest = rowTallest, lineAdvance(part.textLine) <= lineAdvance(tallest) {
+                continue
+            }
+            rowTallest = part.textLine
+        }
+        for part in row where !part.text.isEmpty {
+            rowBottom = max(rowBottom, yText + part.textLine.font!.getDescent(part.textLine.fontSize))
+        }
+        let paragraph = row[0].paragraph
+        let alignment = paragraph.explicitAlignment ? paragraph.alignment : Alignment.LEFT
+        let last = row[row.count - 1]
+        let rowWidth = last.x + TextFrame.width(last.textLine, TextFrame.trimTrailingSpaces(last.text)) - x
+
+        if alignment == Alignment.JUSTIFY && !lastRowOfParagraph {
+            drawJustifiedRow(page, endSpace)
+        } else {
+            var shift: Float = 0.0
+            if alignment == Alignment.RIGHT {
+                shift = w - rowWidth
+            } else if alignment == Alignment.CENTER {
+                shift = (w - rowWidth) / 2.0
+            }
+            // A row wider than the frame, as one character wider than a narrow
+            // column, starts at the frame's left and runs past its right, as a word
+            // processor has it: centered or right-aligned it ran out to the left, past
+            // the frame's edge (PDFjet Write's fuzz, 9 November 2026)
+            shift = max(0.0, shift)
+            let lastWithText = row.lastIndex(where: { !$0.text.isEmpty })
+            for (i, part) in row.enumerated() {
+                beginParagraphElement(page, part.paragraph, part.x + shift, yText)
+                if endSpace && i == lastWithText && part.text.unicodeScalars.last != " " {
+                    // The space of the word break, drawn after the last word of
+                    // the row, and left out of its underline
+                    let withSpace = part.textLine.copyWithText(part.text + Single.space)
+                    withSpace.isLastToken = true
+                    drawLine(withSpace.setLocation(part.x + shift, yText), part.textLine, page)
+                } else {
+                    let line = part.textLine.copyWithText(part.text)
+                    if lastRowOfParagraph && i == lastWithText && part.text.unicodeScalars.last == " " {
+                        // The last word of the paragraph, with the space that
+                        // every word has after it, left out of its underline
+                        // too: a link that ended a paragraph was underlined one
+                        // space too far (14 October 2026)
+                        line.isLastToken = true
+                    }
+                    drawLine(line.setLocation(part.x + shift, yText), part.textLine, page)
+                }
+                endParagraphElement(page)
+                if part.startsParagraph {
+                    part.paragraph.xText += shift
+                }
+                if part.endsTextLine {
+                    part.paragraph.x2 = part.x + TextFrame.width(part.textLine, part.text) + shift
+                }
+            }
+        }
+        row.removeAll()
+    }
+
+    // Draws the words of the row one by one, with the width left in the row shared
+    // out among the spaces between them. The width of the row is measured as its
+    // words are placed, a word and a space at a time: measured whole, it has the
+    // kerning between a space and the letters beside it, which the words placed
+    // one by one do not, and a row in a font that kerns them ran past the right
+    // edge (the review of 28 October 2026).
+    private func drawJustifiedRow(_ page: Page?, _ endSpace: Bool) {
+        let texts = row.map { Array($0.text.unicodeScalars) }
+        var spaces = 0
+        for i in 0..<texts.count {
+            for j in 0..<texts[i].count where texts[i][j] == " " && hasWordAfter(texts, i, j + 1) {
+                spaces += 1
+            }
+        }
+        let dx: Float = (spaces > 0) ?
+                ((x + w) - placeWords(page, texts, 0.0, endSpace, false)) / Float(spaces) : 0.0
+        placeWords(page, texts, dx, endSpace, true)
+    }
+
+    // Places the words of the row from the left edge of the frame, dx further
+    // apart at each space with a word after it, and draws them when draw is
+    // true. Returns where the last word ends.
+    @discardableResult
+    private func placeWords(_ page: Page?, _ texts: [[Unicode.Scalar]], _ dx: Float,
+            _ endSpace: Bool, _ draw: Bool) -> Float {
+        var xWord = x
+        var wordEnd = x
+        for i in 0..<row.count {
+            let part = row[i]
+            let text = texts[i]
+            var start = 0
+            while start < text.count {
+                var end = start
+                while end < text.count && text[end] != " " {
+                    end += 1
+                }
+                if end > start && !draw {
+                    xWord += TextFrame.width(part.textLine, String(String.UnicodeScalarView(text[start..<end])))
+                    wordEnd = xWord
+                } else if end > start {
+                    let word = String(String.UnicodeScalarView(text[start..<end]))
+                    beginParagraphElement(page, part.paragraph, xWord, yText)
+                    // The space after the word may be the first character of
+                    // the next part, where Paragraph.spaceMovesToNext put it,
+                    // or have gone with the word to the next row.
+                    var spaceAfter = end < text.count
+                    if !spaceAfter {
+                        if let next = texts[(i + 1)...].first(where: { !$0.isEmpty }) {
+                            spaceAfter = next[0] == " "
+                        } else {
+                            spaceAfter = endSpace
+                        }
+                    }
+                    if spaceAfter {
+                        // The word with the space after it, so that a screen
+                        // reader and a text extractor see the word break; the
+                        // stretch of the row places the next word, so nothing
+                        // moves, and the underline stops at the word, as the
+                        // last token of a line in a TextColumn does.
+                        let withSpace = part.textLine.copyWithText(word + Single.space)
+                        withSpace.isLastToken = true
+                        drawLine(withSpace.setLocation(xWord, yText), part.textLine, page)
+                    } else {
+                        drawLine(part.textLine.copyWithText(word).setLocation(xWord, yText), part.textLine, page)
+                    }
+                    endParagraphElement(page)
+                    xWord += TextFrame.width(part.textLine, word)
+                    wordEnd = xWord
+                }
+                if end < text.count {
+                    xWord += TextFrame.width(part.textLine, Single.space)
+                    if hasWordAfter(texts, i, end + 1) {
+                        xWord += dx
+                    }
+                }
+                start = end + 1
+            }
+            if draw && part.endsTextLine {
+                part.paragraph.x2 = xWord
+            }
+        }
+        return wordEnd
+    }
+
+    // Returns true when a word follows this position of the row.
+    private func hasWordAfter(_ texts: [[Unicode.Scalar]], _ partIndex: Int, _ charIndex: Int) -> Bool {
+        for i in partIndex..<texts.count {
+            var j = (i == partIndex) ? charIndex : 0
+            while j < texts[i].count {
+                if texts[i][j] != " " {
+                    return true
+                }
+                j += 1
+            }
+        }
+        return false
+    }
+
+    private static func trimTrailingSpaces(_ text: String) -> String {
+        var scalars = Array(text.unicodeScalars)
+        while let last = scalars.last, last == " " {
+            scalars.removeLast()
+        }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    private static func width(_ textLine: TextLine, _ text: String) -> Float {
+        return textLine.font!.stringWidth(textLine.fallbackFont, textLine.fontSize, text)
+    }
+
+    // Splits the text of the text line into words, or, for CJK text, which has no
+    // spaces between its words, into runs of characters that fit in the width.
+    // Splits the text of code into words at the last space of each run, which
+    // the frame draws after a word, as it does the space between two words. The
+    // other spaces of the run stay with the word before them, or the word after
+    // them at the start of the text: `a  b` is "a " and "b".
+    static func splitKeepingSpaces(_ text: String) -> [String] {
+        let units = Array(text.utf8)
+        var list = [String]()
+        var start = 0
+        for i in units.indices where units[i] == 0x20 && i > start && (i + 1 == units.count || units[i + 1] != 0x20) {
+            list.append(String(decoding: units[start..<i], as: UTF8.self))
+            start = i + 1
+        }
+        if start < units.count {
+            list.append(String(decoding: units[start...], as: UTF8.self))
+        }
+        return list
+    }
+
+    private func tokenize(_ textLine: TextLine) -> [String] {
+        if !textLine.text!.isCJK() {
+            if textLine.keepSpaces && textLine.text!.contains("  ") {
+                return TextFrame.splitKeepingSpaces(textLine.text!)
+            }
+            return textLine.text!.splitOnWhitespace()
+        }
+        var list = [String]()
+        var buf = String()
+        for scalar in textLine.text!.unicodeScalars {
+            if textLine.font!.stringWidth(textLine.fallbackFont, textLine.fontSize, buf + String(scalar)) <= w {
+                buf.unicodeScalars.append(scalar)
+            } else {
+                let full = Array(buf.unicodeScalars)
+                let end = cjkLineEnd(full, scalar)
+                if end > 0 {
+                    list.append(String(String.UnicodeScalarView(full[0..<end])))
+                }
+                buf = String(String.UnicodeScalarView(full[end...]))
+                buf.unicodeScalars.append(scalar)
+            }
+        }
+        if !buf.isEmpty {
+            list.append(buf)
+        }
+        return list
+    }
+}   // End of TextFrame.swift

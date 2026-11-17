@@ -1,0 +1,272 @@
+/**
+ * Path.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Used to create path objects.
+/// The path objects may consist of lines, splines or both.
+///
+/// Please see Example_34 and Example_40.
+///
+public class Path : Drawable {
+    private var color: [Float] = [0.0, 0.0, 0.0]
+    private var width: Float = 0.5
+    private var pattern: String = "[] 0"
+    private var fillShape = false
+    private var closed = false
+
+    private var points = [Point]()
+
+    private var xBox: Float = 0.0
+    private var yBox: Float = 0.0
+
+    private var lineCapStyle = CapStyle.BUTT
+    private var lineJoinStyle = JoinStyle.MITER
+
+    ///
+    /// The default constructor.
+    ///
+    public init() {
+    }
+
+    ///
+    /// Adds a point to this path.
+    ///
+    /// - Parameter point: the point to add.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func add(_ point: Point) -> Path {
+        points.append(point)
+        return self
+    }
+
+    ///
+    /// Sets the line dash pattern for this path.
+    ///
+    /// The line dash pattern controls the pattern of dashes and gaps used to stroke paths.
+    /// It is specified by a dash array and a dash phase.
+    /// The elements of the dash array are positive numbers that specify the lengths of
+    /// alternating dashes and gaps.
+    /// The dash phase specifies the distance into the dash pattern at which to start the dash.
+    /// The elements of both the dash array and the dash phase are expressed in user space units.
+    /// Examples of line dash patterns:
+    ///
+    /// ```
+    ///     "[Array] Phase"     Appearance          Description
+    ///     _______________     _________________   ____________________________________
+    ///
+    ///     "[] 0"              -----------------   Solid line
+    ///     "[3] 0"             ---   ---   ---     3 units on, 3 units off, ...
+    ///     "[2] 1"             -  --  --  --  --   1 on, 2 off, 2 on, 2 off, ...
+    ///     "[2 1] 0"           -- -- -- -- -- --   2 on, 1 off, 2 on, 1 off, ...
+    ///     "[3 5] 6"             ---     ---       2 off, 3 on, 5 off, 3 on, 5 off, ...
+    ///     "[2 3] 11"          -   --   --   --    1 on, 3 off, 2 on, 3 off, 2 on, ...
+    /// ```
+    ///
+    /// - Parameter pattern: the line dash pattern.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setStrokeDashPattern(_ pattern: String) -> Path {
+        self.pattern = pattern
+        return self
+    }
+
+    ///
+    /// Sets the stroke width that will be used to draw the lines and splines that are part of this path,
+    /// 0.5 points unless set, as every line PDFjet draws by default (9.1.9); 0 is the thinnest
+    /// line of the device, a pixel on a screen, faint or gone in print.
+    ///
+    /// - Parameter width: the stroke width.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setStrokeWidth(_ width: Float) -> Path {
+        self.width = width
+        return self
+    }
+
+    ///
+    /// Sets the stroke color that will be used to draw this path.
+    /// Color.transparent leaves it unchanged.
+    ///
+    /// - Parameter color: the color specified as an integer.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setStrokeColor(_ color: Int32) -> Path {
+        if color == Color.transparent {
+            return self
+        }
+        self.color = Util.toRGB(color)
+        return self
+    }
+
+    /// Sets the stroke color of this path from an array of red, green and blue values between 0.0 and 1.0.
+    @discardableResult
+    public func setStrokeColor(_ rgbColor: [Float]) -> Path {
+        self.color = rgbColor
+        return self
+    }
+
+    ///
+    /// Sets whether a line is drawn from the last point of this path back to the first.
+    ///
+    /// - Parameter closed: true to close the path.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setClosed(_ closed: Bool) -> Path {
+        self.closed = closed
+        return self
+    }
+
+    ///
+    /// Sets whether the shape of this path is filled with the stroke color instead of stroked.
+    ///
+    /// - Parameter fillShape: true to fill the shape.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setFillShape(_ fillShape: Bool) -> Path {
+        self.fillShape = fillShape
+        return self
+    }
+
+    ///
+    /// Sets the line cap style.
+    ///
+    /// - Parameter style: the cap style of this path.
+    /// Supported values: CapStyle.BUTT, CapStyle.ROUND and CapStyle.PROJECTING_SQUARE
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setLineCapStyle(_ style: CapStyle) -> Path {
+        self.lineCapStyle = style
+        return self
+    }
+
+    ///
+    /// Returns the line cap style for this path.
+    ///
+    /// - Returns: the line cap style for this path.
+    ///
+    public func getLineCapStyle() -> CapStyle {
+        return self.lineCapStyle
+    }
+
+    ///
+    /// Sets the line join style.
+    ///
+    /// - Parameter style: the line join style code. Supported values: JoinStyle.MITER, JoinStyle.ROUND and JoinStyle.BEVEL
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setLineJoinStyle(_ style: JoinStyle) -> Path {
+        self.lineJoinStyle = style
+        return self
+    }
+
+    ///
+    /// Returns the line join style.
+    ///
+    /// - Returns: the line join style.
+    ///
+    public func getLineJoinStyle() -> JoinStyle {
+        return self.lineJoinStyle
+    }
+
+    ///
+    /// Sets the location of this path: its points are drawn offset by x and y.
+    ///
+    /// - Parameter x: the x offset.
+    /// - Parameter y: the y offset.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        xBox = x
+        yBox = y
+        return self
+    }
+
+    ///
+    /// Scales the points of this path by the specified factor.
+    ///
+    /// - Parameter factor: the factor used to scale the path.
+    /// - Returns: this Path object.
+    ///
+    @discardableResult
+    public func scaleBy(_ factor: Float) -> Path {
+        // A point the path lists more than once is scaled once: (10, 10)
+        // listed twice became (40, 40) (review of 12 October 2026, F9)
+        var scaled = Set<ObjectIdentifier>()
+        for point in points where scaled.insert(ObjectIdentifier(point)).inserted {
+            point.x *= factor
+            point.y *= factor
+        }
+        return self
+    }
+
+    ///
+    /// Draws this path on the specified page. If fillShape is set the shape is
+    /// filled with the stroke color; otherwise the path is stroked with its
+    /// width, dash pattern, cap style and join style.
+    ///
+    /// - Parameter page: the page to draw this path on.
+    /// - Returns: x and y coordinates of the bottom right corner of this component.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        if page == nil {    // Measured, not drawn
+            var xMax: Float = 0.0
+            var yMax: Float = 0.0
+            for point in points {
+                xMax = max(xMax, point.x + xBox)
+                yMax = max(yMax, point.y + yBox)
+            }
+            return [xMax, yMax]
+        }
+        // The points are drawn offset by the location, as copies: the path
+        // keeps its own points, which can be in it more than once.
+        var offset = [Point]()
+        offset.reserveCapacity(points.count)
+        var xMax: Float = 0.0
+        var yMax: Float = 0.0
+        for point in points {
+            let copy = Point(point.x + xBox, point.y + yBox, point.controlPoint)
+            offset.append(copy)
+            xMax = max(xMax, copy.x)
+            yMax = max(yMax, copy.y)
+        }
+
+        // A path carries no text, so it is decorative content. Its pen is its
+        // own, and the page is left with the one it had.
+        page!.addArtifactBMC()
+        page!.saveGraphicsState()
+        if fillShape {
+            page!.setBrushColor(self.color)
+            page!.drawPath(offset, PathOperator.FILL)
+        } else {
+            page!.setPenWidth(self.width)
+            page!.setPenColor(self.color)
+            page!.setStrokeDashPattern(self.pattern)
+            page!.setLineCapStyle(self.lineCapStyle)
+            page!.setLineJoinStyle(self.lineJoinStyle)
+            if closed {
+                page!.drawPath(offset, PathOperator.CLOSE_AND_STROKE)
+            } else {
+                page!.drawPath(offset, PathOperator.STROKE)
+            }
+        }
+        page!.restoreGraphicsState()
+        page!.addEMC()
+
+        return [xMax, yMax]
+    }
+}   // End of Path.swift

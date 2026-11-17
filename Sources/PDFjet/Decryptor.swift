@@ -1,0 +1,591 @@
+/**
+ * Decryptor.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
+///
+/// The error when an encrypted PDF cannot be decrypted.
+///
+enum DecryptorError: Error, CustomStringConvertible {
+    case notSupported(String)
+
+    var description: String {
+        switch self {
+        case .notSupported(let message):
+            return message
+        }
+    }
+}
+
+///
+/// Decrypts the strings and streams of a PDF that is encrypted with the
+/// standard security handler, given its user or owner password, or no
+/// password for a PDF that opens without one but restricts printing or
+/// copying. RC4 and AES-128 (revisions 2 to 4) and AES-256 (revisions 5 and 6)
+/// are supported.
+///
+final class Decryptor {
+    private static let passwordPadding: [UInt8] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41,
+        0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+        0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,
+        0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+    ]
+
+    // The methods of the crypt filters.
+    enum Method {
+        case identity
+        case rc4
+        case aes128
+        case aes256
+    }
+
+    /// The object number of the encryption dictionary.
+    let objNumber: Int
+    private let key: [UInt8]
+    private let streamMethod: Method
+    private let stringMethod: Method
+    private let encryptMetadata: Bool
+
+    ///
+    /// Returns the decryptor of the PDF, or nil when it is not encrypted. The
+    /// trailer is the cross-reference stream object when there is no trailer.
+    ///
+    static func getDecryptor(_ trailer: PDFobj?, _ objects: [PDFobj], _ password: String) throws -> Decryptor? {
+        guard let trailer = trailer,
+                let i = trailer.dict.firstIndex(of: "/Encrypt"),
+                i + 1 < trailer.dict.count else {
+            return nil
+        }
+        var found: PDFobj?
+        if trailer.dict[i + 1] == "<<" {
+            // The dictionary is in the trailer, so there is no object to skip.
+            let inline = PDFobj()
+            inline.number = -1
+            var level = 0
+            for j in (i + 1)..<trailer.dict.count {
+                let token = trailer.dict[j]
+                inline.dict.append(token)
+                if token == "<<" {
+                    level += 1
+                } else if token == ">>" {
+                    level -= 1
+                    if level == 0 {
+                        break
+                    }
+                }
+            }
+            found = inline
+        } else {
+            for obj in objects where String(obj.number) == trailer.dict[i + 1] {
+                found = obj         // The last one is the newest.
+            }
+        }
+        guard let encrypt = found else {
+            throw DecryptorError.notSupported("The encryption dictionary of the PDF was not found.")
+        }
+        var id = [UInt8]()
+        if let k = trailer.dict.firstIndex(of: "/ID"), k + 2 < trailer.dict.count,
+                trailer.dict[k + 1] == "[" {
+            id = toBytes(trailer.dict[k + 2])
+        }
+        return try Decryptor(encrypt, objects, id, password)
+    }
+
+    init(_ encrypt: PDFobj, _ objects: [PDFobj], _ id: [UInt8], _ password: String) throws {
+        if encrypt.getValue("/Filter") != "/Standard" {
+            throw DecryptorError.notSupported(
+                    "The security handler of the PDF is not supported: " + encrypt.getValue("/Filter"))
+        }
+        let v = Decryptor.getInt(encrypt, "/V")
+        let r = Decryptor.getInt(encrypt, "/R")
+        let encryptMetadata = encrypt.getValue("/EncryptMetadata") != "false"
+        if v == 1 || v == 2 {
+            self.streamMethod = .rc4
+            self.stringMethod = .rc4
+        } else if v == 4 || v == 5 {
+            self.streamMethod = Decryptor.getCryptMethod(encrypt, encrypt.getValue("/StmF"), objects)
+            self.stringMethod = Decryptor.getCryptMethod(encrypt, encrypt.getValue("/StrF"), objects)
+        } else {
+            throw DecryptorError.notSupported("The encryption of the PDF is not supported: /V \(v)")
+        }
+        let u = Decryptor.toBytes(encrypt.getValue("/U"))
+        let o = Decryptor.toBytes(encrypt.getValue("/O"))
+        if r == 5 || r == 6 {
+            let candidates = Decryptor.aes256Passwords(password)
+            var key: [UInt8]?
+            for (i, candidate) in candidates.enumerated() {
+                do {
+                    key = try Decryptor.getKey(r, candidate, u, o,
+                            Decryptor.toBytes(encrypt.getValue("/UE")),
+                            Decryptor.toBytes(encrypt.getValue("/OE")))
+                    break
+                } catch where i < candidates.count - 1 {
+                    continue
+                }
+            }
+            self.key = key!
+        } else if r >= 2 && r <= 4 {
+            var length = (v == 1 || r == 2) ? 5 : (v == 4) ? 16 : Decryptor.getInt(encrypt, "/Length") / 8
+            length = max(5, min(length, 16))
+            // AES-128 takes an object key of 16 bytes, which a key of fewer than
+            // 11 bytes does not make, and AES-256 a key of 32 bytes, which only
+            // revisions 5 and 6 have.
+            for method in [streamMethod, stringMethod] {
+                if (method == .aes128 && length < 11) || method == .aes256 {
+                    throw DecryptorError.notSupported(
+                            "The encryption of the PDF is not valid: /R \(r) with a key of \(8 * length) bits for AES")
+                }
+            }
+            self.key = try Decryptor.getKey(r, length,
+                    Decryptor.latin1Password(password), o, u,
+                    Decryptor.getInt(encrypt, "/P"), id, encryptMetadata)
+        } else {
+            throw DecryptorError.notSupported("The encryption of the PDF is not supported: /R \(r)")
+        }
+        self.objNumber = encrypt.number
+        self.encryptMetadata = encryptMetadata
+    }
+
+    // Returns the method of the crypt filter with the name in the /CF
+    // dictionary. The /CF dictionary and each filter in it can be an object of
+    // its own, as pdf.js tests it in issue7665: the streams and the strings of
+    // that PDF were left encrypted.
+    static func getCryptMethod(_ encrypt: PDFobj, _ name: String, _ objects: [PDFobj]) -> Method {
+        let filters = cryptDictValue(PDF.valueOf(encrypt), "/CF", objects)
+        let filter = cryptDictValue(filters, name, objects)
+        let method = cryptDictValue(filter, "/CFM", objects)
+        if method.count == 1 {
+            switch method[0] {
+            case "/V2":
+                return .rc4
+            case "/AESV2":
+                return .aes128
+            case "/AESV3":
+                return .aes256
+            default:
+                break
+            }
+        }
+        return .identity            // Like /Identity, the default.
+    }
+
+    // Returns the value of the entry of the dictionary, or of the object it
+    // refers to, or an empty array. The objects are the ones the PDF lists,
+    // not yet sorted by their number, and the last one of a number is the
+    // newest.
+    private static func cryptDictValue(_ dict: [String], _ key: String, _ objects: [PDFobj]) -> [String] {
+        let i = PDF.entryIndex(dict, key)
+        if i == -1 {
+            return []
+        }
+        let value = Array(dict[(i + 1)..<PDF.valueEnd(dict, i + 1)])
+        if !PDF.isReference(value, 0) {
+            return value
+        }
+        var referred: PDFobj?
+        for obj in objects where String(obj.number) == value[0] {
+            referred = obj
+        }
+        guard let obj = referred else {
+            return []
+        }
+        return PDF.valueOf(obj)
+    }
+
+    // Returns the bytes to try for the password of revisions 5 and 6: those
+    // of the password prepared with SASLprep, as PDF 2.0 asks, and, when they
+    // differ, its own UTF-8, at most 127 bytes of either, which PDFjet before
+    // 9.0.5 and other writers took (review of 11 October 2026, #27).
+    static func aes256Passwords(_ password: String) -> [[UInt8]] {
+        let raw = SASLprep.truncate(password)
+        guard let prepared = try? SASLprep.passwordBytes(password), prepared != raw else {
+            return [raw]
+        }
+        return [prepared, raw]
+    }
+
+    // Returns the password in PDFDocEncoding, which is Latin-1 for the
+    // characters a password is likely to have, at most 32 bytes of it, which
+    // is the password of revisions 2 to 4.
+    private static func latin1Password(_ password: String) -> [UInt8] {
+        return password.unicodeScalars.prefix(32).map { $0.value < 256 ? UInt8($0.value) : UInt8(ascii: "?") }
+    }
+
+    // The error for a password that does not open the PDF.
+    private static func passwordError(_ password: [UInt8]) -> DecryptorError {
+        return DecryptorError.notSupported(password.isEmpty ?
+                "The PDF needs a password." : "The password of the PDF is not correct.")
+    }
+
+    // Computes the key of revisions 2 to 4 from the password with algorithm 2
+    // of ISO 32000-2, and checks it against /U with algorithms 4 and 5. When
+    // the password is not the user password, it is tried as the owner
+    // password, which algorithm 7 turns into the user password with /O.
+    private static func getKey(
+            _ r: Int,
+            _ length: Int,
+            _ password: [UInt8],
+            _ o: [UInt8],
+            _ u: [UInt8],
+            _ p: Int,
+            _ id: [UInt8],
+            _ encryptMetadata: Bool) throws -> [UInt8] {
+        let padded = pad(password)
+        var key = computeKey(r, length, padded, o, p, id, encryptMetadata)
+        if isUserKey(r, key, u, id) {
+            return key
+        }
+        var hash = Cryptography.md5(padded)
+        if r >= 3 {
+            for _ in 0..<50 {
+                hash = Cryptography.md5(hash)
+            }
+        }
+        let ownerKey = Array(hash[0..<length])
+        var userPassword = Array(o.prefix(32)) + [UInt8](repeating: 0, count: max(0, 32 - o.count))
+        if r == 2 {
+            userPassword = Cryptography.rc4(ownerKey, userPassword)
+        } else {
+            for i in stride(from: 19, through: 0, by: -1) {
+                userPassword = Cryptography.rc4(ownerKey.map { $0 ^ UInt8(i) }, userPassword)
+            }
+        }
+        key = computeKey(r, length, userPassword, o, p, id, encryptMetadata)
+        if isUserKey(r, key, u, id) {
+            return key
+        }
+        throw passwordError(password)
+    }
+
+    // Returns the password padded or cut to 32 bytes, step a of algorithm 2.
+    private static func pad(_ password: [UInt8]) -> [UInt8] {
+        let n = min(password.count, 32)
+        return Array(password[0..<n]) + Array(passwordPadding[0..<(32 - n)])
+    }
+
+    // Steps b to h of algorithm 2: the key from the padded password.
+    private static func computeKey(
+            _ r: Int, _ length: Int, _ padded: [UInt8], _ o: [UInt8], _ p: Int, _ id: [UInt8],
+            _ encryptMetadata: Bool) -> [UInt8] {
+        var input = padded + o
+        input += [UInt8(truncatingIfNeeded: p), UInt8(truncatingIfNeeded: p >> 8),
+                UInt8(truncatingIfNeeded: p >> 16), UInt8(truncatingIfNeeded: p >> 24)]
+        input += id
+        if r >= 4 && !encryptMetadata {
+            input += [0xFF, 0xFF, 0xFF, 0xFF]
+        }
+        var hash = Cryptography.md5(input)
+        if r >= 3 {
+            for _ in 0..<50 {
+                hash = Cryptography.md5(Array(hash[0..<length]))
+            }
+        }
+        return Array(hash[0..<length])
+    }
+
+    // Algorithms 4 and 5: whether the key computed from a password is the
+    // user key, which /U holds encrypted.
+    private static func isUserKey(
+            _ r: Int, _ key: [UInt8], _ u: [UInt8], _ id: [UInt8]) -> Bool {
+        var check: [UInt8]
+        let n: Int
+        if r == 2 {
+            check = Cryptography.rc4(key, passwordPadding)
+            n = 32
+        } else {
+            check = Cryptography.rc4(key, Cryptography.md5(passwordPadding + id))
+            for i in 1...19 {
+                check = Cryptography.rc4(key.map { $0 ^ UInt8(i) }, check)
+            }
+            n = 16
+        }
+        return u.count >= n && check[0..<n] == u[0..<n]
+    }
+
+    // Algorithms 2.A, 11 and 12 of ISO 32000-2 get the key of revisions 5 and
+    // 6 from /UE with the user password, or from /OE with the owner password.
+    private static func getKey(
+            _ r: Int, _ password: [UInt8], _ u: [UInt8], _ o: [UInt8], _ ue: [UInt8], _ oe: [UInt8])
+            throws -> [UInt8] {
+        if u.count < 48 || ue.count < 32 {
+            throw DecryptorError.notSupported("The encryption dictionary of the PDF is not valid.")
+        }
+        let zeroIV = [UInt8](repeating: 0, count: 16)
+        if getHash(r, password, Array(u[32..<40]), []) == Array(u[0..<32]) {
+            return Cryptography.aesDecryptCBC(
+                    Array(ue[0..<32]), getHash(r, password, Array(u[40..<48]), []), zeroIV)
+        }
+        let u48 = Array(u[0..<48])
+        if o.count >= 48 && oe.count >= 32 &&
+                getHash(r, password, Array(o[32..<40]), u48) == Array(o[0..<32]) {
+            return Cryptography.aesDecryptCBC(
+                    Array(oe[0..<32]), getHash(r, password, Array(o[40..<48]), u48), zeroIV)
+        }
+        throw passwordError(password)
+    }
+
+    // Returns the hash of the password, the salt and, for the owner password,
+    // the 48 bytes of /U: SHA-256 in revision 5, and algorithm 2.B of
+    // ISO 32000-2 in revision 6.
+    private static func getHash(
+            _ r: Int, _ password: [UInt8], _ salt: [UInt8], _ udata: [UInt8]) -> [UInt8] {
+        if r == 5 {
+            return Cryptography.sha256(password + salt + udata)
+        }
+        return Cryptography.hash2B(password, salt, udata)
+    }
+
+    ///
+    /// Decrypts the strings in the dictionary of the object, which become
+    /// hexadecimal strings. The /Contents of a signature dictionary, the
+    /// signature, is not encrypted, as ISO 32000-2 7.6.2 has it, and is left
+    /// as it is.
+    ///
+    func decryptStrings(_ obj: PDFobj) {
+        if stringMethod == .identity {
+            return
+        }
+        let digits = Array("0123456789abcdef")
+        // The dictionary of each token and whether each is a signature
+        // dictionary, found once: for each string after /Contents a scan to
+        // its dictionary's ends made a PDF of 560 KB take 17 s (review of 17
+        // October 2026)
+        var starts: [Int]? = nil
+        var signatures = [Int: Bool]()
+        for i in 0..<obj.dict.count {
+            let token = obj.dict[i]
+            if token.hasPrefix("(") || (token.hasPrefix("<") && token != "<<") {
+                if i > 0 && obj.dict[i - 1] == "/Contents" {
+                    if starts == nil {
+                        starts = Decryptor.dictionaryStarts(obj.dict)
+                    }
+                    let start = starts![i]
+                    let signature: Bool
+                    if let known = signatures[start] {
+                        signature = known
+                    } else {
+                        signature = Decryptor.isSignatureDictFrom(obj.dict, start)
+                        signatures[start] = signature
+                    }
+                    if signature {
+                        continue
+                    }
+                }
+                var hex = "<"
+                for b in decrypt(Decryptor.toBytes(token), stringMethod, obj) {
+                    hex.append(digits[Int(b >> 4)])
+                    hex.append(digits[Int(b & 0x0F)])
+                }
+                hex.append(">")
+                obj.dict[i] = hex
+            }
+        }
+    }
+
+    // Tells if the dictionary the token at i is in is a signature dictionary:
+    // of /Type /Sig or /DocTimeStamp, or with a /ByteRange, which only a
+    // signature dictionary has.
+    static func isSignatureDict(_ dict: [String], _ i: Int) -> Bool {
+        // The start of the dictionary
+        var start = i
+        var level = 0
+        while start >= 0 {
+            if dict[start] == ">>" {
+                level += 1
+            } else if dict[start] == "<<" {
+                if level == 0 {
+                    break
+                }
+                level -= 1
+            }
+            start -= 1
+        }
+        return isSignatureDictFrom(dict, start)
+    }
+
+    // The index of the << of the dictionary each token is in, the innermost,
+    // or -1 for one in none, as isSignatureDict finds it, in one pass
+    static func dictionaryStarts(_ dict: [String]) -> [Int] {
+        var starts = [Int](repeating: -1, count: dict.count)
+        var open = [Int]()
+        for j in 0..<dict.count {
+            if let last = open.last {
+                starts[j] = last
+            }
+            if dict[j] == "<<" {
+                open.append(j)
+            } else if dict[j] == ">>" && !open.isEmpty {
+                open.removeLast()
+            }
+        }
+        return starts
+    }
+
+    // Tells if the dictionary whose << is at start is a signature dictionary
+    static func isSignatureDictFrom(_ dict: [String], _ start: Int) -> Bool {
+        // Its entries, not those of the dictionaries in it
+        var level = 0
+        var j = start + 1
+        while j < dict.count {
+            switch dict[j] {
+            case "<<":
+                level += 1
+            case ">>":
+                if level == 0 {
+                    return false
+                }
+                level -= 1
+            case "/ByteRange":
+                if level == 0 {
+                    return true
+                }
+            case "/Type":
+                if level == 0 && j + 1 < dict.count && (dict[j + 1] == "/Sig" || dict[j + 1] == "/DocTimeStamp") {
+                    return true
+                }
+            default:
+                break
+            }
+            j += 1
+        }
+        return false
+    }
+
+    ///
+    /// Returns the decrypted stream of the object.
+    ///
+    func decryptStream(_ obj: PDFobj, _ stream: [UInt8]) -> [UInt8] {
+        if (!encryptMetadata && obj.getValue("/Type") == "/Metadata") || obj.hasIdentityCrypt() {
+            return stream
+        }
+        return decrypt(stream, streamMethod, obj)
+    }
+
+    // Algorithm 1 of ISO 32000-2 decrypts with a key for each object in
+    // revisions 2 to 4, and revisions 5 and 6 use the file key.
+    private func decrypt(_ data: [UInt8], _ method: Method, _ obj: PDFobj) -> [UInt8] {
+        if method == .identity {
+            return data
+        }
+        var objectKey = key
+        if method != .aes256 {
+            let number = obj.number
+            let generation = (obj.dict.count > 1) ? (Int(obj.dict[1]) ?? 0) : 0
+            var input = key
+            input += [UInt8(truncatingIfNeeded: number), UInt8(truncatingIfNeeded: number >> 8),
+                    UInt8(truncatingIfNeeded: number >> 16),
+                    UInt8(truncatingIfNeeded: generation), UInt8(truncatingIfNeeded: generation >> 8)]
+            if method == .aes128 {
+                input += [0x73, 0x41, 0x6C, 0x54]       // "sAlT"
+            }
+            objectKey = Array(Cryptography.md5(input)[0..<min(key.count + 5, 16)])
+        }
+        if method == .rc4 {
+            return Cryptography.rc4(objectKey, data)
+        }
+        // The data starts with the initialization vector, and is padded to whole blocks.
+        if data.count < 32 {
+            return []
+        }
+        let decrypted = Cryptography.aesDecryptCBC(
+                Array(data[16..<(16 + (data.count - 16) / 16 * 16)]), objectKey, Array(data[0..<16]))
+        if decrypted.isEmpty {
+            return []
+        }
+        let padding = Int(decrypted[decrypted.count - 1])
+        if padding >= 1 && padding <= 16 {
+            return Array(decrypted[0..<(decrypted.count - padding)])
+        }
+        return decrypted
+    }
+
+    // Returns the integer value of the key, or 0. /P can be written as an
+    // unsigned number.
+    private static func getInt(_ obj: PDFobj, _ key: String) -> Int {
+        if let value = Int64(obj.getValue(key)) {
+            return Int(Int32(truncatingIfNeeded: value))
+        }
+        return 0
+    }
+
+    ///
+    /// Returns the bytes of a literal string like (a\)b) or of a hexadecimal
+    /// string like <612962>. Each character of the token is a byte.
+    ///
+    static func toBytes(_ token: String) -> [UInt8] {
+        let chars = token.unicodeScalars.map { UInt8(truncatingIfNeeded: $0.value) }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(chars.count)
+        if chars.first == 0x3C {            // "<"
+            var high = -1
+            for c in chars.dropFirst() {
+                let digit = hexValue(c)
+                if digit == -1 {
+                    continue
+                }
+                if high == -1 {
+                    high = digit
+                } else {
+                    bytes.append(UInt8(high << 4 | digit))
+                    high = -1
+                }
+            }
+            if high != -1 {
+                bytes.append(UInt8(high << 4))
+            }
+        } else if chars.first == 0x28 {     // "("
+            let end = (chars.last == 0x29) ? chars.count - 1 : chars.count
+            var i = 1
+            while i < end {
+                let c = chars[i]
+                if c == 0x5C && i + 1 < end {   // "\\"
+                    i += 1
+                    let escaped = chars[i]
+                    switch escaped {
+                    case 0x6E:                  // "n"
+                        bytes.append(0x0A)
+                    case 0x72:                  // "r"
+                        bytes.append(0x0D)
+                    case 0x74:                  // "t"
+                        bytes.append(0x09)
+                    case 0x62:                  // "b"
+                        bytes.append(0x08)
+                    case 0x66:                  // "f"
+                        bytes.append(0x0C)
+                    case 0x30...0x37:           // An octal number of up to three digits
+                        var value = Int(escaped - 0x30)
+                        var n = 1
+                        while n < 3 && i + 1 < end && chars[i + 1] >= 0x30 && chars[i + 1] <= 0x37 {
+                            i += 1
+                            value = value * 8 + Int(chars[i] - 0x30)
+                            n += 1
+                        }
+                        bytes.append(UInt8(truncatingIfNeeded: value))
+                    case 0x0D:
+                        // A backslash at the end of a line continues the string.
+                        if i + 1 < end && chars[i + 1] == 0x0A {
+                            i += 1
+                        }
+                    case 0x0A:
+                        break
+                    default:
+                        bytes.append(escaped)   // Like \( \) and \\
+                    }
+                } else if c == 0x0D {
+                    // An end of line in a string is a line feed.
+                    if i + 1 < end && chars[i + 1] == 0x0A {
+                        i += 1
+                    }
+                    bytes.append(0x0A)
+                } else {
+                    bytes.append(c)
+                }
+                i += 1
+            }
+        }
+        return bytes
+    }
+}

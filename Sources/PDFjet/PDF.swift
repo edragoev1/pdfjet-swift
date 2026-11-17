@@ -1,0 +1,4592 @@
+/**
+ * PDF.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Used to create PDF objects that represent PDF documents.
+///
+public final class PDF {
+    var fonts = [Font]()
+    var images = [Image]()
+    var pages = [Page]()
+    // The destinations by the bytes of their names, as uriActions below: two
+    // names that are canonically equivalent are two destinations, as they
+    // are in the other ports
+    var destinations = [[UInt8]: Destination]()
+    // The object of the action of each URI a link goes to, by the bytes of
+    // the URI: Swift's strings that are canonically equivalent are equal, as
+    // é and e with its accent, which are two URIs
+    private var uriActions = [[UInt8]: Int]()
+    var groups = [OptionalContentGroup]()
+    var states = [String : Int]()
+    var stamps = [Stamp]()
+    var compliance = Compliance.PDF_1_7
+
+    // The description of the PDF/UA identification schema, which PDF/A accepts
+    // only when the metadata describes it, as ISO 19005-3 6.6.2.3 asks: the
+    // metadata of PDF_A_3A_UA_1 names the part of PDF/UA as well as of PDF/A. It
+    // goes into the list of extension schemas of a description the document
+    // adds, such as that of Factur-X, as the metadata has one list, or into a
+    // list of its own when the document adds none.
+    static let pdfUASchema = """
+              <rdf:li rdf:parseType="Resource">
+                <pdfaSchema:namespaceURI>http://www.aiim.org/pdfua/ns/id/</pdfaSchema:namespaceURI>
+                <pdfaSchema:prefix>pdfuaid</pdfaSchema:prefix>
+                <pdfaSchema:schema>PDF/UA identification schema</pdfaSchema:schema>
+                <pdfaSchema:property>
+                  <rdf:Seq>
+                    <rdf:li rdf:parseType="Resource">
+                      <pdfaProperty:category>internal</pdfaProperty:category>
+                      <pdfaProperty:description>PDF/UA version identifier</pdfaProperty:description>
+                      <pdfaProperty:name>part</pdfaProperty:name>
+                      <pdfaProperty:valueType>Integer</pdfaProperty:valueType>
+                    </rdf:li>
+                  </rdf:Seq>
+                </pdfaSchema:property>
+              </rdf:li>
+
+        """
+    static let pdfUAExtensionSchemas = """
+        <rdf:Description rdf:about=""
+            xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"
+            xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"
+            xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">
+          <pdfaExtension:schemas>
+            <rdf:Bag>
+        \(pdfUASchema)    </rdf:Bag>
+          </pdfaExtension:schemas>
+        </rdf:Description>
+
+        """
+
+    // The descriptions the document adds, the first list of extension schemas
+    // among them with the PDF/UA identification schema, or nil when none has
+    // such a list.
+    static func withPDFUASchema(_ descriptions: [String]) -> [String]? {
+        var result = descriptions
+        for (i, description) in result.enumerated() {
+            guard let schemas = description.range(of: "<pdfaExtension:schemas>"),
+                    let bag = description.range(of: "<rdf:Bag>", range: schemas.upperBound..<description.endIndex) else {
+                continue
+            }
+            result[i] = String(description[..<bag.upperBound]) + "\n" + String(pdfUASchema.dropLast())
+                    + String(description[bag.upperBound...])
+            return result
+        }
+        return nil
+    }
+
+    // Whether the content of the document is tagged, and follows the rules of
+    // PDF/UA: that of PDF_UA_1, of the A levels of PDF/A, which ask for tagged
+    // content, and of PDF_A_3A_UA_1, which is both.
+    func isTagged() -> Bool {
+        return compliance == Compliance.PDF_UA_1 || compliance == Compliance.PDF_A_1A
+                || compliance == Compliance.PDF_A_2A || compliance == PDF.complianceA3A
+                || compliance == Compliance.PDF_A_3A_UA_1
+    }
+
+    // Whether the document is of PDF/A, of any part and level.
+    func isPDFA() -> Bool {
+        return compliance != Compliance.PDF_1_7 && compliance != Compliance.PDF_UA_1
+    }
+
+    // Whether the document is of PDF/A-1, which has no transparency.
+    func isPDFA1() -> Bool {
+        return compliance == Compliance.PDF_A_1A || compliance == Compliance.PDF_A_1B
+    }
+
+    // PDF_A_3A, named by its raw value, since the case is deprecated and the
+    // build fails on the warning its name gives. It is still supported.
+    static var complianceA3A: Compliance { Compliance(rawValue: 6)! }
+    var toc: Bookmark?
+    // The headings of a tagged document, and of a Markdown text in any
+    // document, in the order they are drawn, which its bookmarks are made of
+    // when it has none of its own
+    var headings = [Heading]()
+    var importedFonts = [String]()
+    var importedXObjects = [String]()
+    var importedExtGStates = [String]()
+    // Where each name of the imported entries starts in its list, so that a
+    // name is found at once, not by a look through the list for each entry
+    // of each page: 1,000 pages of 2,000 fonts took 36 s (review of
+    // 11 October 2026, #35)
+    var importedFontNames = [String: Int]()
+    var importedXObjectNames = [String: Int]()
+    var importedExtGStateNames = [String: Int]()
+
+    private var metadataObjNumber = 0
+    private var outputIntentObjNumber = 0
+    private var os: BufferedOutputStream?
+    // The memory the content of the pages and the fonts is compressed in, one
+    // stream after another, made once for the document: made for each font
+    // stream, its 450 KB were 1.8 MB of a page in two fonts (28 October 2026)
+    internal lazy var flateMemory = FlateEncode.Memory()
+    // The digits of the number append(Int) writes, the most an Int has and its sign.
+    private var digits = [UInt8](repeating: 0, count: 20)
+    private var objOffset = [Int]()
+    private var producer = "PDFjet v9.1.9"
+    private var title: String?
+    private var author: String?
+    private var subject: String?
+    private var keywords: String?
+    private var creator: String?
+    private var createDate: String?
+    private var byteCount = 0
+    private var pagesObjNumber = 0
+    // The /AcroForm of the catalog of a PDF whose objects were added, which
+    // the catalog of this document carries over: without it a filled-in form
+    // that was drawn on lost its fields, and viewers showed none of their
+    // values (Stefan Ostermann's fork of PDFjet, 19 October 2026).
+    private var acroForm: [String]? = nil
+    private var pageLayout: PageLayout?
+    private var pageMode: PageMode?
+    private(set) var language: String = "en-US"
+    private var languageSet = false     // A PDF that is not of PDF/A or PDF/UA says it only then
+    // The document ID for the trailer and the XMP metadata: 16 random bytes as
+    // 32 hexadecimal digits, so documents made at the same time get different IDs.
+    private var uuid: String = Cryptography.randomBytes(16).map {
+        ($0 < 16 ? "0" : "") + String($0, radix: 16)
+    }.joined()
+    // The files the document carries, in the order they were added.
+    private var associatedFiles = [EmbeddedFile]()
+    // The files embedded in the document, and whether one is attached to a
+    // page, which a document of PDF/A takes only as PDF/A-3's associated
+    // files (review of 11 October 2026, #5)
+    var embeddedFiles = [EmbeddedFile]()
+    var attachedFiles = [EmbeddedFile]()    // Attached to pages, by FileAttachment
+    // Lets the tests of what a document of PDF/A or PDF/UA tags draw in a core
+    // font, whose text they find by its encoding: complete() refuses one
+    // otherwise. A property of the document, not a static, so that the tests
+    // that run at the same time do not share it. Never set outside the tests.
+    var coreFontsInCompliance = false
+    // The fonts PDFjet carries that the document draws in, by their files
+    var bundledFonts = [String: Font]()
+    // The descriptions that a standard of its own asks the metadata to carry.
+    private var metadata = [String]()
+    private var prevPage: Page?
+    // The structure elements of the pages of the document, in page order.
+    // complete() collects them, so a detached page that was never added has
+    // no part in the structure tree.
+    private var annotElements = [StructElement]()
+    // The elements of the Document element, by number.
+    private var documentKids = [Int]()
+    // The structure tree root, the parent tree and the Document element take
+    // three numbers reserved before the first element is written.
+    private var structTreeRootNumber = 0
+    private var parentTreeNumber = 0
+    private var documentElementNumber = 0
+    private var contentStreamsCompression = true
+    var encryption: Encryption?
+
+    // The first misuse of the API. Swift records it where Java throws, and
+    // complete() then throws it, as the file would be broken.
+    var error: String?
+    // True after complete(): the document is written and closed.
+    var completed = false
+    // The pages made for this document, added or detached.
+    var pagesCreated = 0
+    // Tells this document apart from the others, for the fonts, images and
+    // embedded files, which do not keep a reference to their PDF.
+    let identity = UUID()
+
+    // The OCG type that will be stored in the list/array.
+    struct OCG {
+        let objNumber: Int
+        let name: String
+    }
+
+    ///
+    /// The default constructor - use when reading PDF files.
+    ///
+    public init() {
+    }
+
+    ///
+    /// Creates a PDF object that represents a PDF document.
+    ///
+    /// - Parameter os: the associated output stream.
+    ///
+    public convenience init(_ os: OutputStream) {
+        self.init(os, Compliance.PDF_1_7)
+    }
+
+    // Returns the time, in milliseconds since 1970, as yyyy-MM-ddTHH:mm:ss in
+    // UTC, worked out by hand, as in the other ports: DateFormatter took 1.7 ms
+    // of the first PDF of a process. The date of the days since 1970 is that of
+    // Howard Hinnant's days_from_civil, reversed.
+    static func utcDate(_ millis: Int64) -> String {
+        let days = floorDiv(millis, 86_400_000)
+        let seconds = (millis - days * 86_400_000) / 1000
+        let z = days + 719_468
+        let era = floorDiv(z, 146_097)
+        let doe = z - era * 146_097
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        let mp = (5 * doy + 2) / 153
+        let day = doy - (153 * mp + 2) / 5 + 1
+        let month = mp < 10 ? mp + 3 : mp - 9
+        let year = yoe + era * 400 + (month <= 2 ? 1 : 0)
+        // The year in four digits, as Go writes it, 0999 for 999 (review of
+        // 17 October 2026)
+        let digits = String(year)
+        let padded = (year >= 0 && year < 1000) ? String(repeating: "0", count: 4 - digits.count) + digits : digits
+        return padded + "-" + two(month) + "-" + two(day) + "T" +
+            two(seconds / 3600) + ":" + two(seconds / 60 % 60) + ":" + two(seconds % 60)
+    }
+
+    private static func floorDiv(_ a: Int64, _ b: Int64) -> Int64 {
+        let q = a / b
+        return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q
+    }
+
+    private static func two(_ value: Int64) -> String {
+        return String(value / 10) + String(value % 10)
+    }
+
+    /// Here is the layout of the PDF document:
+    ///
+    /// Metadata Object
+    /// Output Intent Object
+    /// Fonts
+    /// Images
+    /// Resources Object
+    /// Content1
+    /// Content2
+    /// ...
+    /// ContentN
+    /// Annot1
+    /// Annot2
+    /// ...
+    /// AnnotN
+    /// Page1
+    /// Page2
+    /// ...
+    /// PageN
+    /// Pages
+    /// StructElem1
+    /// StructElem2
+    /// ...
+    /// StructElemN
+    /// StructTreeRoot
+    /// Info
+    /// Root
+    /// xref table
+    /// Trailer
+    ///
+    /// Creates a PDF object that represents a PDF document.
+    /// Use this constructor to create PDF/A compliant PDF documents.
+    /// Please note: PDF/A compliance requires all fonts to be embedded in the PDF.
+    ///
+    /// - Parameter os: the associated output stream.
+    /// - Parameter compliance: must be: Compliance.PDF_UA_1, Compliance.PDF_A_1A to Compliance.PDF_A_3B, or Compliance.PDF_A_3A_UA_1, which is both PDF/A-3a and PDF/UA-1
+    ///
+    public init(_ os: OutputStream, _ compliance: Compliance) {
+        os.open()
+        self.os = BufferedOutputStream(os)
+        self.compliance = compliance
+
+        // The creation date is in UTC, so the XMP metadata says so with a Z.
+        self.createDate = PDF.utcDate(Int64((Date().timeIntervalSince1970 * 1000).rounded(.down))) + "Z"
+
+        append("%PDF-1.7\n")
+        append("%")
+        append(UInt8(0xF2))
+        append(UInt8(0xF3))
+        append(UInt8(0xF4))
+        append(UInt8(0xF5))
+        append(UInt8(0xF6))
+        append(Token.newline)
+    }
+
+    /// Sets the PDF/UA or PDF/A compliance of this document.
+    @discardableResult
+    public func setCompliance(_ compliance: Compliance) -> PDF {
+        // ISO 19005 does not allow a PDF/A document to be encrypted, and the
+        // encryption is written for the compliance: it grants a PDF/UA
+        // document the permission to extract its content for accessibility.
+        if encryption != nil && compliance != Compliance.PDF_1_7 && compliance != Compliance.PDF_UA_1 {
+            fail("A PDF/A document cannot be encrypted.")
+            return self
+        }
+        if encryption != nil && compliance != self.compliance {
+            fail("Set the compliance before the encryption, which is written for it.")
+            return self
+        }
+        // The fonts and the page content are written for the compliance.
+        if compliance != self.compliance && (getObjNumber() > 0 || pagesCreated > 0) {
+            fail("Set the compliance before adding fonts, images or pages to the PDF.")
+            return self
+        }
+        self.compliance = compliance
+        return self
+    }
+
+    /// Returns the PDF document compliance.
+    public func getCompliance() -> Compliance {
+        return compliance
+    }
+
+    ///
+    /// Sets the encryption applied to this document.
+    ///
+    /// - Parameter encryption: the encryption.
+    /// - Returns: this PDF object.
+    ///
+    @discardableResult
+    public func setEncryption(_ encryption: Encryption) -> PDF {
+        // Every object after the encryption dictionary is encrypted.
+        if encryption.getObjNumber() != getObjNumber() {
+            fail("Set the encryption before adding fonts, images or pages to the PDF.")
+            return self
+        }
+        // ISO 19005 does not allow a PDF/A document to be encrypted.
+        if compliance != Compliance.PDF_1_7 && compliance != Compliance.PDF_UA_1 {
+            fail("A PDF/A document cannot be encrypted.")
+            return self
+        }
+        self.encryption = encryption
+        return self
+    }
+
+    /// Returns the bytes of a string or a stream, encrypted if the document is
+    /// encrypted.
+    func encrypted(_ bytes: [UInt8]) -> [UInt8] {
+        guard let encryption = encryption else {
+            return bytes
+        }
+        return Cryptography.aesEncryptCBCPadded(bytes, encryption.getKey())
+    }
+
+    /// Returns the UTF-8 bytes of the string, encrypted if the document is
+    /// encrypted, as hexadecimal digits, for a string object.
+    func toHexString(_ str: String?) -> String {
+        guard let str = str, !str.isEmpty else {
+            return ""
+        }
+        return toHex(encrypted(Array(str.utf8)))
+    }
+
+    /// Returns a text string, like a bookmark title or an alternate
+    /// description, as hexadecimal digits: UTF-16BE with a byte order mark,
+    /// encrypted if the document is encrypted. A text string without the mark
+    /// is in PDFDocEncoding, so UTF-8 bytes would show as two or three wrong
+    /// characters each.
+    func textString(_ str: String?) -> String {
+        // An empty text is the byte order mark alone, as in the other ports.
+        let str = str ?? ""
+        var bytes: [UInt8] = [0xFE, 0xFF]
+        for unit in str.utf16 {
+            bytes.append(UInt8(unit >> 8))
+            bytes.append(UInt8(unit & 0xFF))
+        }
+        return toHex(encrypted(bytes))
+    }
+
+    /// Records the first misuse of the API, which complete() then throws.
+    // Records the misuse of an array of more than 8191 entries, or a
+    // dictionary of more than 4095, in a document of PDF/A-1, which limits them
+    // so: veraPDF refused 4,100 tagged pages, 8,200 pages and 4,100 images
+    // (review of 12 October 2026, W1).
+    func checkPDFA1Size(_ count: Int, _ limit: Int, _ what: String) {
+        if isPDFA1() && count > limit {
+            let kind = (limit == PDF.MAX_PDFA1_DICT_ENTRIES) ? "a dictionary" : "an array"
+            fail("PDF/A-1 limits \(kind) to \(limit) entries, and \(what) has \(count): make the document PDF/A-2 or PDF/A-3.")
+        }
+    }
+
+    // The most entries of an array and of a dictionary of PDF/A-1, and the
+    // most objects of a document of PDF/A.
+    static let MAX_PDFA1_ARRAY_ENTRIES = 8191
+    static let MAX_PDFA1_DICT_ENTRIES = 4095
+    static let MAX_PDFA_OBJECTS = 8388607
+
+    func fail(_ message: String) {
+        if error == nil {
+            error = message
+        }
+    }
+
+    func newObj() {
+        objOffset.append(byteCount)
+        append(objOffset.count)
+        append(Token.newObj)
+    }
+
+    /// Starts the object of a number reserved before, with reserveObjNumber.
+    func newObj(_ number: Int) {
+        setObjOffset(number, byteCount)
+        append(number)
+        append(Token.newObj)
+    }
+
+    func endObj() {
+        append(Token.endObj)
+    }
+
+    func getObjNumber() -> Int {
+        return objOffset.count
+    }
+
+    /// Records the offset of an object that carries its own number, growing the
+    /// table with placeholders for any number that has no object yet.
+    private func setObjOffset(_ number: Int, _ offset: Int) {
+        if number <= 0 {    // No number of its own - just append.
+            objOffset.append(offset)
+            return
+        }
+        while objOffset.count < number {
+            objOffset.append(0)
+        }
+        objOffset[number - 1] = offset
+    }
+
+    // Returns the offset as the 10 digits of an entry of the cross-reference
+    // table, which cannot hold an offset of more than 10 digits.
+    static func xrefOffset(_ offset: Int) throws -> String {
+        let digits = String(offset)
+        if digits.count > 10 {
+            throw PDFjetError(message: "The PDF is too large for a cross-reference table: "
+                    + "an object starts at byte \(offset).")
+        }
+        return String(repeating: "0", count: 10 - digits.count) + digits
+    }
+
+    func addMetadataObject(_ notice: String, _ fontMetadataObject: Bool) -> Int {
+        var sb = String()
+        // The header begins with the byte order mark, which ISO 16684-1 asks
+        // of it, written as UTF-8 (review of 11 October 2026, #28)
+        sb.append("<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
+        sb.append("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"\n")
+        sb.append("    x:xmptk=\"Adobe XMP Core 5.4-c005 78.147326, 2012/08/23-13:03:03\">\n")
+        sb.append("<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
+
+        if fontMetadataObject {
+            sb.append("<rdf:Description rdf:about=\"\" xmlns:xmpRights=\"http://ns.adobe.com/xap/1.0/rights/\">\n")
+            sb.append("<xmpRights:UsageTerms>\n")
+            sb.append("<rdf:Alt>\n")
+            sb.append("<rdf:li xml:lang=\"x-default\">\n")
+            // The notice of a font is text, which may hold an ampersand, like
+            // that of the Noto fonts of Japanese, Korean and Chinese.
+            sb.append(PDF.escapeXML(notice))
+            sb.append("</rdf:li>\n")
+            sb.append("</rdf:Alt>\n")
+            sb.append("</xmpRights:UsageTerms>\n")
+            sb.append("</rdf:Description>\n")
+        } else {
+            sb.append("<rdf:Description rdf:about=\"\"\n")
+            sb.append("    xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"\n")
+            sb.append("    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n")
+            sb.append("    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n")
+            sb.append("    xmlns:xapMM=\"http://ns.adobe.com/xap/1.0/mm/\"\n")
+            sb.append("    xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"\n")
+            sb.append("    xmlns:pdfuaid=\"http://www.aiim.org/pdfua/ns/id/\">\n")
+
+            sb.append("    <dc:format>application/pdf</dc:format>\n")
+            if compliance == Compliance.PDF_UA_1 {
+                sb.append("  <pdfuaid:part>1</pdfuaid:part>\n")
+            } else if compliance == Compliance.PDF_A_1A {
+                sb.append("  <pdfaid:part>1</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>A</pdfaid:conformance>\n")
+            } else if compliance == Compliance.PDF_A_1B {
+                sb.append("  <pdfaid:part>1</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>B</pdfaid:conformance>\n")
+            } else if compliance == Compliance.PDF_A_2A {
+                sb.append("  <pdfaid:part>2</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>A</pdfaid:conformance>\n")
+            } else if compliance == Compliance.PDF_A_2B {
+                sb.append("  <pdfaid:part>2</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>B</pdfaid:conformance>\n")
+            } else if compliance == PDF.complianceA3A {
+                sb.append("  <pdfaid:part>3</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>A</pdfaid:conformance>\n")
+            } else if compliance == Compliance.PDF_A_3B {
+                sb.append("  <pdfaid:part>3</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>B</pdfaid:conformance>\n")
+            } else if compliance == Compliance.PDF_A_3A_UA_1 {
+                sb.append("  <pdfuaid:part>1</pdfuaid:part>\n")
+                sb.append("  <pdfaid:part>3</pdfaid:part>\n")
+                sb.append("  <pdfaid:conformance>A</pdfaid:conformance>\n")
+            }
+
+            sb.append("  <pdf:Producer>")
+            sb.append(producer)
+            sb.append("</pdf:Producer>\n")
+
+            if title != nil {
+                sb.append("  <dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">")
+                sb.append(PDF.escapeXML(title!))
+                sb.append("</rdf:li></rdf:Alt></dc:title>\n")
+            }
+
+            if author != nil {
+                sb.append("  <dc:creator><rdf:Seq><rdf:li>")
+                sb.append(PDF.escapeXML(author!))
+                sb.append("</rdf:li></rdf:Seq></dc:creator>\n")
+            }
+
+            if subject != nil {
+                sb.append("  <dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">")
+                sb.append(PDF.escapeXML(subject!))
+                sb.append("</rdf:li></rdf:Alt></dc:description>\n")
+            }
+
+            if keywords != nil {
+                sb.append("  <pdf:Keywords>")
+                sb.append(PDF.escapeXML(keywords!))
+                sb.append("</pdf:Keywords>\n")
+            }
+
+            if creator != nil {
+                sb.append("  <xmp:CreatorTool>")
+                sb.append(PDF.escapeXML(creator!))
+                sb.append("</xmp:CreatorTool>\n")
+            }
+
+            sb.append("  <xmp:CreateDate>")
+            sb.append(createDate!)
+            sb.append("</xmp:CreateDate>\n")
+
+            sb.append("  <xapMM:DocumentID>uuid:")
+            sb.append(uuid)
+            sb.append("</xapMM:DocumentID>\n")
+
+            sb.append("  <xapMM:InstanceID>uuid:")
+            sb.append(uuid)
+            sb.append("</xapMM:InstanceID>\n")
+
+            sb.append("</rdf:Description>\n")
+
+            var descriptions = metadata
+            if compliance == Compliance.PDF_A_3A_UA_1 {
+                if let described = PDF.withPDFUASchema(metadata) {
+                    descriptions = described
+                } else {
+                    sb.append(PDF.pdfUAExtensionSchemas)
+                }
+            }
+
+            for description in descriptions {
+                sb.append(description)
+                sb.append("\n")
+            }
+        }
+
+        if !fontMetadataObject {
+            // Add the recommended 2000 bytes padding
+            for _ in 0..<20 {
+                for _ in 0..<10 {
+                    sb.append("          ")
+                }
+                sb.append("\n")
+            }
+        }
+
+        sb.append("</rdf:RDF>\n")
+        sb.append("</x:xmpmeta>\n")
+        sb.append("<?xpacket end=\"w\"?>")
+
+        // The metadata is encrypted like every other stream, and the
+        // encryption dictionary says so with /EncryptMetadata true. Readers do
+        // not agree on which metadata streams to leave alone when it is false.
+        let buf = encrypted([UInt8](sb.utf8))
+
+        // This is the metadata object
+        newObj()
+        append(Token.beginDictionary)
+        append("/Type /Metadata\n")
+        append("/Subtype /XML\n")
+        append(Token.length)
+        append(buf.count)
+        append(Token.newline)
+        append(Token.endDictionary)
+        append(Token.stream)
+        append(buf)
+        append(Token.endStream)
+        endObj()
+
+        return self.getObjNumber()
+    }
+
+    // Returns the text with the characters that have a meaning in XML escaped,
+    // and without what XML does not allow, which cleanText leaves out.
+    static func escapeXML(_ text: String) -> String {
+        var result = String.UnicodeScalarView()
+        for scalar in cleanText(text).unicodeScalars {
+            switch scalar {
+            case "&":
+                result.append(contentsOf: "&amp;".unicodeScalars)
+            case "<":
+                result.append(contentsOf: "&lt;".unicodeScalars)
+            case ">":
+                result.append(contentsOf: "&gt;".unicodeScalars)
+            case "\r":
+                // An XML reader turns the character itself into a line feed, and
+                // the metadata did not say what the information dictionary says,
+                // which PDF/A refused (review of 30 October 2026, B9)
+                result.append(contentsOf: "&#13;".unicodeScalars)
+            default:
+                result.append(scalar)
+            }
+        }
+        return String(result)
+    }
+
+    // Returns the text without what XML does not allow: the control
+    // characters other than tab, line feed and carriage return, U+FFFE and
+    // U+FFFF, which would make the metadata unreadable. The title and the
+    // other properties of the document are cleaned when they are set, so that
+    // the information dictionary says what the metadata says, as PDF/A asks.
+    static func cleanText(_ text: String) -> String {
+        var result = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            if scalar == "\t" || scalar == "\n" || scalar == "\r"
+                    || (scalar.value >= 0x20 && scalar.value <= 0xFFFD) || scalar.value >= 0x10000 {
+                result.append(scalar)
+            }
+        }
+        return String(result)
+    }
+
+    func addOutputIntentObject() -> Int {
+        newObj()
+        append(Token.beginDictionary)
+        append("/N 3\n")
+
+        let profile = encrypted(ICCBlackScaled.profile)
+        append(Token.length)
+        append(profile.count)
+        append(Token.newline)
+
+        append("/Filter /FlateDecode\n")
+        append(Token.endDictionary)
+        append(Token.stream)
+        append(profile, 0, profile.count)
+        append(Token.endStream)
+        endObj()
+
+        let identifier = toHexString("sRGB IEC61966-2.1")
+        // OutputIntent object
+        newObj()
+        append(Token.beginDictionary)
+        append("/Type /OutputIntent\n")
+        append("/S /GTS_PDFA1\n")
+
+        append("/OutputCondition <")
+        append(identifier)
+        append(">\n")
+
+        append("/OutputConditionIdentifier <")
+        append(identifier)
+        append(">\n")
+
+        append("/Info <")
+        append(identifier)
+        append(">\n")
+
+        append("/DestOutputProfile ")
+        append(getObjNumber() - 1)
+        append(Token.objRef)
+        append(Token.endDictionary)
+        endObj()
+
+        return self.getObjNumber()
+    }
+
+    // Appends a token of a PDF that was read. Each of its characters is a byte
+    // of the PDF, so a string or name with bytes of 0x80 or more is copied
+    // unchanged, where UTF-8 would write two bytes for each of them.
+    private func appendToken(_ token: String) {
+        append(token.unicodeScalars.map { UInt8(truncatingIfNeeded: $0.value) })
+    }
+
+    /// Writes the "/Name number 0 R" entries collected from a PDF that was read.
+    private func appendImportedEntries(_ tokens: [String]) {
+        for token in tokens {
+            appendToken(token)
+            if token == "R" {
+                append(Token.newline)
+            } else {
+                append(Token.space)
+            }
+        }
+    }
+
+    private func addResourcesObject() -> Int {
+        newObj()
+        append(Token.beginDictionary)
+        checkPDFA1Size(fonts.count + importedFontNames.count, PDF.MAX_PDFA1_DICT_ENTRIES, "the /Font resources")
+        checkPDFA1Size(images.count + stamps.count + importedXObjectNames.count, PDF.MAX_PDFA1_DICT_ENTRIES,
+                "the /XObject resources")
+        checkPDFA1Size(states.count + importedExtGStateNames.count, PDF.MAX_PDFA1_DICT_ENTRIES,
+                "the /ExtGState resources")
+        if fonts.count > 0 || importedFonts.count > 0 {
+            append("/Font\n")
+            append(Token.beginDictionary)
+            appendImportedEntries(importedFonts)
+            for font in fonts where !font.outlinesOnly() {
+                // A font drawGlyphs alone drew with, as outlines, is not written
+                append("/F")
+                append(font.objNumber)
+                append(Token.space)
+                append(font.objNumber)
+                append(Token.objRef)
+            }
+            append(Token.endDictionary)
+        }
+        if images.count > 0 || stamps.count > 0 || importedXObjects.count > 0 {
+            append("/XObject\n")
+            append(Token.beginDictionary)
+            appendImportedEntries(importedXObjects)
+            for image in images {
+                append("/Im")
+                append(image.objNumber!)
+                append(Token.space)
+                append(image.objNumber!)
+                append(Token.objRef)
+            }
+            for stamp in stamps {
+                append("/Fm")
+                append(stamp.objNumber!)
+                append(Token.space)
+                append(stamp.objNumber!)
+                append(Token.objRef)
+            }
+            append(Token.endDictionary)
+        }
+        if groups.count > 0 {
+            append("/Properties\n")
+            append(Token.beginDictionary)
+            for i in 0..<groups.count {
+                let ocg = groups[i]
+                append("/OC")
+                append(i + 1)
+                append(Token.space)
+                append(ocg.objNumber)
+                append(Token.objRef)
+            }
+            append(Token.endDictionary)
+        }
+        // The graphics states of a PDF that was read and those of the pages
+        // go in the same dictionary.
+        if states.count > 0 || importedExtGStates.count > 0 {
+            append("/ExtGState <<\n")
+            appendImportedEntries(importedExtGStates)
+            for (state, number) in states.sorted(by: { $0.value < $1.value }) {
+                append("/GS")
+                append(number)
+                append(" <<")
+                append(state)
+                append(Token.endDictionary)
+            }
+            append(Token.endDictionary)
+        }
+        append(Token.endDictionary)
+        endObj()
+        return getObjNumber()
+    }
+
+    private func addPagesObject() {
+        setObjOffset(pagesObjNumber, byteCount)
+        append(pagesObjNumber)
+        append(Token.newObj)
+        append(Token.beginDictionary)
+        append("/Type /Pages\n")
+        checkPDFA1Size(pages.count, PDF.MAX_PDFA1_ARRAY_ENTRIES, "the page tree")
+        append("/Kids [\n")
+        for page in pages {
+            append(page.objNumber)
+            append(Token.objRef)
+        }
+        append("]\n")
+        append("/Count ")
+        append(pages.count)
+        append(Token.newline)
+        append(Token.endDictionary)
+        endObj()
+    }
+
+    // The structure types of PDF 2.0 that PDFjet writes, mapped to the
+    // standard types of PDF 1.7, in the order the role map lists them.
+    private static let roleMap: [(String, String)] = [
+        (StructElem.TITLE.rawValue, StructElem.P.rawValue),
+        (StructElem.EM.rawValue, StructElem.SPAN.rawValue),
+        (StructElem.STRONG.rawValue, StructElem.SPAN.rawValue),
+    ]
+    // The types that PDF 1.5 brought, which PDF/A-1, of PDF 1.4, does not
+    // know: an annotation's element is mapped to a Span, which its reference
+    // to the annotation stays in (veraPDF, PDF/A-1 6.8.3.4).
+    private static let roleMapOfPDFA1: [(String, String)] =
+            roleMap + [(StructElem.ANNOT.rawValue, StructElem.SPAN.rawValue)]
+
+    // Returns the role map of the document's compliance.
+    private func roleMapOfCompliance() -> [(String, String)] {
+        return (compliance == Compliance.PDF_A_1A || compliance == Compliance.PDF_A_1B)
+                ? PDF.roleMapOfPDFA1 : PDF.roleMap
+    }
+    // The types of PDF 2.0 among the elements, which the role map maps.
+    private var roles = Set<String>()
+
+    private func addStructTreeRootObject() -> Int {
+        setObjOffset(structTreeRootNumber, byteCount)
+        append(structTreeRootNumber)
+        append(" 0 obj\n")
+        append(Token.beginDictionary)
+        append("/Type /StructTreeRoot\n")
+        append("/ParentTree ")
+        append(parentTreeNumber)
+        append(Token.objRef)
+        append("/K [\n")
+        append(documentElementNumber)
+        append(Token.objRef)
+        append("]\n")
+        // The types of PDF 2.0 that the document uses, which PDF 1.7 does not
+        // have, are mapped to the standard types that PDF/UA-1 knows.
+        if !roles.isEmpty {
+            append("/RoleMap <<")
+            for role in roleMapOfCompliance() where roles.contains(role.0) {
+                append(" /")
+                append(role.0)
+                append(" /")
+                append(role.1)
+            }
+            append(" >>\n")
+        }
+        append(Token.endDictionary)
+        endObj()
+        return structTreeRootNumber
+    }
+
+    // Reserves the numbers of the structure tree root, the parent tree and
+    // the Document element, which the elements written with their pages refer
+    // to before the three are written.
+    func reserveStructTreeNumbers() {
+        if structTreeRootNumber == 0 {
+            structTreeRootNumber = reserveObjNumber()
+            parentTreeNumber = reserveObjNumber()
+            documentElementNumber = reserveObjNumber()
+        }
+    }
+
+    @discardableResult
+    private func addStructDocumentObject(_ parent: Int) -> Int {
+        setObjOffset(documentElementNumber, byteCount)
+        append(documentElementNumber)
+        append(" 0 obj\n")
+        append(Token.beginDictionary)
+        append("/Type /StructElem\n")
+        append("/S /Document\n")
+        append("/P ")
+        append(parent)
+        append(" 0 R\n")
+        checkPDFA1Size(documentKids.count, PDF.MAX_PDFA1_ARRAY_ENTRIES, "the Document element")
+        append("/K [\n")
+        for number in self.documentKids {
+            append(number)
+            append(Token.objRef)
+        }
+        append("]\n")
+        append(Token.endDictionary)
+        endObj()
+        return documentElementNumber
+    }
+
+    // Writes the structure elements of a page that is written, so that a
+    // document of many pages holds no more of them than the page it is
+    // drawing. What it keeps is the elements that are still open and the ones
+    // of an annotation, whose object is written when the document is completed.
+    private func addPageStructElements(_ page: Page) {
+        if !isTagged() || page.structures.isEmpty {
+            return
+        }
+        var kept = [StructElement]()
+        for element in page.structures {
+            // The element of an annotation alone has no marked content, its
+            // mcid -1; the Link of a text has the marked content of the text
+            // too. The negative mcids of a paragraph are its Link elements.
+            var mcids = element.mcids.filter { $0 >= 0 }
+            if element.mcid >= 0 {
+                mcids.append(element.mcid)
+            }
+            for mcid in mcids {
+                while page.mcidNumbers.count <= mcid {
+                    page.mcidNumbers.append(0)
+                }
+                page.mcidNumbers[mcid] = element.objNumber ?? 0
+            }
+            if element.parent == nil && element.parentObjNumber == nil {
+                documentKids.append(element.objNumber ?? 0)
+            }
+            if element.annotation != nil {
+                annotElements.append(element)
+            }
+            if element.open || element.annotation != nil {
+                kept.append(element)
+                continue
+            }
+            addStructElementObject(element)
+        }
+        page.structures = kept
+    }
+
+    // Writes one structure element, under the number it was given when it was
+    // made.
+    private func addStructElementObject(_ element: StructElement) {
+        do {
+            setObjOffset(element.objNumber ?? 0, byteCount)
+            append(element.objNumber ?? 0)
+            append(" 0 obj\n")
+            for role in roleMapOfCompliance() where role.0 == element.structure {
+                roles.insert(role.0)
+            }
+            append("<<\n/Type /StructElem /S /")
+            append(element.structure!)
+            append("\n/P ")
+            if let parentObjNumber = element.parent?.objNumber ?? element.parentObjNumber {
+                append(parentObjNumber)
+            } else {
+                append(documentElementNumber)
+            }
+            append(" 0 R /Pg ")
+            // The elements get the number of their page when the pages object
+            // is written, which addObjects replaces. Fall back to 0 rather
+            // than trapping, which is what the other ports do.
+            append(element.pageObjNumber ?? 0)
+            append(Token.objRef)
+            checkPDFA1Size(max(element.kids.count + 1, element.mcids.count), PDF.MAX_PDFA1_ARRAY_ENTRIES,
+                    "a \(element.structure!) element")
+
+            if element.annotation != nil {
+                // A link: the marked content of its text, or the elements it
+                // holds, like the Figure of an image, then its annotation
+                append("/K [")
+                if element.mcid >= 0 {
+                    append(element.mcid)
+                    append(Token.space)
+                }
+                for kid in element.kids {
+                    append(kid)
+                    append(" 0 R ")
+                }
+                append("<</Type /OBJR /Obj ")
+                append(element.annotation!.objNumber)
+                append(" 0 R>>]\n")
+            } else if element.mcid >= 0 {
+                append("/K ")
+                append(element.mcid)
+                append("\n")
+            } else if !element.mcids.isEmpty {
+                // The marked contents of a paragraph drawn word by word, and
+                // the Link elements of its words that are links
+                append("/K [")
+                for (i, mcid) in element.mcids.enumerated() {
+                    if i > 0 {
+                        append(Token.space)
+                    }
+                    if mcid < 0 {
+                        append(-mcid)
+                        append(" 0 R")
+                    } else {
+                        append(mcid)
+                    }
+                }
+                append("]\n")
+            } else if !element.kids.isEmpty {
+                append("/K [")
+                for kid in element.kids {
+                    append(kid)
+                    append(" 0 R ")
+                }
+                append("]\n")
+            }
+
+            var attributes = element.attributes
+            if element.placedAsBlock() {
+                attributes = StructElement.withPlacementBlock(attributes)
+            }
+            if let attributes = attributes, !attributes.isEmpty {
+                append("/A ")
+                append(attributes)
+                append("\n")
+            }
+
+            // The actual text is written only with an alternate description,
+            // since a text block and a text box pass the text they draw as the
+            // actual text without one.
+            let altDescription = element.altDescription ?? ""
+            let actualText = altDescription.isEmpty ? "" : element.actualText ?? ""
+            var language = element.language ?? ""
+            if language.isEmpty && !altDescription.isEmpty {
+                language = self.language
+            }
+
+            if !language.isEmpty {
+                append("/Lang <")
+                append(toHexString(language))
+                append(">\n")
+            }
+
+            if !actualText.isEmpty {
+                append("/ActualText <")
+                append(textString(actualText))
+                append(">\n")
+            }
+
+            if !altDescription.isEmpty {
+                append("/Alt <")
+                append(textString(altDescription))
+                append(">\n")
+            }
+
+            append(">>\n")
+            endObj()
+        }
+    }
+
+    private func addNumsParentTree() {
+        var buffer = String()
+
+        setObjOffset(parentTreeNumber, byteCount)
+        buffer.append(String(parentTreeNumber))
+        buffer.append(" 0 obj\n")
+
+        buffer.append("<<\n")
+        let annotations = annotElements.filter { $0.annotation != nil }.count
+        checkPDFA1Size(2 * (pages.count + annotations), PDF.MAX_PDFA1_ARRAY_ENTRIES, "the parent tree")
+        buffer.append("/Nums [\n")
+        // The keys must be listed in increasing order, so the page entries -
+        // whose keys are the /StructParents values 0 .. pages.count-1 - come
+        // first. Each value is the array of struct elements of that page,
+        // indexed by the MCID they were marked with.
+        for (i, page) in pages.enumerated() {
+            buffer.append(String(i))
+            checkPDFA1Size(page.mcidNumbers.count, PDF.MAX_PDFA1_ARRAY_ENTRIES, "the marked content of a page")
+            buffer.append(" [")
+            for number in page.mcidNumbers {
+                buffer.append(" ")
+                buffer.append(String(number))
+                buffer.append(" 0 R")
+            }
+            buffer.append("]\n")
+            page.mcidNumbers = [Int]()
+        }
+        // The annotations follow, keyed by the /StructParent values handed out
+        // by addAnnotDictionaries(), which continue where the pages left off.
+        var index = pages.count
+        for element in self.annotElements {
+            if element.annotation != nil {
+                buffer.append(String(index))
+                buffer.append(" ")
+                buffer.append(String(element.objNumber!))
+                buffer.append(" 0 R\n")
+                index += 1
+            }
+        }
+        buffer.append("]\n")
+        buffer.append(">>\n")
+        buffer.append("endobj\n")
+        append(buffer)
+    }
+
+    /// Adds the document information dictionary, which readers like pdfinfo
+    /// show. It says what the XMP metadata of PDF/A and PDF/UA documents says.
+    private func addInfoObject() -> Int {
+        newObj()
+        append(Token.beginDictionary)
+        appendInfoText("/Title", title)
+        appendInfoText("/Author", author)
+        appendInfoText("/Subject", subject)
+        appendInfoText("/Keywords", keywords)
+        appendInfoText("/Creator", creator)
+        appendInfoText("/Producer", producer)
+        appendInfoString("/CreationDate", Array(getDate().utf8))
+        append(Token.endDictionary)
+        endObj()
+        return getObjNumber()
+    }
+
+    /// The moment the document was made, as a date string of PDF: the XMP
+    /// creation date 2026-01-31T12:00:00Z is D:20260131120000Z.
+    func getDate() -> String {
+        return "D:" + createDate!
+                .replacingOccurrences(of: "-", with: "")
+                .replacingOccurrences(of: "T", with: "")
+                .replacingOccurrences(of: ":", with: "")
+    }
+
+    /// Appends an entry of the information dictionary with the text, unless
+    /// the text is nil.
+    private func appendInfoText(_ key: String, _ text: String?) {
+        guard let text = text else {
+            return
+        }
+        append(key)
+        append(" <")
+        append(textString(text))
+        append(">\n")
+    }
+
+    /// Appends an entry of the information dictionary with the bytes of a
+    /// string, encrypted if the document is encrypted.
+    private func appendInfoString(_ key: String, _ bytes: [UInt8]) {
+        append(key)
+        append(" ")
+        appendByteString(bytes)
+        append("\n")
+    }
+
+    /// Appends a string of bytes, like a date, in hexadecimal, encrypted if
+    /// the document is encrypted.
+    func appendByteString(_ bytes: [UInt8]) {
+        append("<")
+        append(toHex(encrypted(bytes)))
+        append(">")
+    }
+
+    /// Appends a string of letters, which needs no escapes, as (Adobe), or
+    /// encrypted in hexadecimal if the document is encrypted: written as it
+    /// is, a reader decrypted it to bytes of no meaning (review of 11 October
+    /// 2026, #19 and #20).
+    func appendLiteralString(_ text: String) {
+        if encryption != nil {
+            appendByteString(Array(text.utf8))
+            return
+        }
+        append("(")
+        append(text)
+        append(")")
+    }
+
+    private func addRootObject(
+            _ structTreeRootObjNumber: Int,
+            _ outlineDictNumber: Int) -> Int {
+        // Add the root object
+        newObj()
+        append(Token.beginDictionary)
+        append("/Type /Catalog\n")
+        if compliance != Compliance.PDF_1_7 || languageSet {
+            append("/Lang <")
+            append(toHexString(language))
+            append(">\n")
+        }
+
+        if compliance != Compliance.PDF_1_7 {
+            // Only a tagged document has a structure tree: a PDF/A of level B
+            // that said it was marked would say its content is tagged, which
+            // it is not.
+            if isTagged() {
+                append("/StructTreeRoot ")
+                append(structTreeRootObjNumber)
+                append(Token.objRef)
+
+                append("/MarkInfo <</Marked true>>\n")
+            }
+            append("/ViewerPreferences <</DisplayDocTitle true>>\n")
+        }
+
+        if pageLayout != nil {
+            append("/PageLayout /")
+            append(pageLayout!.rawValue)
+            append(Token.newline)
+        }
+
+        if pageMode != nil {
+            append("/PageMode /")
+            append(pageMode!.rawValue)
+            append(Token.newline)
+        }
+
+        if !groups.isEmpty {
+            addOCProperties()
+        }
+
+        append("/Pages ")
+        append(pagesObjNumber)
+        append(Token.objRef)
+
+        if let acroForm = acroForm, !acroForm.isEmpty {
+            append("/AcroForm ")
+            appendTokens(acroForm)
+            append("\n")
+        }
+
+        addAssociatedFiles()
+
+        if compliance != Compliance.PDF_1_7 {
+            append("/Metadata ")
+            append(metadataObjNumber)
+            append(Token.objRef)
+
+            append("/OutputIntents [")
+            append(outputIntentObjNumber)
+            append(" 0 R]\n")
+        }
+
+        if outlineDictNumber > 0 {
+            append("/Outlines ")
+            append(outlineDictNumber)
+            append(Token.objRef)
+        }
+
+        append(Token.endDictionary)
+        endObj()
+        return getObjNumber()
+    }
+
+    /// The files the document carries: /AF says which they are and how each of
+    /// them relates to the document, and the name tree of /EmbeddedFiles is
+    /// where a reader of the document looks for a file by its name.
+    private func addAssociatedFiles() {
+        if associatedFiles.isEmpty {
+            return
+        }
+        append("/AF [")
+        for i in 0..<associatedFiles.count {
+            if i > 0 {
+                append(Token.space)
+            }
+            append(associatedFiles[i].objNumber)
+            append(" 0 R")
+        }
+        append("]\n")
+
+        // The names of a name tree are in order, which here means the order of
+        // the characters of the names. The tree is one node, as a document
+        // carries few files. The names are compared by their UTF-16 code
+        // units, as Java's String.compareTo does, and not as Swift compares
+        // two strings, which orders them by their Unicode scalars.
+        // Two files of the same name keep the order they were added in, as
+        // the sort of Java keeps it and the sort of Swift does not.
+        let sorted = associatedFiles.enumerated().sorted {
+            let units1 = Array($0.element.fileName!.utf16)
+            let units2 = Array($1.element.fileName!.utf16)
+            return (units1 == units2) ? $0.offset < $1.offset
+                    : units1.lexicographicallyPrecedes(units2)
+        }.map { $0.element }
+        append("/Names <</EmbeddedFiles <</Names [")
+        for file in sorted {
+            append("<")
+            append(textString(file.fileName))
+            append(">")
+            append(Token.space)
+            append(file.objNumber)
+            append(" 0 R")
+        }
+        append("]>>>>\n")
+    }
+
+    private func addPageBox(_ boxName: String, _ page: Page, _ rect: [Float]) {
+        append("/")
+        append(boxName)
+        append(" [")
+        append(rect[0])
+        append(Token.space)
+        append(page.height - rect[3])
+        append(Token.space)
+        append(rect[2])
+        append(Token.space)
+        append(page.height - rect[1])
+        append("]\n")
+    }
+
+    // Gives every destination the object number of the page it is on, which
+    // the page was given when it was added.
+    // Gives every destination the object number of the page it is on, which
+    // the page was given when it was added. The names the document gives its
+    // destinations come first, and a bookmark's, dest#1 and on, that one of
+    // them has is named again: the link to dest#1 the document made went to
+    // the bookmark (review of 12 October 2026, F7).
+    private func setDestinationObjNumbers() {
+        var bookmarks = [Destination]()
+        for page in pages {
+            for destination in page.destinations {
+                destination.pageObjNumber = page.objNumber
+                if destination.bookmark {
+                    bookmarks.append(destination)
+                } else if destinations[[UInt8](destination.name!.utf8)] == nil {
+                    // The first of a name: the parts of a text line wrapped
+                    // by a TextFrame or a TextColumn all have its destination
+                    destinations[[UInt8](destination.name!.utf8)] = destination
+                }
+            }
+        }
+        var taken = Set(bookmarks.map { [UInt8]($0.name!.utf8) })
+        var next = bookmarks.count
+        for destination in bookmarks {
+            while destinations[[UInt8](destination.name!.utf8)] != nil {
+                next += 1
+                let name = "dest#\(next)"
+                if taken.insert([UInt8](name.utf8)).inserted {
+                    destination.name = name
+                }
+            }
+            destinations[[UInt8](destination.name!.utf8)] = destination
+        }
+    }
+
+    private func addAllPages(_ resObjNumber: Int) {
+        setDestinationObjNumbers()
+        addAnnotDictionaries()
+        pagesObjNumber = reserveObjNumber()
+        for (i, page) in pages.enumerated() {
+            if let mergedDict = page.mergedDict {
+                var dict = mergedDict
+                PDF.setEntry(&dict, "/Parent", [String(pagesObjNumber), "0", "R"])
+                setObjOffset(page.objNumber, byteCount)
+                append(page.objNumber)
+                append(Token.newObj)
+                appendTokens(dict)
+                append(Token.newline)
+                append(Token.endObj)
+                continue
+            }
+            // Page object, under the number it was given when it was added.
+            setObjOffset(page.objNumber, byteCount)
+            append(page.objNumber)
+            append(Token.newObj)
+            append(Token.beginDictionary)
+            append("/Type /Page\n")
+            append("/Parent ")
+            append(pagesObjNumber)
+            append(Token.objRef)
+            append("/MediaBox [0 0 ")
+            append(page.width)
+            append(Token.space)
+            append(page.height)
+            append("]\n")
+
+            if page.rotateDegrees != 0.0 {
+                append("/Rotate ")
+                append(page.rotateDegrees)
+                append("\n")
+            }
+
+            if let cropBox = page.cropBox {
+                addPageBox("CropBox", page, cropBox)
+            }
+            if let bleedBox = page.bleedBox {
+                addPageBox("BleedBox", page, bleedBox)
+            }
+            if let trimBox = page.trimBox {
+                addPageBox("TrimBox", page, trimBox)
+            }
+            if let artBox = page.artBox {
+                addPageBox("ArtBox", page, artBox)
+            }
+
+            append("/Resources ")
+            append(resObjNumber)
+            append(Token.objRef)
+
+            append("/Contents [ ")
+            for n in page.contents {
+                append(n)
+                append(" 0 R ")
+            }
+            append("]\n")
+            if page.annots.count > 0 {
+                append("/Annots [ ")
+                for annot in page.annots {
+                    append(annot.objNumber)
+                    append(" 0 R ")
+                }
+                append("]\n")
+            }
+
+            if isTagged() {
+                append("/Tabs /S\n")
+                append("/StructParents ")
+                append(i)
+                append("\n")
+            }
+
+            append(Token.endDictionary)
+            endObj()
+        }
+    }
+
+    private func addPageContent(_ page: Page) {
+        page.checkBalanced()
+        if contentStreamsCompression {
+            var buffer = [UInt8]()
+            FlateEncode(&buffer, page.buf, flateMemory)
+            page.buf.removeAll()   // Release the page content memory!
+            page.written = true
+            buffer = encrypted(buffer)
+
+            newObj()
+            append(Token.beginDictionary)
+            append("/Filter /FlateDecode\n")
+            append(Token.length)
+            append(buffer.count)
+            append(Token.newline)
+            append(Token.endDictionary)
+            append(Token.stream)
+            append(buffer)
+            append(Token.endStream)
+            endObj()
+            page.contents.append(getObjNumber())
+        } else {    // No compression. Used for diagnostics
+            let buffer = encrypted(page.buf)
+            page.buf.removeAll()   // Release the page content memory!
+            page.written = true
+
+            newObj()
+            append(Token.beginDictionary)
+            append(Token.length)
+            append(buffer.count)
+            append(Token.newline)
+            append(Token.endDictionary)
+            append(Token.stream)
+            append(buffer)
+            append(Token.endStream)
+            endObj()
+            page.contents.append(getObjNumber())
+        }
+        addPageStructElements(page)
+    }
+
+    // Writes the appearance of an annotation that is not a link and returns
+    // its object number. It draws what a viewer draws for the annotation: the
+    // square, the circle or the polygon in its fill color, and a note or a file
+    // as its icon in a white box with a black frame. Its box is the rectangle
+    // of the annotation, from its lower left corner to its upper right one, in
+    // the coordinates of the page.
+    private func addAppearanceObject(
+            _ annot: Annotation, _ minX: Float, _ minY: Float, _ maxX: Float, _ maxY: Float) -> Int {
+        let w = maxX - minX
+        let h = maxY - minY
+        var buf = [UInt8]()
+        func numbers(_ values: Float...) {
+            for value in values {
+                buf.append(contentsOf: FastFloat.toByteArray(value))
+                buf.append(UInt8(ascii: " "))
+            }
+        }
+        func ascii(_ text: String) {
+            buf.append(contentsOf: Array(text.utf8))
+        }
+        // A shape that is not opaque is drawn with its opacity, which a viewer
+        // does not apply to an appearance of its own. PDF/A-1 has no
+        // transparency, so there the shape is drawn opaque.
+        var transparent = false
+        let opacity = isPDFA1() ? 1 : annot.opacity
+        func fill() {
+            if opacity < 1 {
+                transparent = true
+                ascii("/GS0 gs\n")
+            }
+            let color = annot.fillColor ?? [0, 0, 0]
+            numbers(color[0], color[1], color[2])
+            ascii("rg\n")
+        }
+        let type = annot.annotationType
+        if type == Annotation.Square {
+            fill()
+            numbers(minX, minY, w, h)
+            ascii("re f\n")
+        } else if type == Annotation.Circle {
+            // Four Bezier curves, one for each quarter of the ellipse.
+            let kappa: Float = 0.55228475
+            let rx = w / 2
+            let ry = h / 2
+            let cx = minX + rx
+            let cy = minY + ry
+            let ox = rx * kappa
+            let oy = ry * kappa
+            fill()
+            numbers(cx + rx, cy)
+            ascii("m\n")
+            numbers(cx + rx, cy + oy, cx + ox, cy + ry, cx, cy + ry)
+            ascii("c\n")
+            numbers(cx - ox, cy + ry, cx - rx, cy + oy, cx - rx, cy)
+            ascii("c\n")
+            numbers(cx - rx, cy - oy, cx - ox, cy - ry, cx, cy - ry)
+            ascii("c\n")
+            numbers(cx + ox, cy - ry, cx + rx, cy - oy, cx + rx, cy)
+            ascii("c\n")
+            ascii("f\n")
+        } else if type == Annotation.Polygon {
+            fill()
+            let vertices = annot.vertices ?? []
+            var i = 0
+            while i + 1 < vertices.count {
+                numbers(annot.x1 + vertices[i], annot.y1 - vertices[i + 1])
+                ascii((i == 0) ? "m\n" : "l\n")
+                i += 2
+            }
+            ascii("h f\n")
+        } else {
+            ascii("1 g 0 G 0.5 w\n")
+            numbers(minX + 0.25, minY + 0.25, w - 0.5, h - 0.5)
+            ascii("re B\n")
+            // The icon, in a box of 1 by 1 scaled to the rectangle
+            var icon = Annotation.noteIcon
+            if let file = annot.fileAttachment {
+                icon = (file.icon == "Paperclip") ? Annotation.paperclipIcon : Annotation.pushPinIcon
+            }
+            ascii("q\n")
+            numbers(w)
+            ascii("0 0 ")
+            numbers(h, minX, minY)
+            ascii("cm\n")
+            ascii(icon)
+            ascii("Q\n")
+        }
+        let content = encrypted(buf)
+
+        newObj()
+        append(Token.beginDictionary)
+        append("/Type /XObject\n")
+        append("/Subtype /Form\n")
+        append("/BBox [")
+        append(minX)
+        append(" ")
+        append(minY)
+        append(" ")
+        append(maxX)
+        append(" ")
+        append(maxY)
+        append("]\n")
+        if transparent {
+            append("/Resources <</ExtGState <</GS0 <</CA ")
+            append(opacity)
+            append(" /ca ")
+            append(opacity)
+            append(">>>>>>\n")
+        }
+        append("/Length ")
+        append(content.count)
+        append("\n")
+        append(Token.endDictionary)
+        append("stream\n")
+        append(content)
+        append("\nendstream\n")
+        endObj()
+        return getObjNumber()
+    }
+
+    // Returns the action of a link to the URI, one object for every link to
+    // it, written before the first: each link carried the address itself,
+    // and twenty links to an address of 20,000 characters added about 800 KB.
+    private func addURIAction(_ uri: String) -> Int {
+        let key = [UInt8](uri.utf8)
+        if let number = uriActions[key] {
+            return number
+        }
+        newObj()
+        append(Token.beginDictionary)
+        append("/S /URI\n")
+        append("/URI <")
+        append(toHexString(uri))
+        append(">\n")
+        append(Token.endDictionary)
+        endObj()
+        uriActions[key] = getObjNumber()
+        return getObjNumber()
+    }
+
+    @discardableResult
+    func addAnnotationObject(_ annot: Annotation, _ index: Int) -> Int {
+        var index = index
+
+        // The rectangle of an annotation of vertices, a polygon, is the box of its
+        // vertices, which are relative to its location; its second corner is not
+        // set
+        var x1 = annot.x1
+        var y1 = annot.y1
+        var x2 = annot.x2
+        var y2 = annot.y2
+        if let vertices = annot.vertices, vertices.count >= 2 {
+            var minX = vertices[0], maxX = vertices[0]
+            var minY = vertices[1], maxY = vertices[1]
+            var i = 2
+            while i + 1 < vertices.count {
+                minX = min(minX, vertices[i])
+                maxX = max(maxX, vertices[i])
+                minY = min(minY, vertices[i + 1])
+                maxY = max(maxY, vertices[i + 1])
+                i += 2
+            }
+            x1 = annot.x1 + minX
+            y1 = annot.y1 - maxY
+            x2 = annot.x1 + maxX
+            y2 = annot.y1 - minY
+        }
+        // The rectangle is written from its lower left corner to its upper
+        // right one, as viewers expect: PDFium draws the icon of a note at its
+        // first y.
+        (x1, x2) = (min(x1, x2), max(x1, x2))
+        (y1, y2) = (min(y1, y2), max(y1, y2))
+
+        // Every annotation but a link has an appearance of its own, which PDF/A
+        // asks for, and without which each viewer draws it its own way, or not
+        // at all: PDFium draws no polygon and no file attachment. It is written
+        // before the annotation.
+        var appearance = 0
+        if annot.annotationType != Annotation.Link {
+            appearance = addAppearanceObject(annot, x1, y1, x2, y2)
+        }
+        var uriAction = 0
+        if annot.annotationType == Annotation.Link, let uri = annot.uri, !uri.isEmpty {
+            uriAction = addURIAction(uri)
+        }
+
+        newObj()
+        annot.objNumber = getObjNumber()
+
+        append(Token.beginDictionary)
+        append("/Type /Annot\n")
+        append("/Subtype /")
+        append(annot.annotationType!)
+        append("\n")
+        append("/Rect [")
+        append(x1)
+        append(" ")
+        append(y1)
+        append(" ")
+        append(x2)
+        append(" ")
+        append(y2)
+        append("]\n")
+
+        append("/Border [0 0 0]\n")
+        // Every annotation is printed, as PDF/A asks.
+        append("/F 4\n")
+        if appearance > 0 {
+            append("/AP <</N ")
+            append(appearance)
+            append(" 0 R>>\n")
+        }
+
+        if annot.annotationType == Annotation.FileAttachment {
+            append("/FS ")
+            append(annot.fileAttachment!.embeddedFile!.objNumber)
+            append(" 0 R\n")
+
+            append("/Name /")
+            append(annot.fileAttachment!.icon)
+            append("\n")
+
+            let title = annot.fileAttachment!.title
+            if !title.isEmpty {
+                append("/T <")
+                append(textString(title))
+                append(">\n")
+            }
+            let contents = annot.fileAttachment!.contents
+            if !contents.isEmpty {
+                append("/Contents <")
+                append(textString(contents))
+                append(">\n")
+            }
+        } else if annot.annotationType == Annotation.Link {
+            // PDF/UA requires a link to carry an alternate description in its
+            // Contents key.
+            var description = annot.contents
+            if description == nil || description!.isEmpty {
+                description = annot.altDescription
+            }
+            if description == nil || description!.isEmpty {
+                description = annot.uri
+            }
+            if description == nil || description!.isEmpty {
+                description = annot.key
+            }
+            if let description = description, !description.isEmpty {
+                append("/Contents <")
+                append(textString(description))
+                append(">\n")
+            }
+            if uriAction > 0 {
+                append("/A ")
+                append(uriAction)
+                append(" 0 R\n")
+            } else if let key = annot.key, !key.isEmpty {
+                if let destination = destinations[[UInt8](key.utf8)] {
+                    append("/Dest [")
+                    append(destination.pageObjNumber)
+                    append(" 0 R /XYZ ")
+                    append(destination.xPosition)
+                    append(" ")
+                    append(destination.yPosition)
+                    append(" 0]\n")
+                } else {
+                    // A link to nowhere would do nothing when it is clicked.
+                    fail("The link goes to the destination " + key
+                            + ", which the document does not have.")
+                }
+            }
+        } else if annot.annotationType == Annotation.Polygon {
+            append("/Vertices [ ")
+            // Whole pairs only: an odd last value, which is no vertex, is left out,
+            // as it is with a container and in the rectangle and the appearance.
+            let vertices = annot.vertices ?? []
+            var i = 0
+            while i + 1 < vertices.count {
+                append(annot.x1 + vertices[i])
+                append(" ")
+                append(annot.y1 - vertices[i + 1])
+                append(" ")
+                i += 2
+            }
+            append("]\n")
+
+            append("/IC [")
+            append(annot.fillColor![0])
+            append(" ")
+            append(annot.fillColor![1])
+            append(" ")
+            append(annot.fillColor![2])
+            append("]\n")
+
+            if !isPDFA1() {
+                append("/CA ")
+                append(annot.opacity)
+                append("\n")
+            }
+
+            if let title = annot.title, !title.isEmpty {
+                append("/T <")
+                append(textString(title))
+                append(">\n")
+            }
+
+            if let contents = annot.contents, !contents.isEmpty {
+                append("/Contents <")
+                append(textString(contents))
+                append(">\n")
+            }
+        } else if annot.annotationType == Annotation.Square ||
+                  annot.annotationType == Annotation.Circle {
+            append("/IC [")
+            append(annot.fillColor![0])
+            append(" ")
+            append(annot.fillColor![1])
+            append(" ")
+            append(annot.fillColor![2])
+            append("]\n")
+
+            if !isPDFA1() {
+                append("/CA ")
+                append(annot.opacity)
+                append("\n")
+            }
+
+            if let title = annot.title, !title.isEmpty {
+                append("/T <")
+                append(textString(title))
+                append(">\n")
+            }
+
+            if let contents = annot.contents, !contents.isEmpty {
+                append("/Contents <")
+                append(textString(contents))
+                append(">\n")
+            }
+        } else if annot.annotationType == Annotation.Text {
+            append("/Name /Comment\n")
+            if let title = annot.title, !title.isEmpty {
+                append("/T <")
+                append(textString(title))
+                append(">\n")
+            }
+
+            if let contents = annot.contents, !contents.isEmpty {
+                append("/Contents <")
+                append(textString(contents))
+                append(">\n")
+            }
+        }
+
+        if index != -1 {
+            append("/StructParent ")
+            append(index)
+            append("\n")
+            index += 1
+        }
+
+        append(Token.endDictionary)
+        endObj()
+
+        return index
+    }
+
+    private func addAnnotDictionaries() {
+        var index = self.pages.count
+        for element in self.annotElements {
+            if element.annotation != nil {
+                index = addAnnotationObject(element.annotation!, index)
+                element.annotation!.structParentWritten = true
+            }
+        }
+
+        for page in self.pages {
+            for annotation in page.annots {
+                // Skip the annotations that were already written above -
+                // writing them twice would leave the page referencing a copy
+                // that has no /StructParent key.
+                if !annotation.structParentWritten {
+                    addAnnotationObject(annotation, -1)
+                }
+            }
+        }
+    }
+
+    private func addOCProperties() {
+        var list = [OCG]()
+        var buf = String()
+        for ocg in self.groups {
+            buf.append(" ")
+            buf.append(String(ocg.objNumber))
+            buf.append(" 0 R")
+            list.append(OCG(objNumber: ocg.objNumber, name: ocg.name!))
+        }
+        // The groups are in the order of their names, by the UTF-16 code
+        // units as in every port, and those of the same name in the order
+        // they were added, as the sort of Java keeps it and the sort of Swift
+        // does not.
+        list = list.enumerated().sorted {
+            let units1 = Array($0.element.name.utf16)
+            let units2 = Array($1.element.name.utf16)
+            return (units1 == units2) ? $0.offset < $1.offset
+                    : units1.lexicographicallyPrecedes(units2)
+        }.map { $0.element }
+
+        append("/OCProperties\n")
+        append(Token.beginDictionary)
+        append("/OCGs [")
+        append(buf)
+        append(" ]\n")
+        append("/D <<\n")
+
+        // PDF/UA and PDF/A ask for the configuration to have a name and no
+        // usage states, /AS, which say when a group is printed: a group set
+        // not to print prints in such a document.
+        if compliance == Compliance.PDF_1_7 {
+            append("/AS [\n")
+            append("<< /Event /View /Category [/View] /OCGs [")
+            append(buf)
+            append(" ] >>\n")
+            append("<< /Event /Print /Category [/Print] /OCGs [")
+            append(buf)
+            append(" ] >>\n")
+            append("<< /Event /Export /Category [/Export] /OCGs [")
+            append(buf)
+            append(" ] >>\n")
+            append("]\n")
+        } else {
+            append("/Name ")
+            appendLiteralString("Default")
+            append("\n")
+        }
+
+        // The groups hidden by default, for the viewers that read the
+        // configuration and not the usage of each group
+        var off = String()
+        for ocg in self.groups where !ocg.visible {
+            off.append(" ")
+            off.append(String(ocg.objNumber))
+            off.append(" 0 R")
+        }
+        if !off.isEmpty {
+            append("/OFF [")
+            append(off)
+            append(" ]\n")
+        }
+
+        append("/Order [")
+        for ocg in list {
+            append(" ")
+            append(ocg.objNumber)
+            append(" 0 R ")
+        }
+        append("]\n")
+
+        append(Token.endDictionary)
+        append(Token.endDictionary)
+    }
+
+    /// Adds the page to this document.
+    public func addPage(_ page: Page) {
+        if completed {
+            fail("The PDF was already completed.")
+            return
+        }
+        if page.pdf !== self {
+            fail("The page belongs to another PDF.")
+            return
+        }
+        if page.added {
+            fail("The page was already added to the PDF.")
+            return
+        }
+        if pagesObjNumber != 0 {
+            // The page tree of the objects that addObjects wrote does not list it.
+            fail("A page cannot be added to a PDF that addObjects added the objects of an existing PDF to.")
+            return
+        }
+        page.added = true
+        if page.objNumber == 0 {
+            page.objNumber = reserveObjNumber()
+        }
+        // A page that was drawn before it was added has elements of its own.
+        if isTagged() {
+            page.setStructElementsPageObjNumber(page.objNumber)
+        }
+        pages.append(page)
+        if prevPage != nil {
+            addPageContent(prevPage!)
+        }
+        prevPage = page
+    }
+
+    /// Adds the pages to this document.
+    public func addPages(_ pages: [Page]) {
+        for page in pages {
+            addPage(page)
+        }
+    }
+
+    ///
+    /// Completes the construction of the PDF and writes it to the output stream.
+    /// The output stream is then automatically closed.
+    ///
+    /// - Throws: an error if the PDF cannot be written to the output stream.
+    ///
+    public func complete() throws {
+        try complete(closeStream: true)
+    }
+
+    ///
+    /// Completes the construction of the PDF and writes it to the output stream,
+    /// which is then closed when closeStream is true, else flushed and left
+    /// open: for several PDFs written into one stream.
+    ///
+    /// - Parameter closeStream: whether the output stream is closed.
+    /// - Throws: an error if the PDF cannot be written to the output stream.
+    ///
+    public func complete(closeStream: Bool) throws {
+        // The output stream is closed also when the document could not be
+        // completed, unless it is to be left open.
+        do {
+            try writeRest()
+        } catch {
+            if closeStream {
+                try? os?.close()
+            } else {
+                try? os?.flushAndLeaveOpen()
+            }
+            throw error
+        }
+        if closeStream {
+            try os!.close()
+        } else {
+            try os!.flushAndLeaveOpen()
+        }
+    }
+
+    // Writes the rest of the PDF.
+    private func writeRest() throws {
+        if completed {
+            let message = "complete() was already called."
+            fail(message)
+            throw PDFjetError(message: message)
+        }
+        if let error = error {
+            throw PDFjetError(message: "The PDF was not completed because of an earlier error: " + error)
+        }
+        if pages.isEmpty && pagesObjNumber == 0 {
+            let message = "A PDF needs at least one page."
+            fail(message)
+            throw PDFjetError(message: message)
+        }
+        // PDF/UA asks for the title of the document, which a reader shows in
+        // place of the name of the file.
+        if (compliance == Compliance.PDF_UA_1 || compliance == Compliance.PDF_A_3A_UA_1)
+                && (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let message = "A PDF/UA document needs a title: use setTitle."
+            fail(message)
+            throw PDFjetError(message: message)
+        }
+        // PDF/A and PDF/UA ask for every font to be embedded, which a core font
+        // and the deprecated CJK fonts are not: such a document was written as
+        // what it was not (review of 11 October 2026, #6)
+        if compliance != Compliance.PDF_1_7 && !coreFontsInCompliance {
+            for font in fonts where font.isCoreFont || font.isCJK {
+                let message = "The font " + font.name + " is not embedded, which a document of "
+                        + "\(compliance) needs: use a font that is, such as IBM Plex Sans."
+                fail(message)
+                throw PDFjetError(message: message)
+            }
+        }
+        // PDF/A-1 carries no files, PDF/A-2 only documents of PDF/A, and PDF/A-3
+        // each as an associated file, with its relationship: a file embedded or
+        // attached to a page otherwise made a document that was not PDF/A
+        // (review of 11 October 2026, #5)
+        if isPDFA() {
+            // A file attached to a page of PDF/A-3 that the document carries as an
+            // associated file too is one PDF/A-3 allows, the annotation's /FS the
+            // file specification that /AF lists: it was refused (review of
+            // 12 October 2026, R24)
+            let pdfA3 = !isPDFA1() && compliance != Compliance.PDF_A_2A && compliance != Compliance.PDF_A_2B
+            for file in attachedFiles where !pdfA3 || !associatedFiles.contains(where: { $0 === file }) {
+                let message = "A document of \(compliance)"
+                        + " cannot have a file attached to a page: carry it with addAssociatedFile, in PDF/A-3."
+                fail(message)
+                throw PDFjetError(message: message)
+            }
+            for file in embeddedFiles where !associatedFiles.contains(where: { $0 === file }) {
+                let message = "A document of \(compliance) cannot carry the file " + file.getFileName()
+                        + " but as an associated file: use addAssociatedFile, in PDF/A-3."
+                fail(message)
+                throw PDFjetError(message: message)
+            }
+        }
+        if prevPage != nil {
+            addPageContent(prevPage!)
+        }
+        if let error = error {  // Found when the last page was written.
+            throw PDFjetError(message: error)
+        }
+        completed = true
+        Subset.addTrueTypeFonts(self)
+        if compliance != Compliance.PDF_1_7 {
+            metadataObjNumber = addMetadataObject("", false)
+            outputIntentObjNumber = addOutputIntentObject()
+        }
+
+        if pagesObjNumber == 0 {
+            addAllPages(addResourcesObject())
+            addPagesObject()
+        }
+
+        var structTreeRootObjNumber = 0
+        if isTagged() {
+            // The elements of every page are written with it; the ones still
+            // open and the ones of the annotations are what is left.
+            for page in pages {
+                for element in page.structures {
+                    addStructElementObject(element)
+                }
+                page.structures = [StructElement]()
+            }
+            reserveStructTreeNumbers()
+            structTreeRootObjNumber = addStructTreeRootObject()
+            addNumsParentTree()
+            addStructDocumentObject(structTreeRootObjNumber)
+        }
+
+        // A tagged document with headings, or a document with a Markdown
+        // text, and no bookmarks of its own has the bookmarks of its headings,
+        // which a reader shows as its outline, as PAC asks of a document with
+        // headings
+        if toc == nil && !headings.isEmpty {
+            toc = Bookmark.ofHeadings(self, headings)
+        }
+        var outlineDictNum = 0
+        if toc != nil && toc!.getChildren() != nil {
+            let list: [Bookmark] = toc!.toArrayList()
+            outlineDictNum = addOutlineDict(toc!)
+            var i = 1
+            while i < list.count {
+                addOutlineItem(outlineDictNum, list[i])
+                i += 1
+            }
+        }
+
+        let infoObjNumber = addInfoObject()
+        let rootObjNumber = addRootObject(structTreeRootObjNumber, outlineDictNum)
+        if isPDFA() && objOffset.count > PDF.MAX_PDFA_OBJECTS {
+            // The limit of PDF/A, which was not checked (review of 12 October
+            // 2026, W1)
+            fail("PDF/A limits a document to \(PDF.MAX_PDFA_OBJECTS) objects, and this one has \(objOffset.count).")
+        }
+        let startxref = byteCount
+
+        // Create the xref table
+        append("xref\n")
+        append("0 ")
+        append(rootObjNumber + 1)
+        append("\n")
+        append("0000000000 65535 f \n")
+        var buffer = String()
+        for offset in objOffset {
+            if offset == 0 {    // A number that no object was written for.
+                buffer.append("0000000000 65535 f \n")
+                continue
+            }
+            buffer.append(try PDF.xrefOffset(offset))
+            buffer.append(" 00000 n \n")
+        }
+        append(buffer)
+        append("trailer\n")
+        append(Token.beginDictionary)
+        append("/Size ")
+        append(rootObjNumber + 1)
+        append(Token.newline)
+
+        append("/ID[<")
+        append(uuid)
+        append("><")
+        append(uuid)
+        append(">]\n")
+
+        if let encryption = encryption {
+            append("/Encrypt ")
+            append(encryption.getObjNumber())
+            append(Token.objRef)
+        }
+
+        append("/Info ")
+        append(infoObjNumber)
+        append(Token.objRef)
+
+        append("/Root ")
+        append(rootObjNumber)
+        append(Token.objRef)
+
+        append(Token.endDictionary)
+        append("startxref\n")
+        append(startxref)
+        append(Token.newline)
+        append("%%EOF\n")
+
+        if let error = error {  // Found when the rest of the document was written.
+            throw PDFjetError(message: error)
+        }
+    }
+
+    ///
+    /// Adds a file that the document carries with it: a reader shows it beside
+    /// the document, and a program that reads the document finds it by its
+    /// name. This is how a document of PDF/A-3 carries the data behind what it
+    /// shows, such as the XML of an invoice.
+    ///
+    /// The file names what it holds, how it relates to the document and what
+    /// it is, so it has to be made with the constructor of EmbeddedFile that
+    /// takes them.
+    ///
+    /// - Parameter file: the embedded file.
+    /// - Returns: this PDF object.
+    ///
+    @discardableResult
+    public func addAssociatedFile(_ file: EmbeddedFile) -> PDF {
+        // A file of another PDF is no object of this one: /AF and /EmbeddedFiles
+        // named an object of the other, as a FileAttachment's file is refused
+        // (review of 12 October 2026, R11)
+        if file.pdfIdentity != identity {
+            fail("The embedded file belongs to another PDF.")
+            return self
+        }
+        // PDF/A-1 carries no files at all, and PDF/A-2 only other documents of
+        // PDF/A, so a document of either that carries a file is not the
+        // document it says it is.
+        if compliance == Compliance.PDF_A_1A || compliance == Compliance.PDF_A_1B
+                || compliance == Compliance.PDF_A_2A || compliance == Compliance.PDF_A_2B {
+            fail("A document of \(compliance) cannot carry the file "
+                    + file.getFileName() + ": PDF/A-3 is the one that carries files.")
+            return self
+        }
+        if file.relationship == nil {
+            fail("The file " + file.getFileName()
+                    + " was embedded without a media type, a relationship and a description, "
+                    + "which a file the document carries needs: use the constructor of "
+                    + "EmbeddedFile that takes them.")
+            return self
+        }
+        // PDF/A-3 asks a file it carries for what it holds, its /Subtype, and
+        // for its size and date, which are written with the media type.
+        if (file.mediaType ?? "").isEmpty && (compliance == PDF.complianceA3A
+                || compliance == Compliance.PDF_A_3B || compliance == Compliance.PDF_A_3A_UA_1) {
+            fail("The file " + file.getFileName()
+                    + " was embedded without a media type, which a file of a document of PDF/A-3 needs.")
+            return self
+        }
+        associatedFiles.append(file)
+        return self
+    }
+
+    ///
+    /// Attaches the text, in UTF-8, as a file the document carries: an
+    /// associated file of the relationship Source, of the media type
+    /// "text/plain". The encoding is told in the description, since PDF/A-3
+    /// takes a media type with no parameters. This is how a document whose
+    /// text is drawn as outlines, with Page.drawGlyphs, which cannot be
+    /// selected or searched, carries its exact text for anyone who needs it: a reader
+    /// shows the file beside the document. It is attached only when this is
+    /// called. A document of PDF/A-1, which carries no files, or of PDF/A-2,
+    /// which carries only documents of PDF/A, refuses it.
+    ///
+    /// - Parameters:
+    ///   - name: the name of the file, such as "article-1.txt".
+    ///   - text: the text.
+    /// - Returns: this PDF object.
+    ///
+    @discardableResult
+    public func attachText(_ name: String, _ text: String) throws -> PDF {
+        if name.isEmpty {
+            let message = "attachText needs the name of the file and the text."
+            fail(message)
+            throw PDFjetError(message: message)
+        }
+        if compliance == Compliance.PDF_A_1A || compliance == Compliance.PDF_A_1B
+                || compliance == Compliance.PDF_A_2A || compliance == Compliance.PDF_A_2B {
+            let message = "A document of \(compliance) cannot carry the text " + name
+                    + ": PDF/A-1 carries no files and PDF/A-2 only documents of PDF/A;"
+                    + " PDF/A-3 and PDF/UA carry it."
+            fail(message)
+            throw PDFjetError(message: message)
+        }
+        let file = try EmbeddedFile(self, name, InputStream(data: Data(text.utf8)), true,
+                "text/plain", Relationship.SOURCE, "The text of this document, in UTF-8.")
+        return addAssociatedFile(file)
+    }
+
+    ///
+    /// Adds a description to the metadata of the document: the rdf:Description
+    /// element of a standard that asks for properties of its own, such as the
+    /// invoice standards that say which of the files the document carries is
+    /// the invoice. The text is written into the metadata as it is given, so it
+    /// has to be XML, and the document has to be of PDF/A or PDF/UA, which are
+    /// the documents that carry metadata.
+    ///
+    /// - Parameter rdfDescription: the rdf:Description element.
+    /// - Returns: this PDF object.
+    ///
+    @discardableResult
+    public func addMetadata(_ rdfDescription: String) -> PDF {
+        metadata.append(rdfDescription)
+        return self
+    }
+
+    ///
+    /// Set the "Language" document property of the PDF file.
+    /// - Parameter language: The language of this document.
+    ///
+    @discardableResult
+    public func setLanguage(_ language: String) -> PDF {
+        self.language = language
+        self.languageSet = true
+        return self
+    }
+
+    ///
+    /// Sets whether the content of the pages is compressed. It is unless set.
+    /// Uncompressed content is larger, and can be read in a text editor, to see
+    /// what a page draws. The fonts, the images and the embedded files are
+    /// compressed either way. A page is compressed when it is written, so set it
+    /// before the pages are added.
+    /// - Parameter compression: false to write the content of the pages uncompressed.
+    ///
+    @discardableResult
+    public func setCompression(_ compression: Bool) -> PDF {
+        self.contentStreamsCompression = compression
+        return self
+    }
+
+    ///
+    /// Set the "Title" document property of the PDF file.
+    /// - Parameter title: The title of this document.
+    ///
+    // An empty document property is the same as one that was never set: it is
+    // not written, as in the Go port, which cannot tell the two apart.
+    @discardableResult
+    public func setTitle(_ title: String) -> PDF {
+        let title = PDF.cleanText(title)
+        self.title = title.isEmpty ? nil : title
+        return self
+    }
+
+    ///
+    /// Set the "Author" document property of the PDF file.
+    /// - Parameter author: The author of this document.
+    ///
+    @discardableResult
+    public func setAuthor(_ author: String) -> PDF {
+        let author = PDF.cleanText(author)
+        self.author = author.isEmpty ? nil : author
+        return self
+    }
+
+    ///
+    /// Set the "Subject" document property of the PDF file.
+    /// - Parameter subject: The subject of this document.
+    ///
+    @discardableResult
+    public func setSubject(_ subject: String) -> PDF {
+        let subject = PDF.cleanText(subject)
+        self.subject = subject.isEmpty ? nil : subject
+        return self
+    }
+
+    ///
+    /// Set the "Keywords" document property of the PDF file.
+    /// - Parameter keywords: The keywords of this document.
+    ///
+    @discardableResult
+    public func setKeywords(_ keywords: String) -> PDF {
+        let keywords = PDF.cleanText(keywords)
+        self.keywords = keywords.isEmpty ? nil : keywords
+        return self
+    }
+
+    ///
+    /// Set the "Creator" document property of the PDF file.
+    /// - Parameter creator: The creator of this document.
+    ///
+    @discardableResult
+    public func setCreator(_ creator: String) -> PDF {
+        let creator = PDF.cleanText(creator)
+        self.creator = creator.isEmpty ? nil : creator
+        return self
+    }
+
+    /// Sets the page layout used when the document is opened. See PageLayout.
+    @discardableResult
+    public func setPageLayout(_ pageLayout: PageLayout) -> PDF {
+        self.pageLayout = pageLayout
+        return self
+    }
+
+    /// Sets the page mode used when the document is opened. See PageMode.
+    @discardableResult
+    public func setPageMode(_ pageMode: PageMode) -> PDF {
+        self.pageMode = pageMode
+        return self
+    }
+
+    func append(_ number: UInt8) {
+        append([UInt8](arrayLiteral: number))
+    }
+
+    func append(_ number: Int32) {
+        append(Int(number))
+    }
+
+    func append(_ number: Int) {
+        // The digits are written from the last, into a buffer of the PDF, as
+        // a string of the number would be made and thrown away every time.
+        var i = digits.count
+        var magnitude = number.magnitude
+        repeat {
+            i -= 1
+            digits[i] = UInt8(ascii: "0") + UInt8(magnitude % 10)
+            magnitude /= 10
+        } while magnitude > 0
+        if number < 0 {
+            i -= 1
+            digits[i] = UInt8(ascii: "-")
+        }
+        append(digits, i, digits.count - i)
+    }
+
+    func append(_ val: Float) {
+        if !FastFloat.isWritable(val) {
+            fail(FastFloat.NOT_WRITABLE)
+        }
+        append(FastFloat.toByteArray(val))
+    }
+
+    func append(_ str: String) {
+        if str.isEmpty {
+            return
+        }
+        append(Array(str.utf8))
+    }
+
+    func append(_ buf: [UInt8], _ off: Int, _ len: Int) {
+        os!.write(buf, off, len)
+        self.byteCount += len
+    }
+
+    func append(_ buf: [UInt8]) {
+        os!.write(buf)
+        self.byteCount += buf.count
+    }
+
+    // The highest object number read in a file of any size: its empty objects
+    // take about 70 MB.
+    private static let minObjNumberLimit = 262144
+
+    // Returns the objects by their number, with an empty object at the number
+    // of every one the PDF does not have, so that the object a reference names
+    // is the one at its number. A PDF may number its objects as it likes, and
+    // one that kept the numbers of the document it was cut from has few
+    // objects and high numbers, so a number up to minObjNumberLimit is read in
+    // any file, and a larger one in a file that has as many bytes. The empty
+    // objects up to a larger number would take the memory a file of a few
+    // bytes never names.
+    //
+    // The empty objects past minObjNumberLimit are taken from the budget as the
+    // objects of object streams are: each one takes a few hundred bytes, and a
+    // file of 16 MB that numbered its one object 16,000,000 made 4.3 GB of
+    // them, more than the 128 bytes for each byte of the PDF that the reader
+    // may take.
+    func getSortedObjects(
+            _ objects: [PDFobj], _ size: Int, _ budget: PDFobj.DecodeBudget) throws -> [PDFobj] {
+        var maxObjNumber = 0
+        for obj in objects {
+            if obj.number > maxObjNumber {
+                maxObjNumber = obj.number
+            }
+        }
+        if maxObjNumber > max(size, PDF.minObjNumberLimit) {
+            throw PDFjetError(message: "The PDF of \(size) bytes cannot hold "
+                    + "an object numbered \(maxObjNumber).")
+        }
+        var byNumber = [PDFobj?](repeating: nil, count: maxObjNumber)
+        for obj in objects where obj.number > 0 {
+            byNumber[obj.number - 1] = obj
+        }
+        var empty = -PDF.minObjNumberLimit
+        for obj in byNumber where obj == nil {
+            empty += 1
+        }
+        if empty > 0 {
+            let free = min(empty, budget.freeObjects)
+            budget.freeObjects -= free
+            if empty - free > budget.left / PDF.objectCost {
+                throw PDFjetError(message: "The PDF of \(size) bytes cannot hold "
+                        + "an object numbered \(maxObjNumber).")
+            }
+            budget.left -= (empty - free) * PDF.objectCost
+        }
+        var sorted = [PDFobj]()
+        sorted.reserveCapacity(maxObjNumber)
+        for (i, found) in byNumber.enumerated() {
+            if let obj = found {
+                sorted.append(obj)
+            } else {
+                let obj = PDFobj()
+                obj.setNumber(i + 1)
+                sorted.append(obj)
+            }
+        }
+        return sorted
+    }
+
+    // Returns the number of the object that holds the /Length of the stream,
+    // or 0 when the /Length is not a reference.
+    private func lengthReference(_ obj: PDFobj) -> Int {
+        guard let open = obj.dict.firstIndex(of: "<<") else {
+            return 0
+        }
+        let key = PDF.entryIndex(Array(obj.dict[open...]), "/Length")
+        if key == -1 {
+            return 0
+        }
+        let i = key + open
+        if i + 3 >= obj.dict.count || obj.dict[i + 2] != "0" || obj.dict[i + 3] != "R" {
+            return 0
+        }
+        return max(toInteger(obj.dict[i + 1]), 0)
+    }
+
+    ///
+    /// Returns a list of objects of type PDFobj read from input stream.
+    /// An encrypted PDF is decrypted when it opens without a password.
+    ///
+    /// - Parameter stream: the PDF input stream.
+    ///
+    /// - Returns: [PDFobj] the list of PDF objects.
+    ///
+    public func read(from stream: InputStream) throws -> [PDFobj] {
+        return try read(from: stream, password: "")
+    }
+
+    ///
+    /// Returns a list of objects of type PDFobj read from input stream, which
+    /// holds a PDF that is encrypted with the standard security handler. The
+    /// PDF is decrypted with the password, which is its user or its owner
+    /// password.
+    ///
+    /// - Parameter stream: the PDF input stream.
+    /// - Parameter password: the user or owner password of the PDF.
+    ///
+    /// - Returns: [PDFobj] the list of PDF objects.
+    /// - Throws: DecryptorError when the password is not correct.
+    ///
+    public func read(from stream: InputStream, password: String) throws -> [PDFobj] {
+        return try read(from: stream, password: password, decodedTotal: PDFobj.maxDecodedTotal)
+    }
+
+    /// read(from:password:) with the budget of what the streams of the PDF may
+    /// decode to together, which a test lowers.
+    func read(from stream: InputStream, password: String, decodedTotal: Int) throws -> [PDFobj] {
+        var buffer1 = try Content.getFromStream(stream)
+        var objects1 = [PDFobj]()
+        let budget = PDFobj.DecodeBudget(buffer1.count, decodedTotal)   // For all the streams of this PDF together
+        let startXRef = getStartXRef(buffer1)
+        var trailer: PDFobj?
+        do {
+            var visited = Set<Int>()
+            trailer = try getObjects(&buffer1, startXRef, &objects1, 0, &visited, budget)
+        } catch let error as PDFobj.DecodedTotalError {
+            throw error         // Not a reason to scan the PDF for its objects
+        } catch {
+            trailer = nil       // A cross-reference stream that cannot be decoded.
+        }
+        if trailer == nil || objects1.isEmpty {
+            // The cross-reference table is missing or wrong, like in a PDF that
+            // was changed without updating it.
+            objects1.removeAll()
+            trailer = getObjectsByScanning(buffer1, &objects1, budget)
+        }
+        let decryptor = try Decryptor.getDecryptor(trailer, objects1, password)
+
+        // The object of each number, for a /Length that is an object of its own.
+        // The newest version of an object that was updated comes last and wins.
+        var numbered = [Int: PDFobj]()
+        for obj in objects1 {
+            numbered[obj.number] = obj
+        }
+        let readSoFar = ReadObjects(Array(numbered.values))
+
+        var objects2 = [PDFobj]()
+        // The streams whose /Length is an object in an object stream, read
+        // when the object streams have been: ISO 32000-1 7.5.7 keeps only the
+        // /Length of an object stream out of one, and pdfTeX and Ghostscript
+        // put the /Length of other streams in them. Read before, such a stream
+        // ended at the first endstream, even one in its data.
+        var deferred = [PDFobj]()
+        for obj in objects1 {
+            let type = obj.getValue("/Type")
+            if type == "/XRef" {
+                continue        // Skip the cross-reference streams.
+            }
+            if let decryptor = decryptor {
+                if obj.number == decryptor.objNumber {
+                    continue    // Skip the encryption dictionary.
+                }
+                decryptor.decryptStrings(obj)
+            }
+            if obj.dict.contains("stream") {
+                let number = lengthReference(obj)
+                if number > 0 && numbered[number] == nil && type != "/ObjStm" {
+                    deferred.append(obj)
+                } else {
+                    obj.readObjects = readSoFar     // For a /Filter that is an object of its own
+                    try obj.setStreamAndData(&buffer1, try obj.getLength(numbered), decryptor, budget)
+                }
+            }
+            if type == "/ObjStm" {
+                // A malformed object stream is an error, as in the other
+                // ports, and not a reason to stop the program.
+                let first = try objectStreamNumber(obj.getValue("/First"))
+                // Its objects are read in no more than its length in all, as
+                // one whose offset is listed again was read again: a stream
+                // of a few kilobytes that decodes to a megabyte, with an
+                // object listed a thousand times, took seconds.
+                let streamBudget = PDFobj.DecodeBudget(0)
+                streamBudget.readLeft = obj.data.count
+                // No more objects than its /N says, and each taken from the
+                // PDF's budget as the memory it takes: a header of 64 MB of
+                // "1 0 " made millions of objects, gigabytes, from a PDF of
+                // 65 KB (review of 11 October 2026, #30). The header is read
+                // no further than those numbers: one of 200 MB was split into
+                // its tokens first, 10.8 GB in Go (review of 12 October 2026,
+                // R6).
+                var pairs = budget.freeObjects + budget.left / PDF.objectCost + 1    // One more fails.
+                if let count = try? objectStreamNumber(obj.getValue("/N")) {
+                    pairs = min(pairs, count)
+                }
+                let header = objectStreamHeader(obj.data, min(first, obj.data.count), 2 * pairs)
+                var i = 0
+                while i + 1 < header.count {
+                    if budget.freeObjects > 0 {
+                        budget.freeObjects -= 1
+                    } else {
+                        budget.left -= PDF.objectCost
+                        if budget.left < 0 {
+                            throw PDFobj.DecodedTotalError(total: budget.total)
+                        }
+                    }
+                    let num = header[i]
+                    let number = try objectStreamNumber(num)
+                    let off = try objectStreamNumber(header[i + 1])
+                    var end = obj.data.count
+                    if i <= header.count - 4 {
+                        end = min(first + (try objectStreamNumber(header[i + 3])), obj.data.count)
+                    }
+                    let o3 = readObject(obj.data, first + off, end, streamBudget)
+                    o3.number = number
+                    o3.dict.insert(contentsOf: [num, "0", "obj"], at: 0)
+                    objects2.append(o3)
+                    i += 2
+                }
+            } else {
+                objects2.append(obj)
+            }
+        }
+        if !deferred.isEmpty {
+            // The objects of the object streams, whose numbers no object of
+            // the PDF's own has: the newest one of a number comes last and
+            // wins.
+            var inStreams = [Int: PDFobj]()
+            for obj in objects2 where numbered[obj.number] == nil {
+                inStreams[obj.number] = obj
+            }
+            numbered.merge(inStreams) { _, inStream in inStream }
+            // With the objects of the object streams, as in the other ports:
+            // the objects read so far had none, and the Identity /Crypt filter
+            // of a stream was not found in one.
+            let merged = ReadObjects(Array(numbered.values))
+            for obj in deferred {
+                obj.readObjects = merged        // For a /Filter that is an object of its own
+                try obj.setStreamAndData(&buffer1, try obj.getLength(numbered), decryptor, budget)
+            }
+        }
+        let sorted = try getSortedObjects(objects2, buffer1.count, budget)
+        if let root = PDF.objectNumbered(sorted, String(trailerRoot(trailer))) {
+            root.root = true
+        }
+        let readObjects = ReadObjects(sorted)
+        for obj in sorted {
+            obj.readObjects = readObjects
+        }
+        // Each image holds its masks; not a mask with a mask of its own, which
+        // is not copied, so that two images that name each other do not hold
+        // each other
+        for obj in sorted where obj.getValue("/Subtype") == "/Image" {
+            for key in ["/SMask", "/Mask"] {
+                let tokens = obj.valueTokens(key)
+                if tokens.count == 3, tokens[2] == "R", let number = Int(tokens[0]),
+                        number != obj.number, let mask = readObjects.object(number),
+                        mask.valueTokens("/SMask").isEmpty, mask.valueTokens("/Mask").isEmpty {
+                    obj.masks[number] = mask
+                }
+            }
+        }
+        return sorted
+    }
+
+    // Returns the number of the catalog that the /Root of the trailer names, or
+    // 0. The trailer is the dictionary after the cross-reference table, or that
+    // of the cross-reference stream.
+    private func trailerRoot(_ trailer: PDFobj?) -> Int {
+        guard let trailer = trailer, let open = trailer.dict.firstIndex(of: "<<") else {
+            return 0
+        }
+        let tokens = Array(trailer.dict[open...])
+        let i = PDF.entryIndex(tokens, "/Root")
+        if i == -1 || !PDF.isReference(tokens, i + 1) {
+            return 0
+        }
+        return toInteger(tokens[i + 1])
+    }
+
+    // Returns the number in the header of an object stream, which is digits and
+    // no more than the largest int of 32 bits, as in the other ports.
+    private func objectStreamNumber(_ token: String) throws -> Int {
+        let number = toInteger(token)
+        if number < 0 {
+            throw PDFjetError(message: "The object stream of the PDF is malformed: \"\(token)\" is not a number.")
+        }
+        return number
+    }
+
+    private func process(
+            _ obj: PDFobj,
+            _ token: inout [UInt8],
+            _ buffer: [UInt8],
+            _ offset: Int) -> Bool {
+        // Like trim() in Java, which removes the characters up to the space.
+        var start = 0
+        var end = token.count
+        while start < end && token[start] <= 0x20 {
+            start += 1
+        }
+        while end > start && token[end - 1] <= 0x20 {
+            end -= 1
+        }
+        if start == end {
+            token.removeAll()
+            return false
+        }
+        // ISO Latin 1 keeps each byte of a string as a character.
+        let str = String(bytes: token[start..<end], encoding: .isoLatin1)!
+        obj.dict.append(str)
+        token.removeAll()
+        if str == "endobj" {
+            return true
+        }
+        if str == "stream" {
+            // The keyword ends with CRLF or LF, and the tokenizer consumed the
+            // first of those bytes, so only the LF of a CRLF is left to skip.
+            // A data byte that is a line feed, like the first byte of the IV
+            // of an encrypted stream, stays.
+            obj.streamOffset = offset
+            if offset > 0 && buffer[offset - 1] == 0x0D && offset < buffer.count && buffer[offset] == 0x0A {
+                obj.streamOffset += 1
+            }
+            return true
+        }
+        if str == "startxref" {
+            return true
+        }
+        return false
+    }
+
+    private func getObject(_ buf: [UInt8], _ off: Int) -> PDFobj {
+        if off < 0 || off >= buf.count {
+            return PDFobj()     // An offset outside of the PDF has no tokens.
+        }
+        return getObject(buf, off, buf.count)
+    }
+
+    // Returns the object at the offset, which ends at len at the latest.
+    private func getObject(_ buf: [UInt8], _ off: Int, _ len: Int) -> PDFobj {
+        var offset = off
+        let obj = PDFobj()
+        obj.offset = offset
+        obj.end = len
+        var token = [UInt8]()
+
+        var p = 0               // The nesting level of the parentheses in a literal string
+        var done = false
+        while !done && offset < len {
+            let c2 = buf[offset]
+            offset += 1
+            if p > 0 {
+                // A literal string is one token, with its white space and
+                // delimiters. A backslash escapes the character after it.
+                token.append(c2)
+                if c2 == 0x5C {             // "\\"
+                    if offset < len {
+                        token.append(buf[offset])
+                        offset += 1
+                    }
+                } else if c2 == 0x28 {      // "("
+                    p += 1
+                } else if c2 == 0x29 {      // ")"
+                    p -= 1
+                    if p == 0 {
+                        done = process(obj, &token, buf, offset)
+                    }
+                }
+            } else if c2 == 0x28 {          // "("
+                done = process(obj, &token, buf, offset)
+                if !done {
+                    token.append(c2)
+                    p = 1
+                }
+            } else if isWhiteSpace(c2) {
+                done = process(obj, &token, buf, offset)
+            } else if c2 == 0x2F {          // "/"
+                done = process(obj, &token, buf, offset)
+                if !done {
+                    token.append(c2)
+                }
+            } else if c2 == 0x3C || c2 == 0x3E {    // "<" or ">"
+                done = process(obj, &token, buf, offset)
+                if !done {
+                    if offset < len && buf[offset] == c2 {
+                        obj.dict.append((c2 == 0x3C) ? "<<" : ">>")
+                        offset += 1
+                    } else if c2 == 0x3C {
+                        // A hexadecimal string is one token, without its white space.
+                        token.append(c2)
+                        while offset < len && buf[offset] != 0x3E {
+                            if !isWhiteSpace(buf[offset]) {
+                                token.append(buf[offset])
+                            }
+                            offset += 1
+                        }
+                        token.append(0x3E)
+                        offset += 1
+                        done = process(obj, &token, buf, offset)
+                    } else {
+                        obj.dict.append(">")
+                    }
+                }
+            } else if c2 == 0x25 {          // "%"
+                // A comment ends at the end of the line.
+                done = process(obj, &token, buf, offset)
+                while !done && offset < len && buf[offset] != 0x0A && buf[offset] != 0x0D {
+                    offset += 1
+                }
+            } else if c2 == 0x5B ||         // "["
+                    c2 == 0x5D ||           // "]"
+                    c2 == 0x7B ||           // "{"
+                    c2 == 0x7D {            // "}"
+                done = process(obj, &token, buf, offset)
+                if !done {
+                    if c2 == 0x5B {
+                        obj.dict.append("[")
+                    } else if c2 == 0x5D {
+                        obj.dict.append("]")
+                    } else if c2 == 0x7B {
+                        obj.dict.append("{")
+                    } else {
+                        obj.dict.append("}")
+                    }
+                }
+            } else {
+                token.append(c2)
+            }
+        }
+        if !done {
+            _ = process(obj, &token, buf, offset)   // The last token, at the end of the data.
+        }
+        obj.read = offset
+
+        return obj
+    }
+
+    // Returns the object at the offset that a cross-reference section or an
+    // object stream names, or the section itself, which ends at end at the
+    // latest, and takes the bytes it reads from the budget. An object that
+    // what is left of the budget does not reach the end of has no tokens, as
+    // one that is outside of the PDF, and the PDF is then read by looking for
+    // its objects: a thousand sections chained by /Prev with no startxref
+    // after them, or a table that lists one object thousands of times, was
+    // each read to the end of the PDF or of the object.
+    private func readObject(_ buf: [UInt8], _ off: Int, _ end: Int, _ budget: PDFobj.DecodeBudget) -> PDFobj {
+        if off < 0 || off >= buf.count {
+            return PDFobj()
+        }
+        let end = min(end, buf.count)
+        let limit = min(end, off + max(budget.readLeft, 0))
+        let obj = getObject(buf, off, limit)
+        budget.readLeft -= obj.read - off
+        if limit < end && obj.read >= limit {
+            return PDFobj()
+        }
+        return obj
+    }
+
+    // Returns the numbers of the header of an object stream, the first length
+    // bytes of its data, split at white space, no more than count of them.
+    private func objectStreamHeader(_ data: [UInt8], _ length: Int, _ count: Int) -> [String] {
+        var header = [String]()
+        header.reserveCapacity(max(0, min(count, 1024)))
+        var i = 0
+        while i < length && header.count < count {
+            while i < length && isWhiteSpace(data[i]) {
+                i += 1
+            }
+            let start = i
+            while i < length && !isWhiteSpace(data[i]) {
+                i += 1
+            }
+            // A token of more than 20 bytes is no number of a header, and only its
+            // first 20 are copied, with "..." after them: a header of one token
+            // as long as the stream was copied whole, uncharged (review of 12
+            // October 2026, N3).
+            if i - start > 20 {
+                header.append(String(bytes: data[start..<start + 20], encoding: .isoLatin1)! + "...")
+            } else if i > start {
+                header.append(String(bytes: data[start..<i], encoding: .isoLatin1)!)
+            }
+        }
+        return header
+    }
+
+    private func isWhiteSpace(_ c: UInt8) -> Bool {
+        return c == 0x00            // Null
+            || c == 0x09            // Horizontal Tab
+            || c == 0x0A            // Line Feed (LF)
+            || c == 0x0C            // Form Feed
+            || c == 0x0D            // Carriage Return (CR)
+            || c == 0x20            // Space
+    }
+
+    ///
+    /// Converts an array of bytes to an integer.
+    /// - Parameter buf: byte[]
+    /// - Returns: int
+    ///
+    private func toInt(
+            _ buf: [UInt8],
+            _ off: Int,
+            _ len: Int) -> Int {
+        var n = 0
+        var i = 0
+        while i < len {
+            n |= Int(buf[off + i]) & 0xFF
+            if i < (len - 1) {
+                n = n &<< 8
+            }
+            i += 1
+        }
+        return n
+    }
+
+    // Returns the value of the token, or -1 when it is not an integer.
+    private func toInteger(_ token: String) -> Int {
+        if isInteger(token), let value = Int32(token) {
+            return Int(value)
+        }
+        return -1
+    }
+
+    // Returns true when the tokens of the object start with "number generation
+    // obj", where the number is above 0, and is the number that is given unless
+    // that is -1.
+    private func isObject(_ obj: PDFobj, _ number: Int) -> Bool {
+        if obj.dict.count < 3 || obj.dict[2] != "obj" || !isInteger(obj.dict[1]) {
+            return false
+        }
+        let n = toInteger(obj.dict[0])
+        return n > 0 && (number == -1 || n == number)
+    }
+
+    ///
+    /// Adds the objects of the cross-reference section at the offset to the
+    /// list, after the objects of the sections before it, so that the newest
+    /// version of an object that was updated comes last. A section is a
+    /// cross-reference table, which can have an /XRefStm stream for the
+    /// objects in object streams, or a cross-reference stream.
+    ///
+    /// A section that a /Prev leads back to, which visited holds the offset
+    /// of, is a broken PDF, and is not read again: a /Prev that points at its
+    /// own section read the section a thousand times.
+    ///
+    /// - Returns: the trailer of the section, which is the cross-reference
+    ///   stream object when there is no table, or nil when an offset in the
+    ///   section is not that of its object.
+    ///
+    private func getObjects(
+            _ buf: inout [UInt8],
+            _ offset: Int,
+            _ objects: inout [PDFobj],
+            _ depth: Int,
+            _ visited: inout Set<Int>,
+            _ budget: PDFobj.DecodeBudget) throws -> PDFobj? {
+        if !visited.insert(offset).inserted {
+            return nil
+        }
+        let xref = readObject(buf, offset, buf.count, budget)
+        let table = !xref.dict.isEmpty && xref.dict[0] == "xref"
+        if depth > 1000 || (!table && !isObject(xref, -1)) {
+            return nil
+        }
+        let prev = xref.getValue("/Prev")
+        if !prev.isEmpty {
+            if try getObjects(&buf, toInteger(prev), &objects, depth + 1, &visited, budget) == nil {
+                return nil
+            }
+        }
+        if table {
+            // The objects in the table replace those in the /XRefStm stream.
+            let xrefStm = xref.getValue("/XRefStm")
+            if !xrefStm.isEmpty {
+                let stream = readObject(buf, toInteger(xrefStm), buf.count, budget)
+                if try !getStreamObjects(&buf, stream, &objects, budget) {
+                    return nil
+                }
+            }
+            if !getTableObjects(buf, xref, &objects, budget) {
+                return nil
+            }
+        } else if try !getStreamObjects(&buf, xref, &objects, budget) {
+            return nil
+        }
+        return xref
+    }
+
+    // Returns the index of the first of the sorted values that is greater than
+    // the value, or the number of values when there is none.
+    private static func firstAfter(_ sorted: [Int], _ value: Int) -> Int {
+        var low = 0
+        var high = sorted.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if sorted[mid] <= value {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
+    // Adds the objects of the entries, and returns false when an offset is not
+    // that of its object. An object ends where the next one of the section
+    // starts at the latest, as one with no endobj was read to the end of the
+    // PDF: a section of objects with no endobj took seconds for every hundred
+    // kilobytes.
+    private func getEntryObjects(
+            _ buf: [UInt8],
+            _ entries: [(number: Int, offset: Int)],
+            _ objects: inout [PDFobj],
+            _ budget: PDFobj.DecodeBudget) -> Bool {
+        let offsets = entries.map { $0.offset }.sorted()
+        for entry in entries {
+            var end = buf.count
+            let j = PDF.firstAfter(offsets, entry.offset)
+            if j < offsets.count {
+                end = min(offsets[j], buf.count)
+            }
+            let obj = readObject(buf, entry.offset, end, budget)
+            if !isObject(obj, entry.number) {
+                return false
+            }
+            obj.number = entry.number
+            objects.append(obj)
+        }
+        return true
+    }
+
+    // Adds the objects in use of a cross-reference table, and returns false
+    // when an offset is not that of its object.
+    private func getTableObjects(
+            _ buf: [UInt8], _ xref: PDFobj, _ objects: inout [PDFobj], _ budget: PDFobj.DecodeBudget) -> Bool {
+        var entries = [(number: Int, offset: Int)]()
+        let dict = xref.dict
+        var i = 1
+        // Each subsection starts with its first object number and the number of entries.
+        while i + 1 < dict.count && isInteger(dict[i]) {
+            var number = toInteger(dict[i])
+            let count = toInteger(dict[i + 1])
+            i += 2
+            var j = 0
+            while j < count {
+                if i + 2 >= dict.count {
+                    return false
+                }
+                // The entry is the offset, the generation number and n for an
+                // object in use. Object 0 heads the list of free objects, and one
+                // that is marked in use, as pdf.js tests it in issue10004, is
+                // skipped, as MuPDF skips it.
+                if dict[i + 2] == "n" && number != 0 {
+                    entries.append((number, toInteger(dict[i])))
+                }
+                j += 1
+                number += 1
+                i += 3
+            }
+        }
+        return i < dict.count && dict[i] == "trailer" && getEntryObjects(buf, entries, &objects, budget)
+    }
+
+    // minObjectBytes is the fewest bytes an object of a PDF takes, "1 0 obj
+    // endobj" less its spaces, and objectCost what an object read takes of the
+    // PDF's budget of decoded bytes, about the memory it takes, so that a PDF
+    // of a few KB cannot make millions of objects (review of 11 October 2026).
+    static let minObjectBytes = 12
+    static let objectCost = 256
+
+    // Adds the objects of a cross-reference stream that are not in object
+    // streams, and returns false when an offset is not that of its object.
+    private func getStreamObjects(
+            _ buf: inout [UInt8],
+            _ xref: PDFobj,
+            _ objects: inout [PDFobj],
+            _ budget: PDFobj.DecodeBudget) throws -> Bool {
+        if !isObject(xref, -1) || xref.getValue("/Type") != "/XRef" || !xref.dict.contains("stream") {
+            return false
+        }
+        // See page 50 in PDF32000_2008.pdf
+        let dict = xref.dict
+        guard let w = dict.firstIndex(of: "/W"), w + 4 < dict.count else {
+            return false
+        }
+        let n1 = toInteger(dict[w + 2])     // Field 1 number of bytes
+        let n2 = toInteger(dict[w + 3])     // Field 2 number of bytes
+        let n3 = toInteger(dict[w + 4])     // Field 3 number of bytes
+        let length = toInteger(xref.getValue("/Length"))
+        if n1 < 0 || n2 < 0 || n3 < 0 || n1 + n2 + n3 == 0 ||
+                length < 0 || xref.streamOffset + length > buf.count {
+            return false
+        }
+        // The /Index array has the first object number and the number of
+        // entries of each subsection, and is [0 /Size] when it is missing.
+        var index = [Int]()
+        if let k = dict.firstIndex(of: "/Index"), k + 1 < dict.count, dict[k + 1] == "[" {
+            var i = k + 2
+            while i + 1 < dict.count && isInteger(dict[i]) {
+                index.append(toInteger(dict[i]))
+                index.append(toInteger(dict[i + 1]))
+                i += 2
+            }
+        } else {
+            index.append(0)
+            index.append(toInteger(xref.getValue("/Size")))
+        }
+
+        // setStreamAndData undoes the predictor, so each entry is a row of the data.
+        try xref.setStreamAndData(&buf, length, nil, budget)
+        let n = n1 + n2 + n3    // Number of bytes per entry
+        var entries = [(number: Int, offset: Int)]()
+        // An object in use is in the PDF, at an offset in it, and takes a few
+        // bytes of it, "1 0 obj endobj" at the least: a stream of more entries
+        // than that, or of an offset past the end, lists objects that are not
+        // there, and the objects are looked for by scanning. Checked as each
+        // entry is read, as keeping them all first, millions of a stream of a
+        // few KB, took gigabytes (review of 11 October 2026, #31).
+        let maxEntries = buf.count / PDF.minObjectBytes
+        var offset = 0
+        var s = 0
+        while s + 1 < index.count {
+            var number = index[s]
+            var j = 0
+            while j < index[s + 1] && offset + n <= xref.data.count {
+                // Process the entries in a cross-reference stream.
+                // Page 51 in PDF32000_2008.pdf
+                let type = (n1 == 0) ? 1 : toInt(xref.data, offset, n1)
+                if type == 1 {
+                    let entry = (number: number, offset: toInt(xref.data, offset + n1, n2))
+                    if entry.offset < 0 || entry.offset >= buf.count || entries.count >= maxEntries {
+                        return false
+                    }
+                    entries.append(entry)
+                }
+                number += 1
+                offset += n
+                j += 1
+            }
+            s += 2
+        }
+        return getEntryObjects(buf, entries, &objects, budget)
+    }
+
+    ///
+    /// Adds the objects of the PDF to the list by looking for "number
+    /// generation obj" in it, for when the cross-reference table is missing or
+    /// wrong. The objects of incremental updates are later in the PDF, so the
+    /// newest version of an object comes last.
+    ///
+    /// An object ends where the next one starts at the latest, as one with no
+    /// endobj was read to the end of the PDF, and the last trailer is read once
+    /// when the scan is done: a PDF of objects with no endobj took seconds for
+    /// every hundred kilobytes.
+    ///
+    /// - Returns: the last trailer, or the last cross-reference stream object
+    ///   when there is no trailer, or nil when there is neither.
+    ///
+    private func getObjectsByScanning(
+            _ buf: [UInt8], _ objects: inout [PDFobj], _ budget: PDFobj.DecodeBudget) -> PDFobj? {
+        let trailerKeyword = Array("trailer".utf8)
+        let endStreamKeyword = Array("endstream".utf8)
+        var xrefStream: PDFobj?
+        var trailerOffset = -1
+        var next = 0    // The start of the object after the one at i
+        var i = 0
+        while i < buf.count {
+            if PDF.isObjectStart(buf, i) {
+                if next <= i {
+                    next = nextObjectStart(buf, i + 1)
+                }
+                let obj = getObject(buf, i, next)
+                if isObject(obj, -1) {
+                    obj.number = toInteger(obj.dict[0])
+                    objects.append(obj)
+                    if obj.getValue("/Type") == "/XRef" {
+                        xrefStream = obj
+                    }
+                    if obj.dict.contains("stream") {
+                        // Skip the stream, as its bytes can look like an
+                        // object: to the endstream after its /Length, or else
+                        // to the first one before the next object, or to the
+                        // next object. The endstream was looked for to the end
+                        // of the PDF, and the objects after a stream with none
+                        // were not read.
+                        let length = toInteger(obj.getValue("/Length"))
+                        var end = PDFobj.endstreamAfter(buf, obj.streamOffset, length, budget)
+                        if end == -1 {
+                            end = indexOf(buf, endStreamKeyword, obj.streamOffset, next)
+                        }
+                        if end == -1 {
+                            // The next "number generation obj" is in the
+                            // stream's own bytes.
+                            let past = streamPastNext(buf, obj.streamOffset, budget)
+                            if past.found != -1 {
+                                obj.end = past.after
+                                end = past.found
+                            }
+                        }
+                        i = (end == -1) ? next : end
+                        continue
+                    }
+                }
+            } else if startsWith(buf, i, trailerKeyword) {
+                trailerOffset = i
+            }
+            i += 1
+        }
+        return (trailerOffset != -1) ? getObject(buf, trailerOffset) : xrefStream
+    }
+
+    // Returns the offset of the endstream that ends the stream at the offset,
+    // past the object start the scan found next, and the offset after the
+    // endobj that must follow it; or -1 and -1. It reads within what is left of
+    // the budget, so that a PDF of many streams with no endstream is not read to
+    // its end for each of them.
+    private func streamPastNext(
+            _ buf: [UInt8], _ offset: Int, _ budget: PDFobj.DecodeBudget) -> (found: Int, after: Int) {
+        let end = min(buf.count, offset + max(budget.readLeft, 0))
+        let found = PDFobj.endstreamOf(buf, offset, end)
+        if found == -1 {
+            budget.readLeft -= end - offset
+            return (-1, -1)
+        }
+        budget.readLeft -= found - offset
+        let after = PDFobj.endobjAfter(buf, found)
+        if after == -1 {
+            return (-1, -1)
+        }
+        return (found, after)
+    }
+
+    // Returns the offset of the first "number generation obj" from the offset
+    // on, or the length of the PDF when there is none.
+    private func nextObjectStart(_ buf: [UInt8], _ off: Int) -> Int {
+        var i = off
+        while i < buf.count {
+            if PDF.isObjectStart(buf, i) {
+                return i
+            }
+            i += 1
+        }
+        return buf.count
+    }
+
+    // Returns true when "number generation obj" starts at the offset, after
+    // white space or at the start of the PDF. An offset that is not at a number
+    // returns at once, as the white space after it was scanned at every offset
+    // of a run of white space.
+    static func isObjectStart(_ buf: [UInt8], _ off: Int) -> Bool {
+        if off > 0 && !PDFobj.isWhiteSpace(buf[off - 1]) {
+            return false
+        }
+        var i = off
+        while i < buf.count && buf[i] >= 0x30 && buf[i] <= 0x39 {
+            i += 1
+        }
+        if i == off {
+            return false
+        }
+        var j = i
+        while j < buf.count && PDFobj.isWhiteSpace(buf[j]) {
+            j += 1
+        }
+        var k = j
+        while k < buf.count && buf[k] >= 0x30 && buf[k] <= 0x39 {
+            k += 1
+        }
+        var m = k
+        while m < buf.count && PDFobj.isWhiteSpace(buf[m]) {
+            m += 1
+        }
+        return j > i && k > j && m > k && m + 3 <= buf.count &&
+                buf[m] == 0x6F && buf[m + 1] == 0x62 && buf[m + 2] == 0x6A     // "obj"
+    }
+
+    private func startsWith(_ buf: [UInt8], _ off: Int, _ str: [UInt8]) -> Bool {
+        if off < 0 || off + str.count > buf.count {
+            return false
+        }
+        for i in 0..<str.count where buf[off + i] != str[i] {
+            return false
+        }
+        return true
+    }
+
+    // Returns the offset of the first str from the offset from on that ends by
+    // the offset to, or -1.
+    private func indexOf(_ buf: [UInt8], _ str: [UInt8], _ from: Int, _ to: Int) -> Int {
+        var i = max(from, 0)
+        while i + str.count <= min(to, buf.count) {
+            if startsWith(buf, i, str) {
+                return i
+            }
+            i += 1
+        }
+        return -1
+    }
+
+    // Returns the offset after the last startxref, or -1 when there is none.
+    private func getStartXRef(_ buf: [UInt8]) -> Int {
+        let keyword = Array("startxref".utf8)
+        var i = buf.count - keyword.count
+        while i >= 0 {
+            if startsWith(buf, i, keyword) {
+                var j = i + keyword.count
+                while j < buf.count && isWhiteSpace(buf[j]) {
+                    j += 1
+                }
+                var offset = 0
+                var k = j
+                while k < buf.count && buf[k] >= 0x30 && buf[k] <= 0x39 && offset <= Int(Int32.max) {
+                    offset = offset * 10 + Int(buf[k] - 0x30)
+                    k += 1
+                }
+                return (k > j && offset <= Int(Int32.max)) ? offset : -1
+            }
+            i -= 1
+        }
+        return -1
+    }
+
+    /// Adds the outline dictionary for the bookmarks and returns its object
+    /// number. The bookmarks were numbered by toArrayList(), level by level,
+    /// and the object of a bookmark is that many objects after the outline
+    /// dictionary.
+    func addOutlineDict(_ toc: Bookmark) -> Int {
+        newObj()
+        append(Token.beginDictionary)
+        append("/Type /Outlines\n")
+        append("/First ")
+        append(getObjNumber() + toc.getFirstChild()!.objNumber)
+        append(" 0 R\n")
+        append("/Last ")
+        append(getObjNumber() + toc.getLastChild()!.objNumber)
+        append(" 0 R\n")
+        // The items that are visible: those of the first level, as the items
+        // with children are closed.
+        append("/Count ")
+        append(toc.getChildren()!.count)
+        append(Token.newline)
+        append(Token.endDictionary)
+        endObj()
+        return getObjNumber()
+    }
+
+    /// Adds an outline item for the bookmark, under the outline dictionary
+    /// with the given object number.
+    func addOutlineItem(_ outlines: Int, _ bm1: Bookmark) {
+        var prev = 0
+        if let bookmark = bm1.getPrevBookmark() {
+            prev = outlines + bookmark.objNumber
+        }
+        var next = 0
+        if let bookmark = bm1.getNextBookmark() {
+            next = outlines + bookmark.objNumber
+        }
+
+        var first = 0
+        var last = 0
+        var count = 0
+        if let children = bm1.getChildren(), children.count > 0 {
+            first = outlines + children[0].objNumber
+            last  = outlines + children[children.count - 1].objNumber
+            // A closed item: the items that opening it would show.
+            count = (-1) * children.count
+        }
+
+        newObj()
+        append(Token.beginDictionary)
+        append("/Title <")
+        append(textString(bm1.getTitle()))
+        append(">\n")
+        // The root of the bookmarks is the outline dictionary itself.
+        append("/Parent ")
+        append(outlines + (bm1.getParent()?.objNumber ?? 0))
+        append(" 0 R\n")
+        if prev > 0 {
+            append("/Prev ")
+            append(prev)
+            append(" 0 R\n")
+        }
+        if next > 0 {
+            append("/Next ")
+            append(next)
+            append(" 0 R\n")
+        }
+        if first > 0 {
+            append("/First ")
+            append(first)
+            append(" 0 R\n")
+        }
+        if last > 0 {
+            append("/Last ")
+            append(last)
+            append(" 0 R\n")
+        }
+        if count != 0 {
+            append("/Count ")
+            append(count)
+            append("\n")
+        }
+        if bm1.getDestination()!.pageObjNumber == 0 {
+            // The page was not added: /Dest [0 0 R] went nowhere, and readers
+        // refused the document (review of 12 October 2026, F8)
+            fail("The bookmark \(bm1.getTitle() ?? "") is on a page that is not added to the PDF.")
+        }
+        append("/Dest [")
+        append(bm1.getDestination()!.pageObjNumber)
+        append(" 0 R /XYZ ")
+        append(bm1.getDestination()!.xPosition)
+        append(Token.space)
+        append(bm1.getDestination()!.yPosition)
+        append(" 0]\n")
+        append(Token.endDictionary)
+        endObj()
+    }
+
+    ///
+    /// Adds all the pages of a document that was read with read(from:) after
+    /// the pages of this document, in their order. A PDF can merge several
+    /// documents and draw pages of its own before, between and after them.
+    ///
+    /// The merged pages keep their content, resources, annotations and links.
+    /// The parts of the read document that belong to the whole document are
+    /// left out: its bookmarks, form fields, tagging, named destinations and
+    /// optional content settings. The objects that the pages use are written
+    /// at once, so the objects are not needed after the call.
+    ///
+    /// A PDF/UA or PDF/A document cannot merge pages, which were not made for
+    /// its compliance, and merge cannot be used with addObjects.
+    ///
+    /// - Parameter objects: the objects of the document, as read(from:) returns them.
+    /// - Throws: PDFjetError when the pages cannot be merged into this document.
+    ///
+    public func merge(_ objects: [PDFobj]) throws {
+        try checkMerge(objects)
+        mergePages(objects, getPageObjects(from: objects))
+    }
+
+    ///
+    /// Adds the listed pages of a document that was read with read(from:)
+    /// after the pages of this document, in the order they are listed. A
+    /// document is split by merging each part of it into a PDF of its own: the
+    /// objects that read(from:) returned can be merged into any number of PDFs.
+    ///
+    /// The pages are merged as merge(objects) merges all of them, and a link to
+    /// a page that is not merged leads nowhere. A page number that the document
+    /// does not have, or one that is listed twice, is refused.
+    ///
+    /// - Parameter objects: the objects of the document, as read(from:) returns them.
+    /// - Parameter pageNumbers: the numbers of the pages, counted from 1.
+    /// - Throws: PDFjetError when the pages cannot be merged into this document.
+    ///
+    public func merge(_ objects: [PDFobj], _ pageNumbers: [Int]) throws {
+        try checkMerge(objects)
+        let pageObjects = getPageObjects(from: objects)
+        var listed = [PDFobj]()
+        var seen = Set<Int>()
+        for number in pageNumbers {
+            if number < 1 || number > pageObjects.count {
+                try refuse("The document has no page \(number).")
+            }
+            if !seen.insert(number).inserted {
+                try refuse("Page \(number) is listed twice.")
+            }
+            listed.append(pageObjects[number - 1])
+        }
+        mergePages(objects, listed)
+    }
+
+    // Refuses a merge that would break this document.
+    private func checkMerge(_ objects: [PDFobj]) throws {
+        if completed {
+            try refuse("The PDF was already completed.")
+        }
+        if compliance != Compliance.PDF_1_7 {
+            try refuse("Pages of an existing PDF cannot be merged into a PDF/UA or PDF/A document.")
+        }
+        if pagesObjNumber != 0 {
+            try refuse("merge and addObjects cannot be used on the same PDF.")
+        }
+        if getPagesObject(objects) == nil {
+            try refuse("The objects have no root /Pages object.")
+        }
+    }
+
+    // Adds the pages, in their order, and every object that they use.
+    private func mergePages(_ objects: [PDFobj], _ pageObjects: [PDFobj]) {
+        // A font added to the objects, drawn on their pages, is filled in first,
+        // as addObjects does (the review of 9 October 2026: merged, it was lost)
+        FontObjects.complete(objects)
+        var mergedPages = Set<Int>()
+        for page in pageObjects {
+            mergedPages.insert(page.number)
+        }
+
+        // Each page and every object that it uses, found through the
+        // references, gets a number of this document before anything is
+        // written, as the objects refer to each other: a page to its
+        // annotations, and a link annotation to the page it points at.
+        var numbers = [Int: Int]()
+        var values = [Int: [String]]()
+        var queue = [PDFobj]()
+        let inherited = InheritedEntries()
+        // A large /Resources that pages inherit from a node of the tree is an
+        // object of its own here, written once, which each page refers to, as
+        // the pages are no longer under the node: a number past those of the
+        // objects stands for it until it gets one of this document.
+        var sharedNumbers = [Int: Int]()    // By the number of the node
+        var added = [PDFobj]()              // The shared objects, queued below
+        let shared = { (node: Int, value: [String]) -> [String] in
+            var number = sharedNumbers[node]
+            if number == nil {
+                number = objects.count + 1 + sharedNumbers.count
+                sharedNumbers[node] = number
+                numbers[number!] = self.reserveObjNumber()
+                let obj = PDFobj()
+                obj.number = number!
+                obj.dict = value
+                added.append(obj)
+            }
+            return [String(number!), "0", "R"]
+        }
+        for page in pageObjects {
+            if numbers[page.number] == nil {
+                numbers[page.number] = reserveObjNumber()
+                queue.append(page)
+            }
+        }
+        var i = 0
+        while i < queue.count {
+            let obj = queue[i]
+            let value = PDF.mergedValue(obj, mergedPages.contains(obj.number), objects, inherited, shared)
+            queue.append(contentsOf: added)     // Its own references are merged too
+            added.removeAll()
+            values[obj.number] = value
+            var j = 0
+            while j < value.count {
+                if PDF.isReference(value, j) {
+                    let number = Int(value[j])!
+                    if numbers[number] == nil {
+                        if number >= 1 && number <= objects.count && objects[number - 1].writtenNumber != 0 {
+                            numbers[number] = objects[number - 1].writtenNumber
+                        } else if isMergedObject(number, objects, mergedPages) {
+                            numbers[number] = reserveObjNumber()
+                            queue.append(objects[number - 1])
+                        }
+                    }
+                    j += 2
+                }
+                j += 1
+            }
+            i += 1
+        }
+
+        for obj in queue where !mergedPages.contains(obj.number) {
+            addMergedObject(obj, numbers[obj.number]!, renumbered(values[obj.number]!, numbers))
+        }
+        for obj in queue where mergedPages.contains(obj.number) {
+            pages.append(Page(self, numbers[obj.number]!, renumbered(values[obj.number]!, numbers)))
+        }
+    }
+
+    // Records the misuse and throws it.
+    private func refuse(_ message: String) throws {
+        fail(message)
+        throw PDFjetError(message: message)
+    }
+
+    // The entries of a page that it can inherit from the page tree.
+    private static let inheritedKeys = ["/Resources", "/MediaBox", "/CropBox", "/Rotate"]
+
+    // Reserves the next object number for an object written later.
+    func reserveObjNumber() -> Int {
+        objOffset.append(0)
+        return objOffset.count
+    }
+
+    // Returns true when the tokens at index i are a reference: "n g R".
+    static func isReference(_ tokens: [String], _ i: Int) -> Bool {
+        return i + 2 < tokens.count
+                && tokens[i + 2] == "R"
+                && isObjectNumber(tokens[i])
+                && isObjectNumber(tokens[i + 1])
+    }
+
+    // Returns true for a number that can be an object number or a generation
+    // number: digits, which can have leading zeros, as pdf.js tests it in
+    // issue10491, "0000000003 0 R", and no more than nine others.
+    private static func isObjectNumber(_ token: String) -> Bool {
+        if token.isEmpty || token.unicodeScalars.drop(while: { $0 == "0" }).count > 9 {
+            return false
+        }
+        for scalar in token.unicodeScalars {
+            if scalar.value < 0x30 || scalar.value > 0x39 {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Returns true for an object that the merged pages can use: not the page
+    // tree, the catalog, a page that is not merged or an object that is missing.
+    private func isMergedObject(_ number: Int, _ objects: [PDFobj], _ mergedPages: Set<Int>) -> Bool {
+        if number < 1 || number > objects.count {
+            return false
+        }
+        let obj = objects[number - 1]
+        // A stream with no dictionary is the content that was drawn on a page.
+        if obj.dict.isEmpty && obj.stream == nil {
+            return false
+        }
+        let type = obj.getValue("/Type")
+        if type == "/Pages" || type == "/Catalog" {
+            return false
+        }
+        return !isPageObject(obj) || mergedPages.contains(number)
+    }
+
+    // Returns the value of an object that was read, without its "n g obj" and
+    // its "stream" and "endobj" keywords, with a direct /Length for a stream,
+    // and for a page with the entries it inherits and without its /Parent.
+    private static func mergedValue(
+            _ obj: PDFobj,
+            _ isPage: Bool,
+            _ objects: [PDFobj],
+            _ cache: InheritedEntries,
+            _ shared: (Int, [String]) -> [String]) -> [String] {
+        var value = valueOf(obj)
+        if let stream = obj.stream {
+            if value.isEmpty {
+                value = ["<<", ">>"] // Content that was drawn on a page
+            }
+            setEntry(&value, "/Length", [String(stream.count)])
+        }
+        if isPage {
+            for key in inheritedKeys {
+                if entryIndex(value, key) == -1 {
+                    let entry = inheritedEntry(obj, key, objects, cache)
+                    var inherited = entry?.value
+                    if let entry = entry, sharedInherited(key, entry.value) {
+                        inherited = shared(entry.node, entry.value)    // A reference to it, written once
+                    }
+                    if inherited == nil && key == "/MediaBox" {
+                        inherited = ["[", "0", "0", "612", "792", "]"]  // Letter
+                    }
+                    if let inherited = inherited {
+                        setEntry(&value, key, inherited)
+                    }
+                }
+            }
+            removeEntry(&value, "/Parent")
+        }
+        return value
+    }
+
+    static func valueOf(_ obj: PDFobj) -> [String] {
+        return Array(obj.dict[valueRange(obj)])
+    }
+
+    // Where the value of the object is in its tokens.
+    private static func valueRange(_ obj: PDFobj) -> Range<Int> {
+        let dict = obj.dict
+        let start = (dict.count >= 3 && dict[2] == "obj") ? 3 : 0
+        var end = dict.count
+        if end > start && dict[end - 1] == "endobj" {
+            end -= 1
+        }
+        if end > start && dict[end - 1] == "stream" {
+            end -= 1
+        }
+        return start..<end
+    }
+
+    // What the nodes of a page tree have or inherit, by the number of the node
+    // and the key, as inheritedEntry finds it, with the number of the node
+    // that has it. A node can have thousands of pages, which each looked
+    // through the whole of it for an entry that it does not have, like the
+    // /CropBox and /Rotate that most trees do not have: veraPDF's
+    // isartor-6-1-12-t01-fail-a took over a minute to read.
+    final class InheritedEntries {
+        struct Key: Hashable {
+            let number: Int
+            let key: String
+        }
+        struct Entry {
+            let node: Int           // The number of the node that has it
+            let value: [String]
+        }
+        var values = [Key: Entry?]()
+    }
+
+    // The most tokens of an inherited dictionary that are copied into each
+    // page that inherits it. A larger /Resources is shared: the pages keep it
+    // by reference, and merge writes it once, as an object of its own. 1,000
+    // pages under a node of an inline /Resources of 20,000 entries, a PDF of
+    // 242 KB, took 2.9 GB, and merge wrote 189 MB (review of 11 October 2026,
+    // #34).
+    static let maxCopiedInherited = 64
+
+    // Says whether an inherited value is shared rather than copied: a
+    // /Resources dictionary of more than maxCopiedInherited tokens.
+    private static func sharedInherited(_ key: String, _ value: [String]) -> Bool {
+        return key == "/Resources" && value.count > maxCopiedInherited && value[0] == "<<"
+    }
+
+    // Returns true when an inherited value is too large for what it is, and is
+    // not inherited: a /MediaBox or a /CropBox is four numbers and /Rotate one,
+    // and a /Resources of more than maxCopiedInherited tokens that is not a
+    // dictionary is not one. 1,000 pages under a node of a /CropBox of 20,000
+    // numbers, a PDF of 117 KB, took 6.2 GB in Go (review of 12 October 2026,
+    // R4).
+    private static func tooLargeToInherit(_ key: String, _ value: [String]) -> Bool {
+        return value.count > maxCopiedInherited && !sharedInherited(key, value)
+    }
+
+    // Returns the number of the nearest node of the page tree above the page
+    // that has the entry, and its value, which is the one the cache keeps for
+    // the node and not a copy, or nil.
+    private static func inheritedEntry(
+            _ page: PDFobj,
+            _ key: String,
+            _ objects: [PDFobj],
+            _ cache: InheritedEntries) -> InheritedEntries.Entry? {
+        var tokens = valueOf(page)
+        var passed = [InheritedEntries.Key]()   // The nodes that do not have it.
+        for _ in 0..<64 {   // A loop in a broken tree ends here, and is not kept.
+            let i = entryIndex(tokens, "/Parent")
+            if i == -1 || !isReference(tokens, i + 1) {
+                return inherited(nil, passed, cache)
+            }
+            let number = Int(tokens[i + 1])!
+            if number < 1 || number > objects.count || objects[number - 1].dict.isEmpty {
+                return inherited(nil, passed, cache)
+            }
+            let node = InheritedEntries.Key(number: number, key: key)
+            if let value = cache.values[node] {
+                return inherited(value, passed, cache)
+            }
+            passed.append(node)
+            tokens = valueOf(objects[number - 1])
+            let k = entryIndex(tokens, key)
+            if k != -1 {
+                let value = Array(tokens[(k + 1)..<valueEnd(tokens, k + 1)])
+                if tooLargeToInherit(key, value) {
+                    return inherited(nil, passed, cache)
+                }
+                return inherited(InheritedEntries.Entry(node: number, value: value), passed, cache)
+            }
+        }
+        return nil
+    }
+
+    // Keeps the value for each node that was passed, and returns it.
+    private static func inherited(
+            _ value: InheritedEntries.Entry?,
+            _ passed: [InheritedEntries.Key],
+            _ cache: InheritedEntries) -> InheritedEntries.Entry? {
+        for node in passed {
+            cache.values[node] = value
+        }
+        return value
+    }
+
+    // Returns the index after the value that starts at index i.
+    static func valueEnd(_ tokens: [String], _ i: Int) -> Int {
+        if i >= tokens.count {
+            return tokens.count
+        }
+        let token = tokens[i]
+        if token == "<<" || token == "[" {
+            var depth = 0
+            for j in i..<tokens.count {
+                let t = tokens[j]
+                if t == "<<" || t == "[" {
+                    depth += 1
+                } else if t == ">>" || t == "]" {
+                    depth -= 1
+                    if depth == 0 {
+                        return j + 1
+                    }
+                }
+            }
+            return tokens.count
+        }
+        return isReference(tokens, i) ? i + 3 : i + 1
+    }
+
+    // Returns the index of the key of an entry of the dictionary, not of a
+    // dictionary inside it, or -1.
+    static func entryIndex(_ tokens: [String], _ key: String) -> Int {
+        if tokens.isEmpty || tokens[0] != "<<" {
+            return -1
+        }
+        var i = 1
+        while i < tokens.count && tokens[i] != ">>" {
+            if tokens[i] == key {
+                return i
+            }
+            i = valueEnd(tokens, i + 1)
+        }
+        return -1
+    }
+
+    // Sets the value of an entry of the dictionary, adding the entry at its end.
+    private static func setEntry(_ tokens: inout [String], _ key: String, _ value: [String]) {
+        if tokens.isEmpty || tokens[0] != "<<" {
+            return
+        }
+        let i = entryIndex(tokens, key)
+        if i != -1 {
+            tokens.replaceSubrange((i + 1)..<valueEnd(tokens, i + 1), with: value)
+        } else {
+            let end = valueEnd(tokens, 0) - 1     // The index of the closing >>
+            tokens.insert(contentsOf: [key] + value, at: end)
+        }
+    }
+
+    private static func removeEntry(_ tokens: inout [String], _ key: String) {
+        let i = entryIndex(tokens, key)
+        if i != -1 {
+            tokens.removeSubrange(i..<valueEnd(tokens, i + 1))
+        }
+    }
+
+    // Returns the tokens with the references renumbered for this document, a
+    // reference to an object that is not merged replaced with null, and the
+    // strings encrypted when this document is encrypted.
+    private func renumbered(_ tokens: [String], _ numbers: [Int: Int]) -> [String] {
+        var result = [String]()
+        result.reserveCapacity(tokens.count)
+        var i = 0
+        while i < tokens.count {
+            let token = tokens[i]
+            if PDF.isReference(tokens, i) {
+                if let number = numbers[Int(token)!] {
+                    result.append(String(number))
+                    result.append("0")
+                    result.append("R")
+                } else {
+                    result.append("null")
+                }
+                i += 3
+                continue
+            }
+            if encryption != nil && (token.hasPrefix("(") || (token.hasPrefix("<") && token != "<<")) {
+                result.append("<" + toHex(encrypted(Decryptor.toBytes(token))) + ">")
+            } else {
+                result.append(token)
+            }
+            i += 1
+        }
+        return result
+    }
+
+    private func addMergedObject(_ obj: PDFobj, _ number: Int, _ value: [String]) {
+        var value = value
+        var stream = obj.stream
+        if stream != nil && encryption != nil {
+            stream = encrypted(stream!)
+            PDF.setEntry(&value, "/Length", [String(stream!.count)])
+        }
+        setObjOffset(number, byteCount)
+        append(number)
+        append(Token.newObj)
+        appendTokens(value)
+        append(Token.newline)
+        if let stream = stream {
+            append(Token.stream)
+            append(stream)
+            append(Token.endStream)
+        }
+        append(Token.endObj)
+    }
+
+    private func appendTokens(_ tokens: [String]) {
+        for (i, token) in tokens.enumerated() {
+            if i > 0 {
+                append(Token.space)
+            }
+            appendToken(token)
+        }
+    }
+
+    ///
+    /// Adds objects read from an existing PDF to this document. The objects
+    /// keep their numbers and are written as they are, so they are added
+    /// before any font, image or page of this document, and an encrypted PDF
+    /// cannot take them. Their page tree is the page tree of this document, so
+    /// it can have no pages of its own, before or after them, and it cannot be
+    /// a PDF/UA or PDF/A document, as the pages were not made for its
+    /// compliance.
+    ///
+    /// - Throws: PDFjetError when the objects cannot be added to this document.
+    ///
+    public func addObjects(_ objects: [PDFobj]) throws {
+        for page in pages where page.mergedDict != nil {
+            try refuse("merge and addObjects cannot be used on the same PDF.")
+        }
+        if compliance != Compliance.PDF_1_7 {
+            try refuse("The objects of an existing PDF cannot be added to a PDF/UA or PDF/A document.")
+        }
+        if !pages.isEmpty {
+            try refuse("The objects of an existing PDF cannot be added to a PDF that has pages of its own.")
+        }
+        guard let pagesObject = getPagesObject(objects),
+                let number = Int(pagesObject.dict.first ?? "") else {
+            try refuse("The objects have no root /Pages object.")
+            return
+        }
+        if let message = checkObjects(objects) {
+            try refuse(message)
+        }
+        self.pagesObjNumber = number
+        // Its references take generation 0, as every object's does (review of
+        // 20 October 2026): "7 1 R" named an object the PDF no longer had
+        self.acroForm = PDF.acroFormOf(objects).map { generationZero($0) }
+        FontObjects.complete(objects)
+        addObjectsToPDF(objects)
+    }
+
+    // Returns the value of the /AcroForm entry of the catalog of the objects, a
+    // dictionary or a reference to one, or nil. The objects keep their
+    // numbers, so a reference still names the same form.
+    private static func acroFormOf(_ objects: [PDFobj]) -> [String]? {
+        for obj in objects where obj.root {
+            let tokens = valueOf(obj)
+            let i = entryIndex(tokens, "/AcroForm")
+            if i == -1 {
+                return nil
+            }
+            return Array(tokens[(i + 1)..<valueEnd(tokens, i + 1)])
+        }
+        return nil
+    }
+
+    // Returns why the objects of a PDF that was read cannot be written, or nil.
+    // They keep their numbers and are written as they are, so they have to come
+    // before the objects that this document numbers itself, and an encrypted
+    // document cannot take them.
+    private func checkObjects(_ objects: [PDFobj]) -> String? {
+        if completed {
+            return "The PDF was already completed."
+        }
+        if encryption != nil {
+            return "The objects of an existing PDF cannot be added to an encrypted PDF."
+        }
+        // A number this document holds, written or only reserved, as that of a
+        // font written at complete(), is taken (the review of 9 October 2026: a
+        // font made before the objects were added took the number of one of them)
+        for obj in objects {
+            if obj.number > 0 && obj.number <= objOffset.count {
+                return "Add the objects of an existing PDF before fonts, images or pages "
+                        + "are added to the PDF: object \(obj.number) is already taken."
+            }
+        }
+        return nil
+    }
+
+    /// Returns the root of the page tree: the node that the /Pages of the
+    /// catalog names, the catalog that the trailer's /Root names, as MuPDF and
+    /// pdf.js find it. A PDF can have another tree with no /Parent, before
+    /// that one: one left from an earlier version of the document, as pdf.js
+    /// tests it in issue19281, or the pages of an XFA form behind a tree of one
+    /// page, in xfa_issue13556. Objects with no such catalog, like those of a
+    /// PDF whose trailer is lost, have the first node with no /Parent as the
+    /// root.
+    func getPagesObject(
+            _ objects: [PDFobj]) -> PDFobj? {
+        for object in objects where object.root {
+            let tokens = PDF.valueOf(object)
+            let i = PDF.entryIndex(tokens, "/Pages")
+            if i != -1 && PDF.isReference(tokens, i + 1),
+                    let pages = PDF.objectNumbered(objects, tokens[i + 1]),
+                    PDF.entryIndex(PDF.valueOf(pages), "/Kids") != -1 {
+                return pages
+            }
+            break
+        }
+        for object in objects {
+            if object.getValue("/Type") == "/Pages" &&
+                    object.getValue("/Parent").isEmpty {
+                return object
+            }
+        }
+        return nil
+    }
+
+    /// Returns the page objects, each holding the entries it inherits from
+    /// the page tree: /Resources, /MediaBox, /CropBox and /Rotate, which a
+    /// PDF can write once on a node above the pages rather than on every
+    /// page. A page that has an entry of its own keeps it, and the entries
+    /// are added to the page the first time it is returned, so that
+    /// getPageSize and getResourcesObject read what the page is.
+    public func getPageObjects(from objects: [PDFobj]) -> [PDFobj] {
+        var pageObjects = [PDFobj]()
+        if let pagesObject = getPagesObject(objects) {
+            var visited = Set<Int>()
+            getPageObjects(pagesObject, &pageObjects, objects, &visited, InheritedEntries())
+        }
+        return pageObjects
+    }
+
+    // The nodes of the page tree that were visited are skipped, as a node of a
+    // broken tree can list itself or a node above it as a kid. The tree is
+    // walked with a list of the kids still to visit, the last of them first,
+    // and not by recursion, as a tree of a hundred thousand nodes, one under
+    // the other, overflowed the stack.
+    private func getPageObjects(
+            _ root: PDFobj,
+            _ pages: inout [PDFobj],
+            _ objects: [PDFobj],
+            _ visited: inout Set<Int>,
+            _ inherited: InheritedEntries) {
+        var stack = [root]
+        var first = true
+        // A page that /Kids lists again is returned again, but has its entries
+        // added once: one page of 2,000 fonts listed 2,000 times copied the
+        // page at each, 5 seconds for a file of 35 KB (review of 12 October
+        // 2026, R5).
+        var prepared = Set<ObjectIdentifier>()
+        while let object = stack.popLast() {
+            let isRoot = first
+            first = false
+            // The root is a node, whatever it is.
+            if !isRoot && (prepared.contains(ObjectIdentifier(object)) || isPageObject(object)
+                    || (!visited.contains(object.number) && PDF.typeLeaf(object))) {
+                if prepared.insert(ObjectIdentifier(object)).inserted {
+                    PDF.addInheritedEntries(object, objects, inherited)
+                    PDF.resolveMediaBox(object, objects)
+                }
+                pages.append(object)
+                continue
+            }
+            if !visited.insert(object.number).inserted {
+                continue
+            }
+            for number in PDF.getKids(object, objects).reversed()
+                    where number >= 1 && number <= objects.count {  // A kid that the document has.
+                stack.append(objects[number - 1])
+            }
+        }
+    }
+
+    // Gives a dictionary in the page tree with no /Type and no /Kids the /Type
+    // /Page it is, which is required but which other programs leave out, and
+    // returns true then: the PDF had no pages, with no error (review of 30
+    // October 2026, B3).
+    private static func typeLeaf(_ obj: PDFobj) -> Bool {
+        let value = valueOf(obj)
+        guard value.first == "<<", entryIndex(value, "/Type") == -1, entryIndex(value, "/Kids") == -1,
+                let open = obj.dict.firstIndex(of: "<<") else {
+            return false
+        }
+        obj.dict.insert(contentsOf: ["/Type", "/Page"], at: open + 1)
+        return true
+    }
+
+    // Returns the object numbers of the /Kids of the node, which can be an
+    // array that is an object of its own, "/Kids 5 0 R".
+    private static func getKids(_ node: PDFobj, _ objects: [PDFobj]) -> [Int] {
+        let kids = node.getObjectNumbers("/Kids")
+        let i = node.entryIndexOf("/Kids")
+        if i != -1 && isReference(node.dict, i + 1) && kids.count == 1
+                && kids[0] >= 1 && kids[0] <= objects.count {
+            let tokens = valueOf(objects[kids[0] - 1])
+            if tokens.first == "[" {
+                var numbers = [Int]()
+                var j = 1
+                while isReference(tokens, j) {
+                    numbers.append(Int(tokens[j])!)
+                    j += 3
+                }
+                return numbers
+            }
+        }
+        return kids
+    }
+
+    // Adds to the page the entries it inherits from the page tree and does
+    // not have itself. A page of another program's PDF often carries no
+    // /MediaBox or /Resources of its own, and read gives the objects as the
+    // file has them, so the page holds what it is only after this.
+    private static func addInheritedEntries(_ page: PDFobj, _ objects: [PDFobj], _ cache: InheritedEntries) {
+        guard let open = page.dict.firstIndex(of: "<<") else {
+            return
+        }
+        for key in inheritedKeys {
+            if entryIndex(valueOf(page), key) != -1 {
+                continue        // An entry of its own.
+            }
+            guard let entry = inheritedEntry(page, key, objects, cache) else {
+                continue
+            }
+            if sharedInherited(key, entry.value) {
+                page.inheritedResources = entry.value   // The node's array, not a copy
+                page.inheritedFrom = entry.node
+            } else {
+                page.dict.insert(contentsOf: [key] + entry.value, at: open + 1)
+            }
+        }
+    }
+
+    // Writes the /MediaBox of the page as the array of numbers it is, when it
+    // is an object of its own, "/MediaBox 4 0 R", or holds references to its
+    // numbers, "[4 0 R 5 0 R 6 0 R 7 0 R]", so that getPageSize reads it. A
+    // box that is not four numbers then is left as it is: a reference to
+    // anything else, like the page itself, would grow the page each time it
+    // is read.
+    private static func resolveMediaBox(_ page: PDFobj, _ objects: [PDFobj]) {
+        guard let open = page.dict.firstIndex(of: "<<") else {
+            return
+        }
+        let tokens = Array(page.dict[open...])
+        let i = entryIndex(tokens, "/MediaBox")
+        if i == -1 {
+            return
+        }
+        let start = open + i + 1
+        let end = open + valueEnd(tokens, i + 1)
+        var value = Array(page.dict[start..<end])
+        // A box is 6 tokens, its numbers and its brackets, and an object it
+        // refers to of more is not read: a page tree of 1,000 pages over an
+        // array of a million numbers, a PDF of 2 MB, copied the array for
+        // each page, 15 GB in Go (review of 12 October 2026, N1).
+        if isReference(value, 0) {
+            guard let obj = objectNumbered(objects, value[0]), valueRange(obj).count <= 6 else {
+                return
+            }
+            value = valueOf(obj)
+        }
+        if value.first != "[" || value.count > 16 {
+            return
+        }
+        var box = [String]()
+        var j = 0
+        while j < value.count {
+            if isReference(value, j) {
+                guard let obj = objectNumbered(objects, value[j]), valueRange(obj).count <= 6 else {
+                    return
+                }
+                box.append(contentsOf: valueOf(obj))
+                j += 2
+            } else {
+                box.append(value[j])
+            }
+            if box.count > 6 {
+                return
+            }
+            j += 1
+        }
+        if box.count != 6 || box[0] != "[" || box[5] != "]" {
+            return
+        }
+        for number in box[1..<5] where !Util.isDecimalNumber(number) || Double(number) == nil {
+            return
+        }
+        page.dict.replaceSubrange(start..<end, with: box)
+    }
+
+    // Returns the object with the number, or nil when the PDF that was read
+    // does not have one: a reference can name an object that is not in the
+    // file.
+    private static func objectNumbered(_ objects: [PDFobj], _ token: String) -> PDFobj? {
+        guard let number = Int(token), number >= 1, number <= objects.count else {
+            return nil
+        }
+        return objects[number - 1]
+    }
+
+    private func isPageObject(_ object: PDFobj) -> Bool {
+        var isPage = false
+        for i in 0..<max(object.dict.count - 1, 0) {
+            if object.dict[i] == "/Type" &&
+                    object.dict[i + 1] == "/Page" {
+                isPage = true
+            }
+        }
+        return isPage
+    }
+
+    // Adds the entries of the /ExtGState dictionary of the resources, which can
+    // be an object of its own, with the names that an earlier page did not add.
+    private func addExtGStates(_ resources: PDFobj, _ objects: [PDFobj]) {
+        let entries = getResourceEntries(resources, "/ExtGState", objects)
+        var i = 0
+        while i < entries.count {
+            // The value after the name is a dictionary, a reference or one token.
+            var end = i + 1
+            if end < entries.count && entries[end] == "<<" {
+                var level = 0
+                repeat {
+                    let token = entries[end]
+                    end += 1
+                    if token == "<<" {
+                        level += 1
+                    } else if token == ">>" {
+                        level -= 1
+                    }
+                } while level > 0 && end < entries.count
+            } else if end + 2 < entries.count && entries[end + 2] == "R" {
+                end += 3
+            } else {
+                end = min(end + 1, entries.count)
+            }
+            if importedExtGStateNames[entries[i]] == nil {
+                importedExtGStateNames[entries[i]] = importedExtGStates.count
+                importedExtGStates.append(contentsOf: entries[i..<end])
+            } else {
+                checkImportedName(importedExtGStates, importedExtGStateNames, Array(entries[i..<end]))
+            }
+            i = end
+        }
+    }
+
+    private func getFontObjects(
+            _ resources: PDFobj,
+            _ objects: [PDFobj]) -> [PDFobj] {
+        var fonts = [PDFobj]()
+        // The /Font dictionary holds one "/Name number 0 R" entry per font, and
+        // can be an object of its own. Every entry is written to the resources
+        // object, so every font it names is collected here.
+        let entries = getResourceEntries(resources, "/Font", objects)
+        var i = 0
+        while i < entries.count {
+            let token = entries[i]
+            if token.hasPrefix("/") && (i + 3) < entries.count && entries[i + 3] == "R" {
+                // Pages can carry separate resource dictionaries that name the
+                // same fonts. They are merged into one /Font dictionary here,
+                // so a name that is already present must not be added twice.
+                if importedFontNames[token] == nil {
+                    importedFontNames[token] = importedFonts.count
+                    importedFonts.append(contentsOf: entries[i..<i + 4])
+                    let number = toInteger(entries[i + 1])
+                    if number > 0 && number <= objects.count {
+                        fonts.append(objects[number - 1])
+                    }
+                } else {
+                    checkImportedName(importedFonts, importedFontNames, Array(entries[i..<i + 4]))
+                }
+                i += 4
+                continue
+            }
+            importedFonts.append(token)
+            i += 1
+        }
+        return fonts
+    }
+
+    // Records the mistake when a name that an earlier page added to the
+    // resources has another value on this page, the entry: the pages of this
+    // document share one resources dictionary, where the name has the value of
+    // the first page, and the content of this page, drawn with drawContents,
+    // would draw the resource of the first page.
+    private func checkImportedName(_ imported: [String], _ names: [String: Int], _ entry: [String]) {
+        guard let i = names[entry[0]] else {
+            return
+        }
+        if imported[(i + 1)..<min(i + entry.count, imported.count)] == entry[1...] {
+            return
+        }
+        fail("The pages of the PDF use the name \(entry[0]) for different resources, "
+                + "and the pages of this document share one resources dictionary.")
+    }
+
+    ///
+    /// Returns the entries of a sub-dictionary of the resources, like /XObject,
+    /// without the brackets around them. The sub-dictionary can also be an
+    /// object of its own.
+    ///
+    private func getResourceEntries(
+            _ resources: PDFobj,
+            _ name: String,
+            _ objects: [PDFobj]) -> [String] {
+        var entries = [String]()
+        var dict = resources.getDict()
+        guard var i = dict.firstIndex(of: name) else {
+            return entries
+        }
+        i += 1
+        if i >= dict.count {
+            return entries
+        }
+        if isInteger(dict[i]) {     // "/XObject 12 0 R"
+            guard let number = Int(dict[i]), number > 0, number <= objects.count else {
+                return entries
+            }
+            dict = objects[number - 1].getDict()
+            guard let index = dict.firstIndex(of: "<<") else {
+                return entries
+            }
+            i = index
+        }
+        if dict[i] != "<<" {
+            return entries
+        }
+        var level = 1
+        i += 1
+        while i < dict.count {
+            let token = dict[i]
+            if token == "<<" {
+                level += 1
+            } else if token == ">>" {
+                level -= 1
+                if level == 0 {
+                    break
+                }
+            }
+            entries.append(token)
+            i += 1
+        }
+        return entries
+    }
+
+    private func isInteger(_ token: String) -> Bool {
+        return !token.isEmpty && token.allSatisfy { $0 >= "0" && $0 <= "9" }
+    }
+
+    ///
+    /// Returns the numbers of the objects that "number 0 R" references in the
+    /// tokens refer to. A number that is too large for an int of 32 bits is
+    /// left out, as in the other ports.
+    ///
+    private func getReferences(_ tokens: [String]) -> [Int] {
+        var numbers = [Int]()
+        var i = 0
+        while i + 2 < tokens.count {
+            if tokens[i + 2] == "R" && isInteger(tokens[i]) && isInteger(tokens[i + 1]) {
+                let number = toInteger(tokens[i])
+                if number >= 0 {
+                    numbers.append(number)
+                }
+                i += 3
+            } else {
+                i += 1
+            }
+        }
+        return numbers
+    }
+
+    ///
+    /// Collects the object with the given number and every object it refers to,
+    /// directly or through other objects, like the color space of an image or
+    /// the resources of a form XObject. The page tree is not followed. The
+    /// objects are found with a list of the numbers still to visit, and not by
+    /// recursion, as a chain of a hundred thousand objects, each referring to
+    /// the next, overflowed the stack.
+    ///
+    private func addObjectTree(
+            _ objNumber: Int,
+            _ objects: [PDFobj],
+            _ numbers: inout Set<Int>,
+            _ resources: inout [PDFobj]) {
+        var stack = [objNumber]
+        while let number = stack.popLast() {
+            if number <= 0 || number > objects.count || !numbers.insert(number).inserted {
+                continue
+            }
+            let object = objects[number - 1]
+            let type = object.getValue("/Type")
+            if object.dict.isEmpty || type == "/Page" || type == "/Pages" || type == "/Catalog" {
+                continue
+            }
+            resources.append(object)
+            stack.append(contentsOf: getReferences(object.dict).reversed())
+        }
+    }
+
+    ///
+    /// Collects the images and forms in the /XObject resources, with the
+    /// objects they use, and adds their names to the resources object.
+    ///
+    private func addXObjects(
+            _ resObj: PDFobj,
+            _ objects: [PDFobj],
+            _ numbers: inout Set<Int>,
+            _ resources: inout [PDFobj]) {
+        let entries = getResourceEntries(resObj, "/XObject", objects)
+        var i = 0
+        while i < entries.count {
+            let token = entries[i]
+            if token.hasPrefix("/") && (i + 3) < entries.count && entries[i + 3] == "R" {
+                // Like the fonts, a name that an earlier page added is kept.
+                if importedXObjectNames[token] == nil {
+                    importedXObjectNames[token] = importedXObjects.count
+                    importedXObjects.append(contentsOf: entries[i..<i + 4])
+                    addObjectTree(toInteger(entries[i + 1]), objects, &numbers, &resources)
+                } else {
+                    checkImportedName(importedXObjects, importedXObjectNames, Array(entries[i..<i + 4]))
+                }
+                i += 4
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    // Returns false when the sub-dictionary of the resources, like /Font, is
+    // an object of its own that was added already, and records it.
+    private static func newEntries(_ resources: PDFobj, _ name: String, _ added: inout Set<String>) -> Bool {
+        let dict = resources.getDict()
+        guard let index = dict.firstIndex(of: name), isReference(dict, index + 1) else {
+            return true
+        }
+        return added.insert(name + " " + dict[index + 1]).inserted
+    }
+
+    ///
+    /// Adds the fonts, images and graphics states used by the pages to this
+    /// document. The objects keep their numbers and are written as they are,
+    /// so they are added before any font, image or page of this document, and
+    /// an encrypted PDF cannot take them: the mistake is recorded, and
+    /// complete() throws it.
+    ///
+    public func addResourceObjects(from objects: [PDFobj]) {
+        if let message = checkObjects(objects) {
+            fail(message)
+            return
+        }
+        FontObjects.complete(objects)
+        var resources = [PDFobj]()
+        var numbers = Set<Int>()
+        let pages = getPageObjects(from: objects)
+        // A page that /Kids lists again has its resources added once, and so
+        // have pages that share them, as an object of their own or from a node
+        // of the page tree: one page listed 2,000 times over 2,000 fonts took
+        // two minutes (review of 11 October 2026, #35), and 4,000 pages of one
+        // resources object of 4,000 fonts allocated 4.8 GB in Go (review of
+        // 12 October 2026, R8). The resources are known by the number of the
+        // object that holds them: the resources object, the page or the node.
+        var done = Set<ObjectIdentifier>()
+        var added = Set<Int>()
+        var addedEntries = Set<String>()
+        for page in pages {
+            if !done.insert(ObjectIdentifier(page)).inserted {
+                continue
+            }
+            guard let resObj = page.getResourcesObject(objects) else {
+                continue        // A page without resources of its own.
+            }
+            let holder = (page.inheritedResources != nil) ? page.inheritedFrom : resObj.number
+            if !added.insert(holder).inserted && holder > 0 {
+                continue
+            }
+            // A /Font, /XObject or /ExtGState dictionary that is an object of
+            // its own is added once too: small resources of each page that
+            // refer to one /Font dictionary of 4,000 fonts, 4,000 pages in a
+            // PDF of 1 MB, copied it for each page, 4.6 GB in Go (review of
+            // 12 October 2026, N2).
+            // A font is copied with every object that it refers to: its
+            // descriptor and font file, and also the widths, the encoding and
+            // the other entries that can be objects of their own.
+            if PDF.newEntries(resObj, "/Font", &addedEntries) {
+                for font in getFontObjects(resObj, objects) {
+                    addObjectTree(font.number, objects, &numbers, &resources)
+                }
+            }
+            if PDF.newEntries(resObj, "/XObject", &addedEntries) {
+                addXObjects(resObj, objects, &numbers, &resources)
+            }
+            if PDF.newEntries(resObj, "/ExtGState", &addedEntries) {
+                addExtGStates(resObj, objects)
+                // The /ExtGState entries are copied as they are, so the
+                // objects that they refer to have to be copied too.
+                for number in getReferences(getResourceEntries(resObj, "/ExtGState", objects)) {
+                    addObjectTree(number, objects, &numbers, &resources)
+                }
+            }
+        }
+        resources.sort(by: { $0.number < $1.number })
+        // An object can be collected twice, like a font that a form XObject
+        // uses too, and must be written once.
+        var unique = [PDFobj]()
+        for obj in resources {
+            if unique.isEmpty || unique.last!.number != obj.number {
+                unique.append(obj)
+            }
+        }
+        addObjectsToPDF(unique)
+    }
+
+    private func addObjectsToPDF(_ objects: [PDFobj]) {
+        for obj in objects {
+            obj.dict = generationZero(obj.dict)
+            if obj.dict.isEmpty && obj.stream == nil {
+                // A number that the PDF that was read has no object for stays a
+                // free entry of the cross-reference table.
+                continue
+            }
+            if obj.offset == 0 {
+                setObjOffset(obj.number, byteCount)
+                append(obj.number)
+                append(" 0 obj\n")
+                if !obj.dict.isEmpty {
+                    for token in obj.dict {
+                        appendToken(token)
+                        append(Token.space)
+                    }
+                }
+                if obj.stream != nil {
+                    if obj.dict.count == 0 {
+                        append("<< /Length ")
+                        append(obj.stream!.count)
+                        append(" >>")
+                    }
+                    append(Token.newline)
+                    append(Token.stream)
+                    append(obj.stream!, 0, obj.stream!.count)
+                    append(Token.endStream)
+                }
+                append(Token.endObj)
+            } else {
+                setObjOffset(obj.number, byteCount)
+                let n = obj.dict.count
+
+                var buffer = String()
+                var token: String?
+                for i in 0..<n {
+                    token = obj.dict[i]
+                    buffer.append(token!)
+                    if i < (n - 1) {
+                        buffer.append(" ")
+                    } else {
+                        buffer.append("\n")
+                    }
+                }
+                appendToken(buffer)
+                if obj.stream != nil {
+                    append(obj.stream!)
+                    append(Token.endStream)
+                }
+                if token == nil || token! != "endobj" {
+                    append(Token.endObj)
+                }
+            }
+        }
+    }
+
+    // Returns the tokens with the generation of each object and each
+    // reference 0, "1 1 obj" as "1 0 obj" and "2 1 R" as "2 0 R", as the
+    // cross-reference table writes every generation as 0 and merge renumbers
+    // to it: a PDF whose objects had another generation lost its pages, as a
+    // reader found none at the generation the references asked for (review of
+    // 11 October 2026, #4). The tokens themselves when none is another.
+    private func generationZero(_ dict: [String]) -> [String] {
+        var zeroed: [String]?
+        var i = 0
+        while i + 2 < dict.count {
+            if (dict[i + 2] == "R" || dict[i + 2] == "obj") && dict[i + 1] != "0" &&
+                    isInteger(dict[i]) && isInteger(dict[i + 1]) {
+                if zeroed == nil {
+                    zeroed = dict
+                }
+                zeroed![i + 1] = "0"
+            }
+            i += 1
+        }
+        return zeroed ?? dict
+    }
+
+    // The hexadecimal digits of a string object, in small letters as the
+    // other three ports write them. The digits of the text drawn on a page
+    // are capitals in all four, and are in Page.swift.
+    private let HEX: [UInt8] = Array("0123456789abcdef".utf8)
+
+    /// Returns the UTF-8 bytes of the string as lowercase hexadecimal digits.
+    func toHex(_ str: String?) -> String {
+        guard let str = str, !str.isEmpty else {
+            return ""
+        }
+        // Java hex encodes the UTF-8 bytes of the string, so a character
+        // outside ASCII must be written as its UTF-8 byte sequence - not as
+        // its code point - or a PDF reader decodes it as the wrong character.
+        return toHex(Array(str.utf8))
+    }
+
+    /// Returns the bytes as lowercase hexadecimal digits.
+    func toHex(_ bytes: [UInt8]) -> String {
+        var result: [UInt8] = []
+        result.reserveCapacity(2 * bytes.count)
+        for byte in bytes {
+            result.append(HEX[Int((byte >> 4) & 0xF)])
+            result.append(HEX[Int(byte        & 0xF)])
+        }
+        return String(decoding: result, as: UTF8.self)
+    }
+
+}   // End of PDF.swift

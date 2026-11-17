@@ -1,0 +1,264 @@
+/**
+ * CheckBox.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
+///
+/// Creates a CheckBox, which can be set checked or unchecked.
+/// By default the check box is unchecked.
+///
+/// Portions of the code was provided by Shirley C. Christenson
+/// Shirley Christenson Consulting
+public class CheckBox : Drawable {
+    private var x: Float = 0.0
+    private var y: Float = 0.0
+    private var w: Float = 0.0
+    private var h: Float = 0.0
+    private var borderColor: [Float] = [0.0, 0.0, 0.0]
+    private var checkmarkColor: [Float] = [0.0, 0.0, 0.0]
+    private var penWidth: Float?
+    private var checkWidth: Float?
+    private var mark = 0
+    private var font: Font
+    private var fontSize: Float = 12.0
+    private var label: String = ""
+    private var uri: String?
+    private var language: String?
+    private var altDescription: String?
+    private var actualText: String?
+
+    ///
+    /// Creates a CheckBox with black check mark.
+    ///
+    public init(_ font: Font, _ label: String) {
+        self.font = font
+        self.label = label
+    }
+
+    ///
+    /// Sets the font size to use for this text line.
+    ///
+    /// - Parameter fontSize: the fontSize to use.
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func setFontSize(_ fontSize: Float) -> CheckBox {
+        self.fontSize = fontSize
+        return self
+    }
+
+    ///
+    /// Sets the color of the check box.
+    /// Color.transparent leaves it unchanged.
+    ///
+    /// - Parameter borderColor: the border color specified as an 0xRRGGBB integer.
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func setBorderColor(_ borderColor: Int32) -> CheckBox {
+        if borderColor == Color.transparent {
+            return self
+        }
+        self.borderColor = Util.toRGB(borderColor)
+        return self
+    }
+
+    /// Sets the color of the check box from an array of red, green and blue values between 0.0 and 1.0.
+    @discardableResult
+    public func setBorderColor(_ rgbColor: [Float]) -> CheckBox {
+        self.borderColor = rgbColor
+        return self
+    }
+
+    ///
+    /// Sets the color of the check mark.
+    /// Color.transparent leaves it unchanged.
+    ///
+    /// - Parameter checkmarkColor: the check mark color specified as an 0xRRGGBB integer.
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func setCheckmarkColor(_ checkmarkColor: Int32) -> CheckBox {
+        if checkmarkColor == Color.transparent {
+            return self
+        }
+        self.checkmarkColor = Util.toRGB(checkmarkColor)
+        return self
+    }
+
+    /// Sets the color of the check mark from an array of red, green and blue values between 0.0 and 1.0.
+    @discardableResult
+    public func setCheckmarkColor(_ rgbColor: [Float]) -> CheckBox {
+        self.checkmarkColor = rgbColor
+        return self
+    }
+
+    ///
+    /// Set the x,y location on the Page.
+    ///
+    /// - Parameter x: the x coordinate on the Page.
+    /// - Parameter y: the y coordinate on the Page.
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func setLocation(_ x: Float, _ y: Float) -> Self {
+        self.x = x
+        self.y = y
+        return self
+    }
+
+    ///
+    /// Gets the height of the CheckBox.
+    ///
+    public func getHeight() -> Float {
+        return self.h
+    }
+
+    ///
+    /// Gets the width of the CheckBox.
+    ///
+    public func getWidth() -> Float {
+        return self.w
+    }
+
+    ///
+    /// Checks or unchecks this check box. See the Mark class for available options.
+    ///
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func check(_ mark: Int) -> CheckBox {
+        self.mark = mark
+        return self
+    }
+
+    ///
+    /// Sets the URI for the "click text line" action.
+    ///
+    /// - Parameter uri: the URI.
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func setURIAction(_ uri: String) -> CheckBox{
+        self.uri = uri
+        return self
+    }
+
+    ///
+    /// Sets the alternate description of this check box.
+    ///
+    /// - Parameter altDescription: the alternate description of the check box.
+    /// - Returns: this Checkbox.
+    ///
+    @discardableResult
+    public func setAltDescription(_ altDescription: String) -> CheckBox {
+        self.altDescription = altDescription
+        return self
+    }
+
+    ///
+    /// Sets the actual text for this check box.
+    ///
+    /// - Parameter actualText: the actual text for the check box.
+    /// - Returns: this CheckBox.
+    ///
+    @discardableResult
+    public func setActualText(_ actualText: String)-> CheckBox {
+        self.actualText = actualText
+        return self
+    }
+
+    /// Draws a blue X mark of the specified size at the specified location.
+    public static func drawXMark(_ page: Page, _ x: Float, _ y: Float, _ size: Float) {
+        page.setPenColor(Color.blue)
+        page.setPenWidth(size / 5)
+        page.moveTo(x, y)
+        page.lineTo(x + size, y + size)
+        page.moveTo(x, y + size)
+        page.lineTo(x + size, y)
+        page.strokePath()
+    }
+
+    ///
+    /// Draws this CheckBox on the specified Page.
+    ///
+    /// - Parameter page: the Page where the CheckBox is to be drawn.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        self.w = self.font.getAscent(fontSize)
+        self.h = self.w
+        self.penWidth = self.w/15
+        self.checkWidth = self.w/5
+        if page == nil {    // Measured, not drawn
+            return [x + 3.0*w + font.stringWidth(fontSize, label), y + font.getBodyHeight(fontSize)]
+        }
+
+        var link: StructElement?
+        if !(uri ?? "").isEmpty {
+            link = page!.addLinkBDC(StructElem.P, language, actualText, altDescription)
+        } else if label.isEmpty {
+            // A box with no label, nor a description, has nothing to read.
+            page!.addShapeBDC(language, actualText, altDescription)
+        } else {
+            page!.addBDC(StructElem.P, language, actualText, altDescription)
+        }
+        // The pen of the box is its own, and the page is left with the one it had.
+        page!.saveGraphicsState()
+
+        let yBox: Float = y
+        page!.setPenWidth(self.penWidth!)
+        page!.setPenColor(self.borderColor)
+        page!.setStrokeDashPattern("[] 0")
+        page!.drawRect(self.x + self.penWidth!, yBox + self.penWidth!, self.w, self.h)
+
+        if mark == Mark.CHECK || mark == Mark.X {
+            page!.setPenWidth(self.checkWidth!)
+            page!.setPenColor(self.checkmarkColor)
+            if mark == Mark.CHECK {
+                // Draw check mark
+                page!.moveTo(x + checkWidth! + penWidth!, yBox + h/2 + penWidth!)
+                page!.lineTo((x + w/6 + checkWidth!) + penWidth!, ((yBox + h) - 4.0*checkWidth!/3.0) + penWidth!)
+                page!.lineTo(((x + w) - checkWidth!) + penWidth!, (yBox + checkWidth!) + penWidth!)
+                page!.strokePath()
+            } else if mark == Mark.X {
+                // Draw 'X' mark
+                page!.moveTo(x + checkWidth! + penWidth!, yBox + checkWidth! + penWidth!)
+                page!.lineTo(((x + w) - checkWidth!) + penWidth!, ((yBox + h) - checkWidth!) + penWidth!)
+                page!.moveTo(((x + w) - checkWidth!) + penWidth!, (yBox + checkWidth!) + penWidth!)
+                page!.lineTo((x + checkWidth!) + penWidth!, ((yBox + h) - checkWidth!) + penWidth!)
+                page!.strokePath()
+            }
+        }
+
+        // A linked label is blue.
+        let textColor: [Float] = !(uri ?? "").isEmpty ? [0.0, 0.0, 1.0] : [0.0, 0.0, 0.0]
+        page!.drawString(font, fontSize, label, x + 3.0*w/2.0, y + font.getAscent(fontSize), textColor, nil)
+        page!.restoreGraphicsState()
+        page!.addEMC()
+
+        if !(uri ?? "").isEmpty {
+            // The link is the P of the box and its label, see Page.addLinkBDC.
+            page!.addAnnotation(Annotation(
+                    Annotation.Link,
+                    x + 3.0*w/2.0,
+                    y,
+                    x + 3.0*w/2.0 + font.stringWidth(fontSize, label),
+                    y + font.getBodyHeight(fontSize),
+                    nil,    // Vertices
+                    nil,    // Fill Color
+                    0.0,    // Opacity
+                    nil,    // Title
+                    nil,    // Contents
+                    uri,
+                    nil,
+                    language,
+                    actualText,
+                    altDescription).joining(link))
+        }
+
+        return [x + 3.0*w + font.stringWidth(fontSize, label), y + font.getBodyHeight(fontSize)]
+    }
+}   // End of CheckBox.swift

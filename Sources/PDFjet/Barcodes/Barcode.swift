@@ -1,0 +1,1050 @@
+/**
+ * Barcode.swift
+ *
+ * Copyright (c) 2026 PDFjet Software
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+import Foundation
+
+///
+/// Used to create one dimensional barcodes - EAN-13, UPC-A, Code 39 and Code 128.
+/// Leave a quiet zone, blank, on both sides of the bars, as a scanner needs it:
+/// 10 modules for Code 128 and Code 39, 9 for UPC-A, and 11 on the left and 7
+/// on the right for EAN-13. ITF-14 draws its own.
+///
+/// The text of an ITF-14 barcode is the 13 digits of a GTIN without its check
+/// digit, which is added, as for UPC-A and EAN-13.
+///
+/// Please see Example_36.
+///
+public class Barcode : Drawable {
+    /// EAN-13 barcode.
+    public static let EAN_13 = 0
+    /// UPC-A barcode.
+    public static let UPC_A = 1
+    /// Code 128 barcode.
+    public static let CODE_128 = 2
+    /// Code 39 barcode.
+    public static let CODE_39 = 3
+    /// Specifies GS1-128 barcode. Its text is GS1 data written as people read
+    /// it, each Application Identifier in parentheses and its data after it,
+    /// such as "(01)09506000134352(10)ABC123", and is drawn so under its bars.
+    public static let GS1_128 = 4
+    /// Specifies ITF-14 barcode. Its text is the 13 digits of a GTIN without
+    /// its check digit, which is added, as for UPC-A and EAN-13.
+    public static let ITF_14 = 5
+
+    private var barcodeType = 0
+    private var text: String
+    fileprivate(set) var x1: Float = 0.0
+    fileprivate(set) var y1: Float = 0.0
+    private var m1: Float = 0.75    // Module length
+    private var barHeightFactor: Float = 50.0
+    private var direction = Direction.LEFT_TO_RIGHT
+    private var font: Font?
+
+    private let lCode = [
+        "3211", "2221", "2122", "1411", "1132",
+        "1231", "1114", "1312", "1213", "3112"]
+    private var gCode = [String]()
+    private let lgMap = [
+        "LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG",
+        "LGGLLG", "LGGGLL", "LGLGLG", "LGLGGL", "LGGLGL"]
+
+    private var tableB = [String : String]()
+    private var altDescription: String?
+    private var color: Int32 = Color.black
+
+    ///
+    /// The constructor.
+    ///
+    /// Throws a PDFjetError for a barcode type it does not draw, for UPC-A or
+    /// EAN-13 text that is not 11 or 12 digits, and for Code 39 text with a
+    /// character the code cannot encode, so that drawOn cannot fail.
+    ///
+    /// - Parameter barcodeType: the type of the barcode.
+    /// - Parameter text: the content string of the barcode.
+    ///
+    public init(
+            _ barcodeType: Int,
+            _ text: String) throws {
+        self.barcodeType = barcodeType
+        self.text = text
+
+        if barcodeType == Barcode.UPC_A && (text.count != 11 || !Barcode.hasOnlyDigits(text)) {
+            throw PDFjetError(message: "UPC-A barcodes must have exactly 11 digits!")
+        } else if barcodeType == Barcode.EAN_13 && (text.count != 12 || !Barcode.hasOnlyDigits(text)) {
+            throw PDFjetError(message: "EAN-13 barcodes must have exactly 12 digits!")
+        } else if barcodeType == Barcode.CODE_128, let error = Barcode.code128Codewords(text).error {
+            throw PDFjetError(message: error)
+        } else if barcodeType == Barcode.GS1_128, let error = Barcode.gs1128Codewords(text).error {
+            throw PDFjetError(message: error)
+        } else if barcodeType == Barcode.ITF_14 && (text.count != 13 || !Barcode.hasOnlyDigits(text)) {
+            throw PDFjetError(message: "ITF-14 barcodes must have exactly 13 digits!")
+        } else if barcodeType != Barcode.UPC_A && barcodeType != Barcode.EAN_13 &&
+                barcodeType != Barcode.CODE_128 && barcodeType != Barcode.CODE_39 &&
+                barcodeType != Barcode.GS1_128 && barcodeType != Barcode.ITF_14 {
+            throw PDFjetError(message: "Unsupported Barcode Type.")
+        }
+
+        for code in lCode {
+            gCode.append(String(code.reversed()))
+        }
+
+        tableB["*"] = "bWbwBwBwb"
+        tableB["-"] = "bWbwbwBwB"
+        tableB["$"] = "bWbWbWbwb"
+        tableB["%"] = "bwbWbWbWb"
+        tableB[" "] = "bWBwbwBwb"
+        tableB["."] = "BWbwbwBwb"
+        tableB["/"] = "bWbWbwbWb"
+        tableB["+"] = "bWbwbWbWb"
+        tableB["0"] = "bwbWBwBwb"
+        tableB["1"] = "BwbWbwbwB"
+        tableB["2"] = "bwBWbwbwB"
+        tableB["3"] = "BwBWbwbwb"
+        tableB["4"] = "bwbWBwbwB"
+        tableB["5"] = "BwbWBwbwb"
+        tableB["6"] = "bwBWBwbwb"
+        tableB["7"] = "bwbWbwBwB"
+        tableB["8"] = "BwbWbwBwb"
+        tableB["9"] = "bwBWbwBwb"
+        tableB["A"] = "BwbwbWbwB"
+        tableB["B"] = "bwBwbWbwB"
+        tableB["C"] = "BwBwbWbwb"
+        tableB["D"] = "bwbwBWbwB"
+        tableB["E"] = "BwbwBWbwb"
+        tableB["F"] = "bwBwBWbwb"
+        tableB["G"] = "bwbwbWBwB"
+        tableB["H"] = "BwbwbWBwb"
+        tableB["I"] = "bwBwbWBwb"
+        tableB["J"] = "bwbwBWBwb"
+        tableB["K"] = "BwbwbwbWB"
+        tableB["L"] = "bwBwbwbWB"
+        tableB["M"] = "BwBwbwbWb"
+        tableB["N"] = "bwbwBwbWB"
+        tableB["O"] = "BwbwBwbWb"
+        tableB["P"] = "bwBwBwbWb"
+        tableB["Q"] = "bwbwbwBWB"
+        tableB["R"] = "BwbwbwBWb"
+        tableB["S"] = "bwBwbwBWb"
+        tableB["T"] = "bwbwBwBWb"
+        tableB["U"] = "BWbwbwbwB"
+        tableB["V"] = "bWBwbwbwB"
+        tableB["W"] = "BWBwbwbwb"
+        tableB["X"] = "bWbwBwbwB"
+        tableB["Y"] = "BWbwBwbwb"
+        tableB["Z"] = "bWBwBwbwb"
+
+        // Code 39 is checked here, as the other symbologies are, not first when
+        // it is drawn: a '*' in its data, the character that starts and ends the
+        // code, or no data at all made a code that no scanner reads (review of
+        // 11 October 2026, #13)
+        if barcodeType == Barcode.CODE_39 {
+            if text.isEmpty {
+                throw PDFjetError(message: "A Code39 barcode needs at least one character.")
+            }
+            for symchar in text.unicodeScalars where symchar == "*" || tableB[String(symchar)] == nil {
+                throw PDFjetError(message: "The input string '*" + text +
+                        "*' contains characters that are invalid in a Code39 barcode.")
+            }
+        }
+    }
+
+    ///
+    /// Sets the location where this barcode will be drawn on the page.
+    ///
+    /// - Parameter x1: the x coordinate of the top left corner of the barcode.
+    /// - Parameter y1: the y coordinate of the top left corner of the barcode.
+    ///
+    @discardableResult
+    public func setLocation(_ x1: Float, _ y1: Float) -> Self {
+        self.x1 = x1
+        self.y1 = y1
+        return self
+    }
+
+    ///
+    /// Sets the module length of this barcode.
+    /// The default value is 0.75
+    ///
+    /// - Parameter moduleLength: the specified module length.
+    ///
+    @discardableResult
+    public func setModuleLength(_ moduleLength: Double) -> Barcode {
+        self.m1 = Float(moduleLength)
+        return self
+    }
+
+    ///
+    /// Sets the module length of this barcode.
+    /// The default value is 0.75
+    ///
+    /// - Parameter moduleLength: the specified module length.
+    ///
+    @discardableResult
+    public func setModuleLength(_ moduleLength: Float) -> Barcode {
+        self.m1 = moduleLength
+        return self
+    }
+
+    ///
+    /// Sets the bar height factor.
+    /// The height of the bars is the moduleLength * barHeightFactor
+    /// The default value is 50.0
+    ///
+    /// - Parameter barHeightFactor: the specified bar height factor.
+    ///
+    @discardableResult
+    public func setBarHeightFactor(_ barHeightFactor: Double) -> Barcode {
+        self.barHeightFactor = Float(barHeightFactor)
+        return self
+    }
+
+    ///
+    /// Sets the bar height factor.
+    /// The height of the bars is the moduleLength * barHeightFactor
+    /// The default value is 50.0f
+    ///
+    /// - Parameter barHeightFactor: the specified bar height factor.
+    ///
+    @discardableResult
+    public func setBarHeightFactor(_ barHeightFactor: Float) -> Barcode {
+        self.barHeightFactor = barHeightFactor
+        return self
+    }
+
+    ///
+    /// Sets the direction in which this barcode is drawn.
+    ///
+    /// - Parameter direction: the specified direction.
+    ///
+    @discardableResult
+    public func setDirection(_ direction: Direction) -> Barcode {
+        self.direction = direction
+        return self
+    }
+
+    /// Sets the color of the bars and of the text under them. It is black
+    /// unless set.
+    /// Color.transparent leaves it unchanged. Use a dark color on a light
+    /// background, as navy, dark green or dark brown: most scanners read with
+    /// red light, in which red, orange and yellow bars look white.
+    ///
+    /// - Parameter color: the color as a 0xRRGGBB value.
+    /// - Returns: this Barcode object.
+    @discardableResult
+    public func setModuleColor(_ color: Int32) -> Barcode {
+        if color != Color.transparent {
+            self.color = color
+        }
+        return self
+    }
+
+    ///
+    /// Sets the font to be used with this barcode.
+    ///
+    /// - Parameter font: the specified font.
+    ///
+    @discardableResult
+    public func setFont(_ font: Font) -> Barcode {
+        self.font = font
+        return self
+    }
+
+    ///
+    /// Sets what the barcode says, such as its digits, for a screen reader: a
+    /// tagged document, PDF/UA or a PDF/A of level A, then has the barcode as one
+    /// figure of that description. Without one, its bars are decoration, which a
+    /// screen reader skips, and the text under them, if any, is read as text.
+    ///
+    /// - Parameter altDescription: the description.
+    ///
+    @discardableResult
+    public func setAltDescription(_ altDescription: String?) -> Barcode {
+        self.altDescription = altDescription
+        return self
+    }
+
+    private static func hasOnlyDigits(_ text: String) -> Bool {
+        for ch in text.unicodeScalars {
+            if ch < "0" || ch > "9" {
+                return false
+            }
+        }
+        return true
+    }
+
+    ///
+    /// Draws this barcode on the specified page.
+    ///
+    /// - Parameter page: the specified page.
+    /// - Returns: x and y coordinates of the bottom right corner of this component.
+    ///
+    @discardableResult
+    public func drawOn(_ page: Page?) -> [Float] {
+        return drawOnPageAtLocation(page, x1, y1)
+    }
+
+    @discardableResult
+    func drawOnPageAtLocation(_ page: Page?, _ x1: Float, _ y1: Float) -> [Float] {
+        // Described, the barcode is one figure of a tagged document, its bars
+        // and its text with it; not described, its bars are decoration and
+        // its text is text.
+        if let page = page, let altDescription = altDescription, !altDescription.isEmpty {
+            page.addBDC(StructElem.FIGURE, nil, nil, altDescription)
+        }
+        defer {
+            if let page = page, let altDescription = altDescription, !altDescription.isEmpty {
+                page.addEMC()
+            }
+        }
+        if let page = page {
+            // The bars are in their color whatever pen color the page was left with
+            page.saveGraphicsState()
+            page.setPenColor(color)
+            page.setDefaultStrokeDashPattern()      // Not the caller's, which broke the bars
+            // Butt caps: a round or projecting cap made each bar longer by half
+            // its width at both ends (ISO 32000, 8.4.3.3)
+            page.setLineCapStyle(CapStyle.BUTT)
+        }
+        defer {
+            page?.restoreGraphicsState()
+        }
+        // init accepted one of these types.
+        var extent: Extent
+        if barcodeType == Barcode.EAN_13 {
+            extent = drawCodeEAN13(page, x1, y1)
+        } else if barcodeType == Barcode.UPC_A {
+            extent = drawCodeUPC(page, x1, y1)
+        } else if barcodeType == Barcode.CODE_128 || barcodeType == Barcode.GS1_128 {
+            extent = drawCode128(page, x1, y1)
+        } else if barcodeType == Barcode.ITF_14 {
+            extent = drawITF14(page, x1, y1)
+        } else {
+            extent = drawCode39(page, x1, y1)
+        }
+        if let page = page, let altDescription = altDescription, !altDescription.isEmpty {
+            // The box of the bars and the text, which can reach left of x1
+            // and, turned, above y1
+            let box = extent.getBox()
+            page.setFigureBoundingBox(box[0], box[1], box[2], box[3])
+        }
+        return extent.bars.getBottomRight(extent.left, extent.right, extent.bottom)
+    }
+
+    private func drawCodeUPC(_ page: Page?, _ x1: Float, _ y1: Float) -> Extent {
+        var x: Float = x1
+        let h: Float = m1 * barHeightFactor     // Barcode height when drawn horizontally
+        // The guard bars, and the bars of the first and the last digit, which are
+        // printed outside the bars, reach 5 modules below the others.
+        let longBar: Float = h + Barcode.guardBarExtension * m1
+
+        // Calculate the check digit:
+        // 1. Add the digits in the odd-numbered positions (first, third, fifth, etc.)
+        // together and multiply by three.
+        // 2. Add the digits in the even-numbered positions (second, fourth, sixth, etc.)
+        // to the result.
+        // 3. Subtract the result modulo 10 from ten.
+        // 4. The answer modulo 10 is the check digit.
+        let scalars = Array(text.unicodeScalars)
+        var sum = 0
+        var i = 0
+        while i < 11 {
+            sum += Int(scalars[i].value) - 48
+            i += 2
+        }
+        sum *= 3
+        i = 1
+        while i < 11 {
+            sum += Int(scalars[i].value) - 48
+            i += 2
+        }
+        let reminder = sum % 10
+        let checkDigit = UInt16((10 - reminder) % 10)
+        // fullScalars is a local copy - drawOn() must be safe to call more
+        // than once on the same Barcode instance (e.g. drawing the same
+        // barcode on several pages).
+        // The check digit must be appended as its ASCII character (0x30 +
+        // digit), matching how the rest of the digits are represented -
+        // not as a raw scalar value 0-9 (which are unprintable control
+        // characters and would corrupt any indexing done against them).
+        var fullScalars = scalars
+        fullScalars.append(UnicodeScalar(checkDigit + 0x30)!)
+        let bars = Bars(x1: x1, y1: y1, length: 95.0 * m1, height: longBar, direction: direction)  // 95 modules
+
+        x = drawEGuard(page, bars, x, longBar)
+        var xGroup1Start = x
+
+        i = 0
+        while i < 6 {
+            let digit = Int(fullScalars[i].value) - 0x30
+            let symbols = Array(lCode[digit].unicodeScalars)
+            let barHeight: Float = (i == 0) ? longBar : h
+            for j in 0..<symbols.count {
+                let n = symbols[j].value - 0x30
+                if j%2 != 0 {
+                    drawBar(page, bars, x, Float(n)*m1, barHeight)
+                }
+                x += Float(n)*m1
+            }
+            if i == 0 {
+                xGroup1Start = x   // Start of the 2nd-6th digit bars (digit 0 is drawn outside)
+            }
+            i += 1
+        }
+        let xLeftGroupEnd = x
+        x = drawMGuard(page, bars, x, longBar)
+        let xRightGroupStart = x
+        var xGroup2End: Float = 0.0
+
+        i = 6
+        while i < 12 {
+            if i == 11 {
+                xGroup2End = x     // End of the 7th-11th digit bars (digit 11 is drawn outside)
+            }
+            let digit = Int(fullScalars[i].value) - 0x30
+            let symbols = Array(lCode[digit].unicodeScalars)
+            let barHeight: Float = (i == 11) ? longBar : h
+            for j in 0..<symbols.count {
+                let n = symbols[j].value - 0x30
+                if j%2 == 0 {
+                    drawBar(page, bars, x, Float(n)*m1, barHeight)
+                }
+                x += Float(n)*m1
+            }
+            i += 1
+        }
+        x = drawEGuard(page, bars, x, longBar)
+
+        var left = x1
+        var right = x
+        var bottom = y1 + longBar
+        if font != nil {
+            // Standard UPC-A layout: the leading (number system) digit and
+            // the trailing check digit are printed in the quiet zones
+            // outside the guard bars, not centered under them together with
+            // the rest of the label. The two groups of 5 digits are each
+            // centered under their own bar section.
+            let firstDigit = String(fullScalars[0])
+            var group1 = ""
+            for k in 1..<6 {
+                group1 += String(fullScalars[k])
+            }
+            var group2 = ""
+            for k in 6..<11 {
+                group2 += String(fullScalars[k])
+            }
+            let lastDigit = String(fullScalars[11])
+
+            let fontSize = font!.getSize()
+            font!.setSize(10.0)
+            let yText = y1 + h + font!.getBodyHeight(font!.getSize())
+            let gap = font!.stringWidth(font!.getSize(), " ")
+
+            left = x1 - gap - font!.stringWidth(font!.getSize(), firstDigit)
+            drawText(page, bars, firstDigit, left, yText)
+            drawText(page, bars, group1,
+                    xGroup1Start + ((xLeftGroupEnd - xGroup1Start) - font!.stringWidth(font!.getSize(), group1))/2,
+                    yText)
+            drawText(page, bars, group2,
+                    xRightGroupStart + ((xGroup2End - xRightGroupStart) - font!.stringWidth(font!.getSize(), group2))/2,
+                    yText)
+            let xy = drawText(page, bars, lastDigit, x + gap, yText)
+            right = xy[0]
+            bottom = max(bottom, xy[1])
+
+            font!.setSize(fontSize)
+        }
+
+        return Extent(bars: bars, left: left, right: right, bottom: bottom)
+    }
+
+    // How far the guard bars of EAN-13 and UPC-A reach below the other bars, in
+    // modules, as the GS1 General Specifications have it.
+    private static let guardBarExtension: Float = 5.0
+
+    private func drawEGuard(
+            _ page: Page?,
+            _ bars: Bars,
+            _ x: Float,
+            _ h: Float) -> Float {
+        if page != nil {
+            // 101
+            page!.addArtifactBMC()
+            strokeBar(page, bars, x + (0.5 * m1), m1, h)
+            strokeBar(page, bars, x + (2.5 * m1), m1, h)
+            page!.addEMC()
+        }
+        return (x + (3.0 * m1))
+    }
+
+    private func drawMGuard(
+            _ page: Page?,
+            _ bars: Bars,
+            _ x: Float,
+            _ h: Float) -> Float {
+        if page != nil {
+            // 01010
+            page!.addArtifactBMC()
+            strokeBar(page, bars, x + (1.5 * m1), m1, h)
+            strokeBar(page, bars, x + (3.5 * m1), m1, h)
+            page!.addEMC()
+        }
+        return (x + (5.0 * m1))
+    }
+
+    // Draws the bar of width w and height h that starts at x.
+    private func drawBar(
+            _ page: Page?,
+            _ bars: Bars,
+            _ x: Float,
+            _ w: Float,
+            _ h: Float) {
+        if page != nil {
+            page!.addArtifactBMC()
+            strokeBar(page, bars, x + w/2, w, h)
+            page!.addEMC()
+        }
+    }
+
+    // Strokes the bar of width w and height h centered on x.
+    private func strokeBar(
+            _ page: Page?,
+            _ bars: Bars,
+            _ x: Float,
+            _ w: Float,
+            _ h: Float) {
+        if page != nil {
+            let top = bars.turn(x, bars.y1)
+            let bottom = bars.turn(x, bars.y1 + h)
+            page!.setPenWidth(w)
+            page!.moveTo(top[0], top[1])
+            page!.lineTo(bottom[0], bottom[1])
+            page!.strokePath()
+        }
+    }
+
+    // Draws the text with its baseline starting at (x, y). Returns the end of
+    // the baseline and the bottom of the text, before the turn.
+    @discardableResult
+    private func drawText(
+            _ page: Page?,
+            _ bars: Bars,
+            _ str: String,
+            _ x: Float,
+            _ y: Float) -> [Float] {
+        let textLine = TextLine(font!, str)
+        textLine.setTextColor(color)
+        let xy = bars.turn(x, y)
+        textLine.setLocation(xy[0], xy[1])
+        if direction == Direction.TOP_TO_BOTTOM {
+            textLine.setTextRotation(-270)
+        } else if direction == Direction.BOTTOM_TO_TOP {
+            textLine.setTextRotation(-90)
+        }
+        textLine.drawOn(page)
+        return [x + font!.stringWidth(font!.getSize(), str), y + font!.getDescent(font!.getSize())]
+    }
+
+    /// Returns the start and the codewords of the text: runs of four digits
+    /// or more in code set C, two digits to a codeword, and the rest in code
+    /// set B, where a character from 32 to 127 takes one codeword, one below
+    /// 32 or from 160 to 255 two, SHIFT or FNC 4 and the character, and one
+    /// from 128 to 159 three, FNC 4, SHIFT and the character 128 below it. It
+    /// returns an error for a character above 255, which the code sets cannot
+    /// hold, and for a text of more than 48 codewords, the limit of GS1-128
+    /// that PDFjet keeps for Code 128 too, rather than draw a barcode of
+    /// another text.
+    static func code128Codewords(_ text: String) -> (codewords: [UInt16], error: String?) {
+        if text.isEmpty {
+            // A barcode of no data, a start, a check symbol and a stop, as an
+            // empty Code 39 is refused too
+            return ([], "Code 128 barcodes must have a text!")
+        }
+        var items = [Int]()
+        for symchar in text.unicodeScalars {
+            if symchar.value > 255 {
+                return ([], "Code 128 barcodes can only hold characters up to U+00FF!")
+            }
+            items.append(Int(symchar.value))
+        }
+        let list = code128Encode(items)
+        if list.count - 1 > 48 {
+            return ([], "Code 128 barcodes hold at most 48 codewords, and a character below 32 or from 160 to 255 takes two, and one from 128 to 159 three!")
+        }
+        return (list, nil)
+    }
+
+    /// Returns the start and the codewords of the GS1 data written as people
+    /// read it: FNC1, then the fields, each followed by FNC1 when it is of no
+    /// set length and another follows, encoded as code128Encode encodes them.
+    /// It returns an error for data that is not GS1, see GS1.parse, or longer
+    /// than the 48 characters a GS1-128 barcode holds, not counting the
+    /// separators.
+    static func gs1128Codewords(_ text: String) -> (codewords: [UInt16], error: String?) {
+        var items = [Int]()
+        var characters = 0
+        let fields: [GS1.Field]
+        do {
+            fields = try GS1.parse(text)
+        } catch let error as PDFjetError {
+            return ([], error.message)
+        } catch {
+            return ([], "\(error)")
+        }
+        for field in fields {
+            let s = Array((field.ai + field.data).unicodeScalars)
+            items += s.map { Int($0.value) }
+            characters += s.count
+            if field.separator {
+                items.append(separator)
+            }
+        }
+        if characters > 48 {
+            return ([], "GS1-128 barcodes hold at most 48 characters, not counting the separators!")
+        }
+        var list = code128Encode(items)
+        list.insert(UInt16(Code128Table.FNC_1), at: 1)
+        return (list, nil)
+    }
+
+    // The item of code128Encode that is FNC1.
+    private static let separator = -1
+
+    /// Returns the start and the codewords of the characters, up to 255, and
+    /// separator for FNC1. It starts in code set C if the characters start
+    /// with four digits or more, or are two digits, and in code set B if not.
+    /// In code set C it takes the digits two to a codeword, and changes to code
+    /// set B at anything else; in code set B it changes to code set C at an
+    /// even run of four digits or more, and so takes the first digit of an odd
+    /// run in code set B.
+    private static func code128Encode(_ items: [Int]) -> [UInt16] {
+        // How many digits there are in a row from i
+        func digits(_ i: Int) -> Int {
+            var n = 0
+            while i + n < items.count && items[i + n] >= 48 && items[i + n] <= 57 {
+                n += 1
+            }
+            return n
+        }
+
+        var inC = digits(0) >= 4 || (digits(0) == 2 && items.count == 2)
+        var list = [UInt16(inC ? Code128Table.START_C : Code128Table.START_B)]
+        var i = 0
+        while i < items.count {
+            let c = items[i]
+            if c == separator {
+                list.append(UInt16(Code128Table.FNC_1))
+                i += 1
+            } else if inC && digits(i) >= 2 {
+                list.append(UInt16(10*(c - 48) + (items[i + 1] - 48)))
+                i += 2
+            } else if inC {
+                list.append(UInt16(Code128Table.CODE_B))
+                inC = false
+            } else if digits(i) >= 4 && digits(i) % 2 == 0 {
+                list.append(UInt16(Code128Table.CODE_C))
+                inC = true
+            } else if c < 32 {
+                list.append(UInt16(Code128Table.SHIFT))
+                list.append(UInt16(c + 64))
+                i += 1
+            } else if c < 128 {
+                list.append(UInt16(c - 32))
+                i += 1
+            } else if c < 160 {
+                // FNC 4 and the control character 128 below it, which is in
+                // code set A, after SHIFT
+                list.append(UInt16(Code128Table.FNC_4))
+                list.append(UInt16(Code128Table.SHIFT))
+                list.append(UInt16(c - 128 + 64))
+                i += 1
+            } else {
+                list.append(UInt16(Code128Table.FNC_4))
+                list.append(UInt16(c - 160))    // 128 + 32
+                i += 1
+            }
+        }
+        return list
+    }
+
+    private func drawCode128(_ page: Page?, _ x1: Float, _ y1: Float) -> Extent {
+        let h: Float = m1 * barHeightFactor     // Barcode height when drawn horizontally
+
+        // init refused a text with an error
+        let codewords = (barcodeType == Barcode.GS1_128) ?
+                Barcode.gs1128Codewords(text).codewords : Barcode.code128Codewords(text).codewords
+        let start = Int(codewords[0])
+        let list = Array(codewords[1...])
+
+        var buf = String()
+        var checkDigit = start
+        buf.append(String(UnicodeScalar(checkDigit)!))
+        for i in 0..<list.count {
+            let codeword = list[i]
+            buf.append(String(UnicodeScalar(codeword)!))
+            checkDigit += Int(codeword) * Int(i + 1)
+        }
+        checkDigit %= Code128Table.START_A
+        buf.append(String(UnicodeScalar(checkDigit)!))
+        buf.append(String(UnicodeScalar(Code128Table.STOP)!))
+
+        let scalars = [UnicodeScalar](buf.unicodeScalars)
+        var length: Float = 0.0
+        for scalar in scalars {
+            for symbolScalar in String(Code128Table.TABLE[Int(scalar.value)]).unicodeScalars {
+                length += Float(Int(symbolScalar.value) - 0x30) * m1
+            }
+        }
+
+        let bars = Bars(x1: x1, y1: y1, length: length, height: h, direction: direction)
+        var x: Float = x1
+        for scalar in scalars {
+            let symbol = String(Code128Table.TABLE[Int(scalar.value)])
+            var j = 0
+            for scalar in symbol.unicodeScalars {
+                let n = Int(scalar.value) - 0x30
+                if j%2 == 0 {
+                    drawBar(page, bars, x, m1 * Float(n), h)
+                }
+                x += Float(n) * m1
+                j += 1
+            }
+        }
+
+        var left = x1
+        var right = x
+        var bottom = y1 + h
+        if font != nil {
+            // The text is centered under the bars, and can be wider than them
+            let textX = x1 + ((x - x1) - font!.stringWidth(text))/2
+            let xy = drawText(page, bars, text, textX, y1 + h + font!.bodyHeight)
+            left = min(left, textX)
+            right = max(right, xy[0])
+            bottom = xy[1]
+        }
+
+        return Extent(bars: bars, left: left, right: right, bottom: bottom)
+    }
+
+    // The widths, narrow (n) or wide (w), of the five bars or the five spaces of
+    // each digit in Interleaved 2 of 5.
+    private static let itfPatterns = [
+        "nnwwn", "wnnnw", "nwnnw", "wwnnn", "nnwnw", "wnwnn", "nwwnn", "nnnww", "wnnwn", "nwnwn"]
+
+    // Draws an ITF-14 barcode: the 14 digits of the GTIN in Interleaved 2 of 5,
+    // the first digit of each pair in the bars and the second in the spaces
+    // between them, wide bars and spaces 2.5 times the narrow ones, after the
+    // start of four narrow bars and spaces and before the stop of a wide bar, a
+    // narrow space and a narrow bar. A frame of bearer bars four modules thick
+    // is around the bars and the quiet zones of ten modules on each side of
+    // them, as GS1 asks of a barcode printed on corrugated board, so that a
+    // scanner does not read a barcode cut short. The text, the 14 digits, is
+    // under the frame.
+    private func drawITF14(_ page: Page?, _ x1: Float, _ y1: Float) -> Extent {
+        let m = m1
+        let wide: Float = 2.5 * m
+        let bearer: Float = 4.0 * m
+        let quiet: Float = 10.0 * m
+        let h: Float = m * barHeightFactor  // The height of the bars when drawn horizontally
+
+        let digits = Array(text.utf8).map { Int($0) - 48 }
+        var sum = 0
+        for i in 0..<13 {
+            sum += (i % 2 == 0) ? 3 * digits[i] : digits[i]
+        }
+        let fullText = text + String((10 - sum % 10) % 10)
+        let all = Array(fullText.utf8).map { Int($0) - 48 }
+
+        // The widths of the bars and the spaces in turn, a bar first
+        var widths = Array("nnnn")
+        for i in stride(from: 0, to: 14, by: 2) {
+            let barWidths = Array(Barcode.itfPatterns[all[i]])
+            let spaceWidths = Array(Barcode.itfPatterns[all[i + 1]])
+            for j in 0..<5 {
+                widths.append(barWidths[j])
+                widths.append(spaceWidths[j])
+            }
+        }
+        widths += Array("wnn")
+        var length: Float = 0.0
+        for c in widths {
+            length += (c == "w") ? wide : m
+        }
+        let outerWidth = 2.0*bearer + 2.0*quiet + length
+        let outerHeight = 2.0*bearer + h
+        let bars = Bars(x1: x1, y1: y1, length: outerWidth, height: outerHeight, direction: direction)
+
+        if let page = page {
+            // The bars carry no text, so they are decorative content.
+            page.addArtifactBMC()
+            var x = x1 + bearer + quiet
+            for (i, c) in widths.enumerated() {
+                let w = (c == "w") ? wide : m
+                if i % 2 == 0 {
+                    strokeLine(page, bars, x + w/2.0, y1 + bearer, x + w/2.0, y1 + bearer + h, w)
+                }
+                x += w
+            }
+            let frameRight = x1 + outerWidth
+            let frameBottom = y1 + outerHeight
+            strokeLine(page, bars, x1, y1 + bearer/2.0, frameRight, y1 + bearer/2.0, bearer)
+            strokeLine(page, bars, x1, frameBottom - bearer/2.0, frameRight, frameBottom - bearer/2.0, bearer)
+            strokeLine(page, bars, x1 + bearer/2.0, y1, x1 + bearer/2.0, frameBottom, bearer)
+            strokeLine(page, bars, frameRight - bearer/2.0, y1, frameRight - bearer/2.0, frameBottom, bearer)
+            page.addEMC()
+        }
+
+        var left = x1
+        var right = x1 + outerWidth
+        var bottom = y1 + outerHeight
+        if font != nil {
+            let textX = x1 + (outerWidth - font!.stringWidth(fullText))/2
+            let xy = drawText(page, bars, fullText, textX, y1 + outerHeight + font!.bodyHeight)
+            left = min(left, textX)
+            right = max(right, xy[0])
+            bottom = xy[1]
+        }
+        return Extent(bars: bars, left: left, right: right, bottom: bottom)
+    }
+
+    // Strokes a line of width w from (xa, ya) to (xb, yb), turned to the
+    // direction of the barcode.
+    private func strokeLine(_ page: Page, _ bars: Bars,
+            _ xa: Float, _ ya: Float, _ xb: Float, _ yb: Float, _ w: Float) {
+        let a = bars.turn(xa, ya)
+        let b = bars.turn(xb, yb)
+        page.setPenWidth(w)
+        page.moveTo(a[0], a[1])
+        page.lineTo(b[0], b[1])
+        page.strokePath()
+    }
+
+    private func drawCode39(_ page: Page?, _ x1: Float, _ y1: Float) -> Extent {
+        // Use a local variable instead of mutating the text field - drawOn()
+        // must be safe to call more than once on the same Barcode instance
+        // (e.g. drawing the same barcode on several pages).
+        let fullText = "*" + text + "*"
+        let h: Float = m1 * barHeightFactor     // Barcode height when drawn horizontally
+
+        var length: Float = 0.0
+        for symchar in fullText.unicodeScalars {
+            let code = tableB[String(symchar)]!    // init checked every character
+            for ch in code.unicodeScalars {
+                length += (ch == "W" || ch == "B") ? 3 * m1 : m1
+            }
+            length += m1
+        }
+        length -= m1    // There is no gap after the last character
+
+        let bars = Bars(x1: x1, y1: y1, length: length, height: h, direction: direction)
+        var x: Float = x1
+        for symchar in fullText.unicodeScalars {
+            let scalars = Array(tableB[String(symchar)]!.unicodeScalars)
+            for i in 0..<9 {
+                let ch = String(scalars[i])
+                if ch == "w" {
+                    x += m1
+                } else if ch == "W" {
+                    x += m1 * 3
+                } else if ch == "b" {
+                    drawBar(page, bars, x, m1, h)
+                    x += m1
+                } else if ch == "B" {
+                    drawBar(page, bars, x, m1 * 3, h)
+                    x += m1 * 3
+                }
+            }
+            x += m1
+        }
+
+        var left = x1
+        var right = x1 + length
+        var bottom = y1 + h
+        if font != nil {
+            let textX = x1 + (length - font!.stringWidth(fullText))/2
+            let xy = drawText(page, bars, fullText, textX, y1 + h + font!.bodyHeight)
+            left = min(left, textX)
+            right = max(right, xy[0])
+            bottom = xy[1]
+        }
+
+        return Extent(bars: bars, left: left, right: right, bottom: bottom)
+    }
+
+    private func drawCodeEAN13(_ page: Page?, _ x1: Float, _ y1: Float) -> Extent {
+        var x: Float = x1
+        let h: Float = m1 * barHeightFactor     // Barcode height when drawn horizontally
+        // The guard bars reach 5 modules below the others.
+        let longBar: Float = h + Barcode.guardBarExtension * m1
+
+        let scalars = Array(text.unicodeScalars)
+        var sum = 0
+        var i = 0
+        while i < 12 {
+            sum += Int(scalars[i].value) - 0x30
+            i += 2
+        }
+        i = 1
+        while i < 12 {
+            sum += (Int(scalars[i].value) - 0x30) * 3
+            i += 2
+        }
+        var checkDigit = 0
+        let remainder = sum % 10
+        if remainder > 0 {
+            checkDigit = 10 - remainder
+        }
+        // fullScalars is a local copy - drawOn() must be safe to call more
+        // than once on the same Barcode instance (e.g. drawing the same
+        // barcode on several pages).
+        // The check digit must be appended as its ASCII character (0x30 +
+        // digit), matching how the rest of the digits are represented -
+        // not as a raw scalar value 0-9 (which are unprintable control
+        // characters and would corrupt any indexing done against them).
+        var fullScalars = scalars
+        fullScalars.append(UnicodeScalar(UInt16(checkDigit) + 0x30)!)
+        let bars = Bars(x1: x1, y1: y1, length: 95.0 * m1, height: longBar, direction: direction)  // 95 modules
+
+        x = drawEGuard(page, bars, x, longBar)
+        let xLeftGroupStart = x
+        let group1 = Array(lgMap[Int(fullScalars[0].value) - 0x30].unicodeScalars)
+
+        i = 1
+        while i < 7 {
+            let digit = Int(fullScalars[i].value) - 0x30
+            var str = gCode[digit]
+            if group1[i - 1] == "L" {
+                str = lCode[digit]
+            }
+            let symbols = Array(str.unicodeScalars)
+            for j in 0..<symbols.count {
+                let n = symbols[j].value - 0x30
+                if j%2 != 0 {
+                    drawBar(page, bars, x, Float(n)*m1, h)
+                }
+                x += Float(n)*m1
+            }
+            i += 1
+        }
+        let xLeftGroupEnd = x
+        x = drawMGuard(page, bars, x, longBar)
+        let xRightGroupStart = x
+
+        i = 7
+        while i < 13 {
+            let digit = Int(fullScalars[i].value) - 0x30
+            let symbols = Array(lCode[digit].unicodeScalars)
+            for j in 0..<symbols.count {
+                let n = symbols[j].value - 0x30
+                if j%2 == 0 {
+                    drawBar(page, bars, x, Float(n)*m1, h)
+                }
+                x += Float(n)*m1
+            }
+            i += 1
+        }
+        let xRightGroupEnd = x
+        x = drawEGuard(page, bars, x, longBar)
+
+        var left = x1
+        var right = x
+        var bottom = y1 + longBar
+        if font != nil {
+            // Standard EAN-13 layout: the leading (number system) digit sits
+            // in the quiet zone to the left of the start guard bars, not
+            // centered under them together with the rest of the label. The
+            // two groups of 6 digits are each centered under their own bar
+            // section (left group / right group), not under the barcode as
+            // a whole.
+            let firstDigit = String(fullScalars[0])
+            var leftGroup = ""
+            for k in 1..<7 {
+                leftGroup += String(fullScalars[k])
+            }
+            var rightGroup = ""
+            for k in 7..<13 {
+                rightGroup += String(fullScalars[k])
+            }
+
+            let fontSize = font!.getSize()
+            font!.setSize(10.0)
+            let yText = y1 + h + font!.getBodyHeight(font!.getSize())
+            let gap = font!.stringWidth(font!.getSize(), " ")
+
+            left = x1 - gap - font!.stringWidth(font!.getSize(), firstDigit)
+            drawText(page, bars, firstDigit, left, yText)
+            drawText(page, bars, leftGroup,
+                    xLeftGroupStart + ((xLeftGroupEnd - xLeftGroupStart) - font!.stringWidth(font!.getSize(), leftGroup))/2,
+                    yText)
+            let xy = drawText(page, bars, rightGroup,
+                    xRightGroupStart + ((xRightGroupEnd - xRightGroupStart) - font!.stringWidth(font!.getSize(), rightGroup))/2,
+                    yText)
+            right = max(right, xy[0])
+            bottom = max(bottom, xy[1])
+
+            font!.setSize(fontSize)
+        }
+
+        return Extent(bars: bars, left: left, right: right, bottom: bottom)
+    }
+
+    // The bars of a barcode, length long and height high, drawn left to right from
+    // (x1, y1) and turned to the direction of the barcode: top to bottom is a quarter
+    // turn clockwise and bottom to top a quarter turn counter-clockwise, and the bars
+    // stay right of x1 and below y1. The draw methods take the coordinates of the
+    // barcode drawn left to right.
+    private struct Bars {
+        let x1: Float
+        let y1: Float
+        let length: Float
+        let height: Float
+        let direction: Direction
+
+        // Returns the point (x, y) turned to the direction of the barcode.
+        func turn(_ x: Float, _ y: Float) -> [Float] {
+            if direction == Direction.TOP_TO_BOTTOM {
+                return [x1 + height - (y - y1), y1 + (x - x1)]
+            } else if direction == Direction.BOTTOM_TO_TOP {
+                return [x1 + (y - y1), y1 + length - (x - x1)]
+            }
+            return [x, y]
+        }
+
+        // Returns the bottom right corner, turned to the direction of the barcode, of
+        // a barcode that spans from left to right and from y1 to bottom.
+        func getBottomRight(_ left: Float, _ right: Float, _ bottom: Float) -> [Float] {
+            if direction == Direction.TOP_TO_BOTTOM {
+                return [x1 + height, y1 + (right - x1)]
+            } else if direction == Direction.BOTTOM_TO_TOP {
+                return [x1 + (bottom - y1), y1 + length + (x1 - left)]
+            }
+            return [right, bottom]
+        }
+    }
+
+    // How far a barcode drawn left to right reaches, its bars and its text:
+    // from left to right, and from y1 to bottom.
+    private struct Extent {
+        let bars: Bars
+        let left: Float
+        let right: Float
+        let bottom: Float
+
+        // Returns the box of the barcode, turned to its direction: the x and y
+        // of its top left corner, its width and its height.
+        func getBox() -> [Float] {
+            let a = bars.turn(left, bars.y1)
+            let b = bars.turn(right, bottom)
+            return [min(a[0], b[0]), min(a[1], b[1]), abs(b[0] - a[0]), abs(b[1] - a[1])]
+        }
+    }
+
+    /// Returns the height of this barcode as it is drawn: from its location to the bottom of the
+    /// bars, or of the text under them, in the direction the barcode is drawn, so a barcode drawn
+    /// top to bottom or bottom to top is as tall as it is long.
+    public func getHeight() -> Float {
+        return drawOn(nil)[1] - y1
+    }
+}   // End of Barcode.swift
