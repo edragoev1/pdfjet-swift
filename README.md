@@ -38,7 +38,7 @@ In Package.swift:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/edragoev1/pdfjet-swift", from: "9.1.9"),
+    .package(url: "https://github.com/edragoev1/pdfjet-swift", from: "9.2.1"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [

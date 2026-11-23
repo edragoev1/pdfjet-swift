@@ -395,10 +395,13 @@ final class GlyphOutline {
         }
     }
 
-    /// A number of a path, in the units of the font: in hundredths, trailing
-    /// zeros left out, the same in the four ports. Rounded half away from zero.
+    /// A number of a path, in the units of the font: whole units, the same in
+    /// the four ports, rounded half away from zero. The font's own points are
+    /// whole units; the control points of a quadratic curve drawn as a cubic
+    /// one are not, and move by at most half a unit, 0.05% of the em, unseen
+    /// at any size, for outlines 15% smaller (9.2.1).
     static func number(_ value: Double) -> String {
-        return decimals(value, 2)
+        return decimals(value, 0)
     }
 
     /// The value with at most the decimals given, rounded half away from zero.
@@ -730,21 +733,11 @@ final class GlyphOutline {
     }
 
     private func u16(_ at: Int) throws -> Int {
-        if at < 0 || at > data.count - 2 {
-            throw Subset.NotSubset()
-        }
-        return Int(data[at]) << 8 | Int(data[at + 1])
+        return try Subset.u16(data, at)
     }
 
     private func u32(_ at: Int) throws -> Int {
-        if at < 0 || at > data.count - 4 {
-            throw Subset.NotSubset()
-        }
-        let value = Int(data[at]) << 24 | Int(data[at + 1]) << 16 | Int(data[at + 2]) << 8 | Int(data[at + 3])
-        if value > Int(Int32.max) {
-            throw Subset.NotSubset()
-        }
-        return value
+        return try Subset.u32(data, at)
     }
 
     // ------------------------------------------------------------------

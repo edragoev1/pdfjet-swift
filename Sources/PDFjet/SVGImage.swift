@@ -25,6 +25,12 @@ public class SVGImage : Drawable {
     var altDescription: String?
     private var font: Font?
     private var boldFont: Font?
+    // The italic, bold italic and monospace fonts Markdown gives the image,
+    // with its regular and bold ones, so that its text keeps the style the
+    // SVG asks for in the fonts of the document (setMarkdownFonts)
+    private var italicFont: Font?
+    private var boldItalicFont: Font?
+    private var monoFont: Font?
 
     // While the file is read: the elements by the bytes of their ids, the
     // clip paths of the image, and the elements drawn again by a use element
@@ -396,8 +402,11 @@ public class SVGImage : Drawable {
         marker = nil
         if name == "svg" && root {
             root = false
-            w = SVGImage.parseLength(values["width"] ?? "")
-            h = SVGImage.parseLength(values["height"] ?? "")
+            // The width and the height in points, and 0 for a length that
+            // PDFjet cannot read, a percentage among them, which leaves the
+            // size to the viewBox.
+            w = SVGState.parseLength(values["width"] ?? "") ?? 0.0
+            h = SVGState.parseLength(values["height"] ?? "") ?? 0.0
             // viewbox in lower case when there is no viewBox, as an
             // HTML page's parser reads an inline svg, whose files keep it
             viewBox = values["viewBox"] ?? values["viewbox"] ?? ""
@@ -1440,23 +1449,6 @@ public class SVGImage : Drawable {
         return units.contains { $0.0 != "px" && SVGState.hasSuffix(text, $0.0) }
     }
 
-    // Returns the width or the height of the svg element in points, and 0 for
-    // a length that PDFjet cannot read, a percentage among them, which leaves
-    // the size to the viewBox.
-    private static func parseLength(_ value: String) -> Float {
-        var text = SVGState.trimSpace(value)
-        var scale: Float = 1.0
-        for (suffix, points) in units where SVGState.hasSuffix(text, suffix) {
-            text = SVGState.trimSpace(SVGState.string(text.unicodeScalars.dropLast(suffix.count)))
-            scale = points
-            break
-        }
-        guard let number = SVGState.parseFloat(text), number.isFinite else {
-            return 0.0
-        }
-        return number*scale
-    }
-
     // Parses a numeric attribute value, treating an empty value as 0 —
     // consistent with how an omitted attribute is handled. Returns nil for a
     // value that is not a number.
@@ -1677,14 +1669,36 @@ public class SVGImage : Drawable {
         return self
     }
 
-    // Returns the font of a run: the one set, the bold one for a weight of 600
-    // or more when it is set, or else the face of the fonts PDFjet carries of
+    // Gives the image the italic, bold italic and monospace fonts of a
+    // Markdown document, with the regular and bold ones of setFont and
+    // setBoldFont: its text in the document's fonts keeps the style the SVG
+    // asks for, where the regular and bold ones alone drew all of it upright
+    // (code review, 23 November 2026).
+    func setMarkdownFonts(_ italic: Font, _ boldItalic: Font, _ mono: Font) {
+        self.italicFont = italic
+        self.boldItalicFont = boldItalic
+        self.monoFont = mono
+    }
+
+    // Returns the font of a run: of the fonts set, the monospace one for a
+    // monospace family, the bold italic or italic one for italic text, the
+    // bold one for a weight of 600 or more, each when it is set, or else the
+    // one of setFont; with none set, the face of the fonts PDFjet carries of
     // its family, weight and style. A face that is neither in resources/fonts
     // nor in the bundle of PDFjetFonts, which PDFjet depends on, is refused:
     // nil, and the document records why, as no core font is drawn in its
     // place.
-    private func fontOf(_ run: SVGText.Run, _ page: Page) -> Font? {
+    func fontOf(_ run: SVGText.Run, _ page: Page) -> Font? {
         if let font = font {
+            if run.family == BundledFonts.MONO, let mono = monoFont {
+                return mono
+            }
+            if run.italic, run.weight >= 600, let boldItalic = boldItalicFont {
+                return boldItalic
+            }
+            if run.italic, let italic = italicFont {
+                return italic
+            }
             return (run.weight >= 600 && boldFont != nil) ? boldFont! : font
         }
         let pdf = page.pdf
@@ -1769,18 +1783,7 @@ public class SVGImage : Drawable {
             let strokePass = (pass == 0) == path.strokeFirst
             if !strokePass && fill {
                 page.setBrushColor(path.fill)
-                for op in path.operations {
-                    if op.cmd == "M" {
-                        page.moveTo(op.x + x, op.y + y)
-                    } else if op.cmd == "L" {
-                        page.lineTo(op.x + x, op.y + y)
-                    } else if op.cmd == "C" {
-                        page.curveTo(
-                            op.x1 + x, op.y1 + y,
-                            op.x2 + x, op.y2 + y,
-                            op.x + x, op.y + y)
-                    }
-                }
+                appendOperations(path.operations, page, false)
                 if path.evenOdd {
                     page.append("f*\n")
                 } else {
@@ -1793,26 +1796,30 @@ public class SVGImage : Drawable {
                 page.setPenWidth(path.strokeWidth)
                 // Z closes a subpath, and the path is stroked once, all of its
                 // subpaths together, as SVG strokes it.
-                for op in path.operations {
-                    if op.cmd == "M" {
-                        page.moveTo(op.x + x, op.y + y)
-                    } else if op.cmd == "L" {
-                        page.lineTo(op.x + x, op.y + y)
-                    } else if op.cmd == "C" {
-                        page.curveTo(
-                            op.x1 + x, op.y1 + y,
-                            op.x2 + x, op.y2 + y,
-                            op.x + x, op.y + y)
-                    } else if op.cmd == "Z" {
-                        page.append("h\n")
-                    }
-                }
+                appendOperations(path.operations, page, true)
                 page.strokePath()
             }
         }
 
         if state {
             page.restoreGraphicsState()
+        }
+    }
+
+    // Writes the moves, the lines and the curves of the path where the image
+    // is, and with close true its Z as h, which closes a subpath; a fill
+    // needs no h, as it closes every subpath.
+    private func appendOperations(_ operations: [PathOp], _ page: Page, _ close: Bool) {
+        for op in operations {
+            if op.cmd == "M" {
+                page.moveTo(op.x + x, op.y + y)
+            } else if op.cmd == "L" {
+                page.lineTo(op.x + x, op.y + y)
+            } else if op.cmd == "C" {
+                page.curveTo(op.x1 + x, op.y1 + y, op.x2 + x, op.y2 + y, op.x + x, op.y + y)
+            } else if close && op.cmd == "Z" {
+                page.append("h\n")
+            }
         }
     }
 
@@ -1894,17 +1901,7 @@ public class SVGImage : Drawable {
                 clipToText(clip, page)
                 continue
             }
-            for op in clip.operations {
-                if op.cmd == "M" {
-                    page.moveTo(op.x + x, op.y + y)
-                } else if op.cmd == "L" {
-                    page.lineTo(op.x + x, op.y + y)
-                } else if op.cmd == "C" {
-                    page.curveTo(op.x1 + x, op.y1 + y, op.x2 + x, op.y2 + y, op.x + x, op.y + y)
-                } else if op.cmd == "Z" {
-                    page.append("h\n")
-                }
-            }
+            appendOperations(clip.operations, page, true)
             if clip.evenOdd {
                 page.append("W*\nn\n")
             } else {
@@ -2135,22 +2132,9 @@ public class SVGImage : Drawable {
         page.addEMC()
         page.endLink(link)
         if (uri != nil || key != nil) {
-            page.addAnnotation(Annotation(
-                    Annotation.Link,
-                    x,
-                    y,
-                    x + w,
-                    y + h,
-                    nil,    // Vertices
-                    nil,    // Fill Color
-                    0.0,    // Opacity
-                    nil,    // Title
-                    nil,    // Contents
-                    uri,
-                    key,    // The destination name
-                    language,
-                    actualText,
-                    altDescription).joining(link))
+            page.addAnnotation(Annotation.link(
+                    x, y, x + w, y + h,
+                    uri, key, language, actualText, altDescription).joining(link))
         }
         return [self.x + self.w, self.y + self.h]
     }

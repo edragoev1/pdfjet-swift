@@ -10,7 +10,7 @@ import Foundation
 /// its name, with its license: IBM Plex Sans and Serif, from Thin to Bold,
 /// and Cascadia Mono, from Light to Bold, as .otf, upright and
 /// italic, for every European language, in Latin, Greek and Cyrillic; and, in
-/// resources/fonts/world, IBM Plex Sans Arabic, Hebrew and Thai, Thin to
+/// resources/fonts/world, IBM Plex Sans Arabic, Devanagari, Hebrew and Thai, Thin to
 /// Bold, and IBM Plex Sans JP, KR, SC and TC, Regular, SemiBold and Bold, as
 /// .otf. All are under the SIL Open Font License 1.1. A path to one of them,
 /// such as fonts/IBMPlexSans/IBMPlexSans-Regular.otf, the constants of the
@@ -50,6 +50,11 @@ enum BundledFonts {
             faces[family] = ["Thin", "Light", "Text", "Regular", "Medium", "SemiBold", "Bold"].map {
                 family + "-" + $0 + ".otf"
             }
+        }
+        // Noto Sans of the scripts TextBlock shapes, Regular and Bold
+        for family in [
+                "NotoSansBengali", "NotoSansDevanagari", "NotoSansGujarati", "NotoSansGurmukhi", "NotoSansKannada", "NotoSansKhmer", "NotoSansLao", "NotoSansMalayalam", "NotoSansMyanmar", "NotoSansOriya", "NotoSansSinhala", "NotoSansTamil", "NotoSansTelugu"] {
+            faces[family] = [family + "-Regular.otf", family + "-Bold.otf"]
         }
         return faces
     }()
@@ -104,7 +109,7 @@ enum BundledFonts {
     static let WORLD_PRODUCT = ".product(name: \"PDFjetFontsWorld\", package: \"pdfjet\")"
 
     // What the fonts of the product PDFjetFontsWorld are for.
-    static let WORLD_SCRIPTS = "with PDFjet's fonts for Chinese, Japanese, Korean, Arabic, Hebrew and Thai"
+    static let WORLD_SCRIPTS = "with PDFjet's fonts for Chinese, Japanese, Korean, Arabic, Hebrew, Thai, the Indic scripts, Sinhala, Khmer, Lao and Myanmar"
 
     // Returns the name of a font under resources/fonts, Family/File, of a
     // path to it, such as fonts/IBMPlexSans/IBMPlexSans-Regular.otf: its
@@ -133,7 +138,9 @@ enum BundledFonts {
     // Returns the name of a family as people write it, such as IBM Plex Sans
     // Arabic of IBMPlexSansArabic.
     static func familyName(_ family: String) -> String {
-        var name = "IBM Plex " + family.dropFirst("IBMPlex".count)
+        var name = family.hasPrefix("Noto")
+                ? "Noto " + family.dropFirst("Noto".count)
+                : "IBM Plex " + family.dropFirst("IBMPlex".count)
         if let sans = name.range(of: "Sans"), sans.upperBound < name.endIndex {
             name.insert(" ", at: sans.upperBound)
         }

@@ -43,6 +43,18 @@ public class TextBlock : Drawable {
     private var underline: Bool = false
     private var strikeout: Bool = false
     private var rightToLeft: Bool = false
+    private var rightToLeftSet = false  // True after setRightToLeft: else each paragraph's own direction
+
+    // The shaper of text such as Hindi or Khmer, else the default one
+    private var shaper: Shaper?
+    // The lines a shaper found, by paragraph, width and size, so that a
+    // paragraph is shaped once however often the block is measured
+    private var shapedLines: [String: [ShapedLine]]?
+    // The font, fallback font and language the lines were shaped in: in
+    // another, they are shaped again
+    private var shapedStyle: ShapingStyle?
+    // Why a paragraph could not be shaped, which drawOn fails the document with
+    private var shapeError: Error?
 
     private var lineSpacing: Float = 1.0
 
@@ -93,6 +105,7 @@ public class TextBlock : Drawable {
     @discardableResult
     public func setText(_ text: String) -> TextBlock {
         self.textContent = text
+        self.shapedLines = nil  // The lines of another text are not needed again
         return self
     }
 
@@ -200,10 +213,7 @@ public class TextBlock : Drawable {
         if color == Color.transparent {
             return self
         }
-        let r = Float(((color >> 16) & 0xff))/255.0
-        let g = Float(((color >>  8) & 0xff))/255.0
-        let b = Float(((color)       & 0xff))/255.0
-        self.textColor = [r, g, b]
+        self.textColor = Util.rgb(color)
         return self
     }
 
@@ -226,10 +236,7 @@ public class TextBlock : Drawable {
             self.fillColor = nil
             return self
         }
-        let r = Float(((color >> 16) & 0xff))/255.0
-        let g = Float(((color >>  8) & 0xff))/255.0
-        let b = Float(((color)       & 0xff))/255.0
-        self.fillColor = [r, g, b]
+        self.fillColor = Util.rgb(color)
         return self
     }
 
@@ -252,10 +259,7 @@ public class TextBlock : Drawable {
             self.borderColor = nil
             return self
         }
-        let r = Float(((color >> 16) & 0xff))/255.0
-        let g = Float(((color >>  8) & 0xff))/255.0
-        let b = Float(((color)       & 0xff))/255.0
-        self.borderColor = [r, g, b]
+        self.borderColor = Util.rgb(color)
         return self
     }
 
@@ -341,11 +345,88 @@ public class TextBlock : Drawable {
     /// Each paragraph is wrapped at the width in logical order, and each line
     /// is then reordered with Bidi.reorderVisually, which also shapes the
     /// Arabic letters, and aligned to the right, unless the text alignment is
-    /// Alignment.CENTER.
+    /// Alignment.CENTER. Without it, each paragraph is right to left when its
+    /// first letter is Arabic or Hebrew, and left to right otherwise.
     @discardableResult
     public func setRightToLeft(_ rightToLeft: Bool) -> TextBlock {
         self.rightToLeft = rightToLeft
+        self.rightToLeftSet = true
         return self
+    }
+
+    /// Sets the text engine that shapes text such as Hindi or Khmer, which
+    /// TextBlock draws as outlines: without it, the one of setDefaultShaper,
+    /// else Core Text on Apple's platforms. On Linux, HBShape(), which runs
+    /// HarfBuzz's program hb-shape.
+    @discardableResult
+    public func setShaper(_ shaper: Shaper) -> TextBlock {
+        self.shaper = shaper
+        self.shapedLines = nil
+        return self
+    }
+
+    /// Sets the shaper of every TextBlock and TextLine given none, such as
+    /// HBShape() on Linux; nil for Core Text on Apple's platforms.
+    public static func setDefaultShaper(_ shaper: Shaper?) {
+        Shaping.setDefaultShaper(shaper)
+    }
+
+    // Whether the paragraph is right to left: as set with setRightToLeft,
+    // else by its first letter, Arabic or Hebrew.
+    private func paragraphRightToLeft(_ paragraph: String) -> Bool {
+        if rightToLeftSet {
+            return rightToLeft
+        }
+        for scalar in paragraph.unicodeScalars {
+            let c = scalar.value
+            // The right to left blocks of bidi.go, Hebrew and Arabic; not
+            // U+FEFF, the byte order mark, past the Arabic forms
+            if (c >= 0x0590 && c <= 0x05FF) || (c >= 0x0600 && c <= 0x07BF) || (c >= 0x07C0 && c <= 0x085F)
+                    || (c >= 0x0860 && c <= 0x08FF) || (c >= 0xFB1D && c <= 0xFB4F) || (c >= 0xFB50 && c <= 0xFD3D)
+                    || (c >= 0xFD50 && c <= 0xFDCE) || (c >= 0xFDF0 && c <= 0xFDFC) || (c >= 0xFE70 && c <= 0xFEFC)
+                    || (c >= 0x10800 && c <= 0x10FFF) || (c >= 0x1E800 && c <= 0x1EFFF) {
+                return true
+            }
+            if scalar.properties.isAlphabetic {
+                return false
+            }
+        }
+        return false
+    }
+
+    // Shapes the paragraph, as Hindi or Khmer, wrapped at the width, and adds
+    // its lines, drawn as outlines: the block's font for the text, its
+    // fallback font for the characters the font has not.
+    private func addShapedLines(_ textLines: inout [TextLine], _ paragraph: String, _ textAreaWidth: Float) {
+        let fonts = Shaping.shapingFonts(font, fallbackFont)
+        let style = ShapingStyle(font: font, fallback: fallbackFont, size: 0, language: language)
+        if shapedStyle != style {
+            shapedLines = nil
+            shapedStyle = style
+        }
+        let key = "\(textAreaWidth)|\(fontSize)|" + paragraph
+        var lines = shapedLines?[key]
+        if lines == nil {
+            do {
+                lines = try Shaping.shapeText(shaper, fonts, fontSize, language, paragraph, textAreaWidth)
+            } catch {
+                if shapeError == nil {
+                    shapeError = error
+                }
+                return
+            }
+            if shapedLines == nil {
+                shapedLines = [:]
+            }
+            shapedLines![key] = lines
+        }
+        let utf16 = Array(paragraph.utf16)
+        for line in lines! {
+            let text = Shaping.text(utf16, line)
+            let textLine = TextLine(font, text.trimmingCharacters(in: .whitespaces))
+            textLine.shaped = ShapedText(line, text, fonts, fontSize)
+            textLines.append(textLine)
+        }
     }
 
     // Splits the text at each of the character, by Unicode scalars, keeping
@@ -368,9 +449,26 @@ public class TextBlock : Drawable {
         while lines.count > 1 && lines[lines.count - 1].isEmpty {
             lines.removeLast()
         }
-        for line in lines {
+        shapeError = nil
+        // The direction of each paragraph, as wrapped: rightToLeft, the
+        // block's as set, is the paragraph's while its lines are made
+        let blockRightToLeft = rightToLeft
+        defer {
+            rightToLeft = blockRightToLeft
+        }
+        for given in lines {
+            var line = given
+            if Shaping.needsShaper(line) {
+                addShapedLines(&textLines, line, textAreaWidth)
+                continue
+            }
+            rightToLeft = paragraphRightToLeft(line)
             if rightToLeft {
+                let first = textLines.count
                 addRightToLeftLines(&textLines, line, textAreaWidth)
+                for i in first..<textLines.count {
+                    textLines[i].rightToLeft = true
+                }
                 continue
             }
             // A zero width space marks a place where the line may break in text
@@ -379,6 +477,10 @@ public class TextBlock : Drawable {
             if stringWidth(text) <= textAreaWidth {
                 textLines.append(TextLine(font, text))
             } else {
+                // Thai text that has none is given one at each end of a word,
+                // as ICU's dictionary of Thai finds them, when the line is to
+                // be broken alone (ultra review, 22 November 2026)
+                line = DictionaryBreaks.thaiWordBreaks(line)
                 if text.isCJK() {
                     var sb = ""
                     for scalar in text.unicodeScalars {
@@ -892,16 +994,20 @@ public class TextBlock : Drawable {
             return textLines
         }
         var lines = Array(textLines[..<fit])
+        if lines[fit - 1].shaped != nil {
+            return lines    // Glyphs drawn as outlines, cut where the height ends
+        }
         var last = Array(lines[fit - 1].text!.unicodeScalars)
         // A line of right to left text is kept in the order it is drawn, so its
         // end, where it is cut and the "..." goes, is at its left: cut at its
         // right, the start of the line was lost and the "..." came first in the
         // reading (review of 11 October 2026, #7)
-        if rightToLeft {
+        if lines[fit - 1].rightToLeft {
             if last.count > 3 {
                 last.removeFirst(3)
             }
             lines[fit - 1] = TextLine(font, "..." + TextBlock.string(last[...]))
+            lines[fit - 1].rightToLeft = true
             return lines
         }
         if last.count > 3 {
@@ -915,14 +1021,22 @@ public class TextBlock : Drawable {
     private func rightAlignText(_ textLines: [TextLine]) {
         let textAreaWidth = self.textAreaWidth()
         for textLine in textLines {
-            textLine.xOffset = textAreaWidth - stringWidth(textLine.text)
+            // A line wider than the block, as a word a shaper cannot break,
+            // starts at its left side, as with LEFT, and overflows to the right
+            textLine.xOffset = max(0, textAreaWidth - widthOf(textLine))
         }
+    }
+
+    // The width of a line of the block: of its glyphs, for one a shaper
+    // shaped, else of its text.
+    private func widthOf(_ textLine: TextLine) -> Float {
+        return textLine.shaped?.line.width ?? stringWidth(textLine.text)
     }
 
     private func centerText(_ textLines: [TextLine]) {
         let textAreaWidth = self.textAreaWidth()
         for textLine in textLines {
-            textLine.xOffset = (textAreaWidth - stringWidth(textLine.text)) / 2.0
+            textLine.xOffset = max(0, (textAreaWidth - widthOf(textLine)) / 2.0)
         }
     }
 
@@ -968,8 +1082,11 @@ public class TextBlock : Drawable {
 
         if textAlignment == Alignment.CENTER {
             centerText(textLines)
-        } else if textAlignment == Alignment.RIGHT || rightToLeft {
+        } else if textAlignment == Alignment.RIGHT {
             rightAlignText(textLines)
+        } else {
+            // The lines of right to left paragraphs, aligned to the right
+            rightAlignText(textLines.filter { $0.rightToLeft })
         }
         if underline {
             underlineText(textLines)
@@ -998,6 +1115,11 @@ public class TextBlock : Drawable {
         // corner (review of 17 October 2026)
         if !width.isFinite {
             page!.pdf.fail("The width of a text block is a finite number.")
+            return [x + width, y + blockHeight]
+        }
+        // Text such as Hindi that could not be shaped fails the document, saying why
+        if let shapeError = shapeError {
+            page!.pdf.fail(Shaping.message(shapeError))
             return [x + width, y + blockHeight]
         }
 
@@ -1035,22 +1157,9 @@ public class TextBlock : Drawable {
         page!.restoreGraphicsState()
 
         if !(uri ?? "").isEmpty {
-            page!.addAnnotation(Annotation(
-                    Annotation.Link,
-                    x,
-                    y,
-                    x + width,
-                    y + blockHeight,
-                    nil,    // Vertices
-                    nil,    // Fill Color
-                    0.0,    // Opacity
-                    nil,    // Title
-                    nil,    // Contents
-                    uri,
-                    nil,    // The destination name
-                    nil,
-                    nil,
-                    nil))
+            page!.addAnnotation(Annotation.link(
+                    x, y, x + width, y + blockHeight,
+                    uri, nil, nil, nil, nil))
         }
 
         return [x + width, y + blockHeight]

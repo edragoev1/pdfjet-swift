@@ -1220,13 +1220,16 @@ public class Page {
                 b += 1
             }
             let run = Array(order[a..<b])
-            var keys = [Int](repeating: 0, count: b - a)
+            // Int64, as Int is 32 bits on wasm32 and armv7: 0xFFFF_FFFF did
+            // not compile there (the Swift Package Index's wasm build of
+            // 9.1.9), and a shift of 32 lost the order
+            var keys = [Int64](repeating: 0, count: b - a)
             for k in 0..<keys.count {
-                keys[k] = (markOrder(codePoints[run[k]]) << 32) | k
+                keys[k] = Int64(markOrder(codePoints[run[k]])) << 32 | Int64(k)
             }
             keys.sort()
             for k in 0..<keys.count {
-                order[a + k] = run[keys[k] & 0xFFFF_FFFF]
+                order[a + k] = run[Int(keys[k] & 0xFFFF_FFFF)]
             }
             a = b
         }
@@ -1534,13 +1537,11 @@ public class Page {
             pdf.fail(Page.RGB_COUNT)
             return self
         }
-        let r = Float((color >> 16) & 0xff)/255.0
-        let g = Float((color >>  8) & 0xff)/255.0
-        let b = Float((color)       & 0xff)/255.0
-        if penColorWritten && penColor[0] == r && penColor[1] == g && penColor[2] == b {
+        let rgb = Util.rgb(color)
+        if penColorWritten && penColor[0] == rgb[0] && penColor[1] == rgb[1] && penColor[2] == rgb[2] {
             return self     // The content is drawn with this color already
         }
-        return setPenColor([r, g, b])
+        return setPenColor(rgb)
     }
 
     ///
@@ -1556,27 +1557,7 @@ public class Page {
         guard let rgbColor = rgbColor else {
             return self
         }
-        if rgbColor.count < 3 {
-            pdf.fail(Page.RGB_COUNT)
-            return self
-        }
-        if rgbColor[0] < 0.0 || rgbColor[0] > 1.0 ||
-                rgbColor[1] < 0.0 || rgbColor[1] > 1.0 ||
-                rgbColor[2] < 0.0 || rgbColor[2] > 1.0 {
-            FileHandle.standardError.write(Data("Warning: RGB color values must be between 0f and 1f. Ignoring request.\n".utf8))
-            return self
-        }
-        if penColorWritten && penColor[0] == rgbColor[0] && penColor[1] == rgbColor[1] && penColor[2] == rgbColor[2] {
-            return self     // The content is drawn with this color already
-        }
-        penColor = rgbColor
-        penColorWritten = true
-        append(rgbColor[0])
-        append(Token.space)
-        append(rgbColor[1])
-        append(Token.space)
-        append(rgbColor[2])
-        append(" RG\n")
+        writeColor(rgbColor, &penColor, &penColorWritten, " RG\n")
         return self
     }
 
@@ -1596,13 +1577,11 @@ public class Page {
             pdf.fail(Page.RGB_COUNT)
             return self
         }
-        let r = Float((color >> 16) & 0xff)/255.0
-        let g = Float((color >>  8) & 0xff)/255.0
-        let b = Float((color)       & 0xff)/255.0
-        if brushColorWritten && brushColor[0] == r && brushColor[1] == g && brushColor[2] == b {
+        let rgb = Util.rgb(color)
+        if brushColorWritten && brushColor[0] == rgb[0] && brushColor[1] == rgb[1] && brushColor[2] == rgb[2] {
             return self     // The content is drawn with this color already
         }
-        return setBrushColor([r, g, b])
+        return setBrushColor(rgb)
     }
 
     ///
@@ -1617,28 +1596,38 @@ public class Page {
         guard let rgbColor = rgbColor else {
             return self
         }
+        writeColor(rgbColor, &brushColor, &brushColorWritten, " rg\n")
+        return self
+    }
+
+    // Writes the color with its operator, " RG\n" for the pen or " rg\n" for
+    // the brush, as the pen's or the brush's, color and written, unless it
+    // has fewer than three values, which fails the document, or one out of
+    // range, which is ignored with a warning, or the content is drawn with it
+    // already.
+    private func writeColor(_ rgbColor: [Float], _ color: inout [Float], _ written: inout Bool,
+            _ op: String) {
         if rgbColor.count < 3 {
             pdf.fail(Page.RGB_COUNT)
-            return self
+            return
         }
         if rgbColor[0] < 0.0 || rgbColor[0] > 1.0 ||
                 rgbColor[1] < 0.0 || rgbColor[1] > 1.0 ||
                 rgbColor[2] < 0.0 || rgbColor[2] > 1.0 {
             FileHandle.standardError.write(Data("Warning: RGB color values must be between 0f and 1f. Ignoring request.\n".utf8))
-            return self
+            return
         }
-        if brushColorWritten && brushColor[0] == rgbColor[0] && brushColor[1] == rgbColor[1] && brushColor[2] == rgbColor[2] {
-            return self     // The content is drawn with this color already
+        if written && color[0] == rgbColor[0] && color[1] == rgbColor[1] && color[2] == rgbColor[2] {
+            return      // The content is drawn with this color already
         }
-        brushColor = rgbColor
-        brushColorWritten = true
+        color = rgbColor
+        written = true
         append(rgbColor[0])
         append(Token.space)
         append(rgbColor[1])
         append(Token.space)
         append(rgbColor[2])
-        append(" rg\n")
-        return self
+        append(op)
     }
 
     /// Returns the brush color as red, green and blue values between 0.0 and 1.0.
@@ -3148,42 +3137,8 @@ public class Page {
     ///   - language: the language of the text, such as "hi" or "km", or nil.
     public func drawGlyphs(_ font: Font, _ glyphs: [Int], _ positions: [Float],
             _ text: String?, _ language: String?) {
-        if let identity = font.pdfIdentity, identity != pdf.identity {
-            pdf.fail("The font belongs to another PDF.")
+        if !glyphsDrawable(font, glyphs, positions) {
             return
-        }
-        guard !font.isCoreFont && !font.isCJK, let program = font.program else {
-            pdf.fail("drawGlyphs needs a font loaded from the font file the glyphs were shaped with.")
-            return
-        }
-        if positions.count != 2 * glyphs.count {
-            pdf.fail("drawGlyphs needs an x and a y for each glyph.")
-            return
-        }
-        for v in positions where !(abs(v) <= 1e6) {     // NaN too
-            pdf.fail("drawGlyphs needs positions between -1,000,000 and 1,000,000 points.")
-            return
-        }
-        // The size times the glyphs' matrix is written with 7 decimals
-        if !(font.size > 0 && font.size <= 10000) {     // NaN too
-            pdf.fail("drawGlyphs needs a font size of more than 0 and at most 10,000 points.")
-            return
-        }
-        if program.outline == nil {
-            do {
-                program.outline = try GlyphOutline(program.font, program.cff)
-            } catch {
-                pdf.fail((error as? PDFjetError)?.message ?? "\(error)")
-                return
-            }
-            program.glyphStamps = [:]
-        }
-        let outline = program.outline!
-        for gid in glyphs {
-            if gid < 0 || gid >= outline.count() {
-                pdf.fail("The font has no glyph number \(gid).")
-                return
-            }
         }
         let tagged = pdf.isTagged() && artifactDepth == 0
         if tagged && !glyphs.isEmpty && (text ?? "").isEmpty {
@@ -3193,26 +3148,95 @@ public class Page {
         if glyphs.isEmpty {
             return
         }
-        font.drawnAsOutlines = true
         // A paragraph of their own, in a tagged document, drawn outside any
         let own = tagged && !insideTaggedContent()
         if own {
             addBDC(StructElem.P, language, nil, nil)
         }
-        // The text they stand for, and its language, as the actual text of
-        // the marked content of the outlines (ISO 32000-1, 14.9.4)
-        if tagged {
-            append("/Span <<")
-            if let language = language, !language.isEmpty {
-                append("/Lang <")
-                append(pdf.toHex(language))
-                append("> ")
-            }
-            append("/ActualText <")
-            append(Page.toUTF16Hex(text!))
-            append(">>> BDC\n")
+        beginActualText(text ?? "", language)
+        placeGlyphs(font, font.size, glyphs, positions)
+        endActualText()
+        if own {
+            addEMC()
         }
-        let size = font.size
+    }
+
+    // Checks the font, the glyphs and their positions for drawGlyphs, and
+    // reads the font's outlines the first time; false, the document failed,
+    // when they cannot be drawn.
+    func glyphsDrawable(_ font: Font, _ glyphs: [Int], _ positions: [Float]) -> Bool {
+        if let identity = font.pdfIdentity, identity != pdf.identity {
+            pdf.fail("The font belongs to another PDF.")
+            return false
+        }
+        guard !font.isCoreFont && !font.isCJK, let program = font.program else {
+            pdf.fail("drawGlyphs needs a font loaded from the font file the glyphs were shaped with.")
+            return false
+        }
+        if positions.count != 2 * glyphs.count {
+            pdf.fail("drawGlyphs needs an x and a y for each glyph.")
+            return false
+        }
+        for v in positions where !(abs(v) <= 1e6) {     // NaN too
+            pdf.fail("drawGlyphs needs positions between -1,000,000 and 1,000,000 points.")
+            return false
+        }
+        // The size times the glyphs' matrix is written with 7 decimals
+        if !(font.size > 0 && font.size <= 10000) {     // NaN too
+            pdf.fail("drawGlyphs needs a font size of more than 0 and at most 10,000 points.")
+            return false
+        }
+        if program.outline == nil {
+            do {
+                program.outline = try GlyphOutline(program.font, program.cff)
+            } catch {
+                pdf.fail((error as? PDFjetError)?.message ?? "\(error)")
+                return false
+            }
+            program.glyphStamps = [:]
+        }
+        let outline = program.outline!
+        for gid in glyphs {
+            if gid < 0 || gid >= outline.count() {
+                pdf.fail("The font has no glyph number \(gid).")
+                return false
+            }
+        }
+        return true
+    }
+
+    // In a tagged document, begins the marked content of glyphs drawn as
+    // outlines, with the text they stand for, and its language, as its actual
+    // text (ISO 32000-1, 14.9.4); endActualText ends it.
+    func beginActualText(_ text: String, _ language: String?) {
+        // In any document, tagged or not: marked content of its own needs no
+        // structure, and gives the outlines their text
+        if artifactDepth != 0 {
+            return
+        }
+        append("/Span <<")
+        if let language = language, !language.isEmpty {
+            append("/Lang <")
+            append(pdf.toHex(language))
+            append("> ")
+        }
+        append("/ActualText <")
+        append(Page.toUTF16Hex(text))
+        append(">>> BDC\n")
+    }
+
+    func endActualText() {
+        if artifactDepth == 0 {
+            append("EMC\n")
+        }
+    }
+
+    // Draws the glyphs, checked by glyphsDrawable, at the size, each as the
+    // stamp of its outline, made the first time the glyph is drawn.
+    func placeGlyphs(_ font: Font, _ size: Float, _ glyphs: [Int], _ positions: [Float]) {
+        font.drawnAsOutlines = true
+        let program = font.program!
+        let outline = program.outline!
         for k in 0..<glyphs.count {
             let gid = glyphs[k]
             // The glyph's stamp, made the first time it is drawn; nil for a
@@ -3231,12 +3255,6 @@ public class Page {
                 stamp.placeGlyph(self, Page.glyphMatrix(outline.matrixOf(gid), size,
                         positions[2 * k], height - positions[2 * k + 1]))
             }
-        }
-        if tagged {
-            append("EMC\n")
-        }
-        if own {
-            addEMC()
         }
     }
 
@@ -3973,6 +3991,57 @@ public class Page {
         append(" cm\n")
     }
 
+    // Draws the shaped line as drawShapedLine does, turned by the degrees,
+    // clockwise, around its start at x on the baseline, as a TextLine's text
+    // is turned. Returns false if the document failed.
+    func drawTurnedShapedLine(_ shaped: ShapedText, _ x: Float, _ baseline: Float, _ language: String?,
+            _ degrees: Int) -> Bool {
+        if degrees % 360 == 0 {
+            return drawShapedLine(shaped, x, baseline, language)
+        }
+        saveGraphicsState()
+        rotateAroundCenter(x, height - baseline, Float(-degrees))
+        let drawn = drawShapedLine(shaped, x, baseline, language)
+        restoreGraphicsState()
+        return drawn
+    }
+
+    // Draws the shaped line, its left at x and its baseline at baseline, in
+    // the language: the glyphs of each font, one run at a time, tagged with
+    // the line's text for screen readers and the copying of text. Returns
+    // false if the document failed.
+    func drawShapedLine(_ shaped: ShapedText, _ x: Float, _ baseline: Float, _ language: String?) -> Bool {
+        let line = shaped.line
+        if line.glyphs.isEmpty {
+            return true
+        }
+        beginActualText(shaped.text, language)
+        var from = 0
+        while from < line.glyphs.count {
+            var to = from
+            while to < line.glyphs.count && line.fontIndexes[to] == line.fontIndexes[from] {
+                to += 1
+            }
+            let index = line.fontIndexes[from]
+            if index >= 0 && index < shaped.fonts.count {
+                var run = [Int]()
+                var places = [Float]()
+                for i in from..<to {
+                    run.append(line.glyphs[i])
+                    places.append(x + line.positions[2 * i])
+                    places.append(baseline + line.positions[2 * i + 1])
+                }
+                if !glyphsDrawable(shaped.fonts[index], run, places) {
+                    return false
+                }
+                placeGlyphs(shaped.fonts[index], shaped.size, run, places)
+            }
+            from = to
+        }
+        endActualText()
+        return true
+    }
+
     func drawTextBlock(
             _ font: Font,
             _ fallbackFont: Font?,
@@ -4004,6 +4073,14 @@ public class Page {
         setTextFont(font, fontSize)
         var yText: Float = y
         for textLine in textLines {
+            if let shaped = textLine.shaped {
+                // Glyphs a shaper found, drawn as outlines, out of the text object
+                append("ET\n")
+                _ = drawShapedLine(shaped, x + textLine.xOffset, yText + font.getAscent(fontSize), language)
+                append("BT\n")
+                yText += leading
+                continue
+            }
             append("1 0 0 1 ")
             append(x + textLine.xOffset)
             append(" ")
@@ -4061,7 +4138,7 @@ public class Page {
         }
         for textLine in textLines {
             if textLine.underline || textLine.strikeout {
-                let width = hasFallbackFont ?
+                let width = textLine.shaped != nil ? textLine.shaped!.line.width : hasFallbackFont ?
                         font.stringWidth(fallbackFont, fontSize, fallbackFontSize, textLine.text) :
                         font.stringWidth(fontSize, textLine.text)
                 if textLine.underline {

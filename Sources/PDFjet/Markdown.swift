@@ -698,7 +698,7 @@ public class Markdown {
             var baseline = y + padding + code.getAscent(code.getSize())
                     + (leading - code.getBodyHeight(code.getSize())) / 2.0
             for _ in 0..<count {
-                if !Markdown.isBlank(lines[i]) {
+                if !Markup.isBlank(lines[i]) {
                     TextLine(code, String(decoding: lines[i], as: UTF16.self)).setStructureType(StructElem.SPAN)
                             .setLocation(x + padding, baseline).drawOn(page)
                 }
@@ -1058,6 +1058,15 @@ public class Markdown {
                     throw PDFjetError(message: "Cannot open file: " + path)
                 }
                 image.setAltDescription(alt)
+                // The text of the SVG in the fonts of the document, in the style it asks
+                // for: regular, bold for a font-weight of 600 or more, italic, bold
+                // italic, and the code font for monospace. With no font set, it took the
+                // fonts PDFjet carries, which a program built without them has not, and
+                // failed (pdfjet.com's Markdown to PDF, 21 November 2026); with the
+                // regular and bold ones alone, all of it was upright and proportional
+                // (code review, 23 November 2026)
+                image.setFont(regular).setBoldFont(bold)
+                image.setMarkdownFonts(italic, boldItalic, code)
                 imageWidth = image.getWidth()
                 imageHeight = image.getHeight()
                 scale = min(1.0, min(width / imageWidth, (bottom - marginTop) / imageHeight))
@@ -1125,14 +1134,5 @@ public class Markdown {
             return nil
         }
         return path
-    }
-
-    // True when the code units are all U+0020 or below, so that String.trim in
-    // Java would leave nothing of them.
-    private static func isBlank(_ units: [UInt16]) -> Bool {
-        for unit in units where unit > 0x20 {
-            return false
-        }
-        return true
     }
 }   // End of Markdown.swift

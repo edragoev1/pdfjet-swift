@@ -33,6 +33,12 @@ public class TextLine : BaselineDrawable {
     // extractor see the word break, but is not part of its text, so that
     // the alignment and the underline measure the line without it.
     var trailingSpace = false
+    // The glyphs a shaper found, of text such as Hindi or Khmer, drawn as
+    // outlines in place of the text; nil for text drawn as text
+    var shaped: ShapedText?             // A TextBlock's line, shaped with its paragraph
+    private var pieces: ShapedPieces?   // The texts this line and its copies shaped
+    // True for a line of a right to left paragraph of a TextBlock, aligned to the right
+    var rightToLeft = false
     // The hard line breaks after the text line, of Markdown's two spaces, \
     // or <br> at the end of a line: TextFrame starts a new row after it, and
     // leaves an empty row for each break after the first, as <br><br> does.
@@ -94,6 +100,7 @@ public class TextLine : BaselineDrawable {
     @discardableResult
     public func setText(_ text: String) -> TextLine {
         self.text = text
+        self.pieces = nil
         self.altDescription = text
         return self
     }
@@ -190,10 +197,7 @@ public class TextLine : BaselineDrawable {
         if color == Color.transparent {
             return self
         }
-        let r = Float(((color >> 16) & 0xff))/255.0
-        let g = Float(((color >>  8) & 0xff))/255.0
-        let b = Float(((color)       & 0xff))/255.0
-        self.textColor = [r, g, b]
+        self.textColor = Util.rgb(color)
         return self
     }
 
@@ -215,10 +219,7 @@ public class TextLine : BaselineDrawable {
         if color == Color.transparent {
             return self
         }
-        let r = Float(((color >> 16) & 0xff))/255.0
-        let g = Float(((color >>  8) & 0xff))/255.0
-        let b = Float(((color)       & 0xff))/255.0
-        self.decorationColor = [r, g, b]
+        self.decorationColor = Util.rgb(color)
         return self
     }
 
@@ -246,7 +247,56 @@ public class TextLine : BaselineDrawable {
     /// - Returns: the width.
     ///
     public func getWidth() -> Float {
+        // Measured as text when it cannot be shaped: drawOn says why
+        if let glyphs = try? shapedGlyphs() {
+            return glyphs.line.width
+        }
         return font!.stringWidth(fallbackFont, fontSize, text ?? "")
+    }
+
+    // The glyphs a shaper found for text such as Hindi or Khmer, one line of
+    // it, which drawOn draws as outlines; nil for text drawn as text. A
+    // TextBlock's line was shaped with its paragraph.
+    func shapedGlyphs() throws -> ShapedText? {
+        if let shaped = shaped {
+            return shaped
+        }
+        return try shapeOf(text)
+    }
+
+    // The text shaped in this line's style, as one line, or nil for text
+    // drawn as text; shaped once, kept in the pieces this line shares with
+    // its copies, made again when the style changed.
+    func shapeOf(_ text: String?) throws -> ShapedText? {
+        guard let text = text, Shaping.needsShaper(text), let font = font else {
+            return nil
+        }
+        let style = ShapingStyle(font: font, fallback: fallbackFont, size: fontSize, language: language)
+        if pieces == nil || pieces!.style != style {
+            pieces = ShapedPieces(style)
+        }
+        if let glyphs = pieces!.shaped[text] {
+            return glyphs
+        }
+        let glyphs = try Shaping.shapeOneLine(Shaping.shapingFonts(font, fallbackFont), fontSize, language, text)
+        pieces!.shaped[text] = glyphs
+        return glyphs
+    }
+
+    // The width of the text in this line's style: of its glyphs, for text
+    // such as Hindi a shaper shapes, else of its characters. What cannot be
+    // shaped is measured as text; drawOn says why it cannot be drawn.
+    func widthOf(_ text: String) -> Float {
+        // A shaper's width leaves out the spaces at the end of the line, which
+        // a TextFrame's word is measured with: they are measured in the font
+        var core = text
+        while core.hasSuffix(" ") {
+            core.removeLast()
+        }
+        if let glyphs = try? shapeOf(core) {
+            return glyphs.line.width + font!.stringWidth(fallbackFont, fontSize, String(text.dropFirst(core.count)))
+        }
+        return font!.stringWidth(fallbackFont, fontSize, text)
     }
 
     ///
@@ -576,6 +626,7 @@ public class TextLine : BaselineDrawable {
         textLine.uriActualText = uriActualText
         textLine.uriAltDescription = uriAltDescription
         textLine.structureType = structureType
+        textLine.pieces = pieces    // The words it shaped, shaped once
         textLine.pieceOf = pieceOf ?? self
         return textLine
     }
@@ -620,7 +671,21 @@ public class TextLine : BaselineDrawable {
             page!.addBDC(structureType, language, "", alt)
             page!.pieceOf = nil
         }
-        page!.drawString(font!, fallbackFont, fontSize, text, self.x, self.y + verticalOffset, textColor, colorMap)
+        let glyphs: ShapedText?
+        do {
+            glyphs = try shapedGlyphs()
+        } catch {
+            // Text such as Hindi that could not be shaped fails the document, saying why
+            page!.addEMC()
+            page!.pdf.fail(Shaping.message(error))
+            return [x, y]
+        }
+        if let glyphs = glyphs {
+            // Glyphs a shaper found, drawn as outlines, turned as the text is
+            _ = page!.drawTurnedShapedLine(glyphs, self.x, self.y + verticalOffset, language, degrees)
+        } else {
+            page!.drawString(font!, fallbackFont, fontSize, text, self.x, self.y + verticalOffset, textColor, colorMap)
+        }
         page!.addEMC()
 
         // The trigonometry is done in double precision, as in the other ports, and
@@ -667,22 +732,9 @@ public class TextLine : BaselineDrawable {
 
         if !(uri ?? "").isEmpty || !(key ?? "").isEmpty {
             let box = getLinkBox(verticalOffset)
-            page!.addAnnotation(Annotation(
-                    Annotation.Link,
-                    box[0],
-                    box[1],
-                    box[2],
-                    box[3],
-                    nil,    // Vertices
-                    nil,    // Fill Color
-                    0.0,    // Opacity
-                    nil,    // Title
-                    nil,    // Contents
-                    uri,
-                    key,    // The destination name
-                    uriLanguage,
-                    uriActualText,
-                    uriAltDescription).joining(link))
+            page!.addAnnotation(Annotation.link(
+                    box[0], box[1], box[2], box[3],
+                    uri, key, uriLanguage, uriActualText, uriAltDescription).joining(link))
         }
         page!.setTextRotation(0)
 
@@ -733,7 +785,7 @@ public class TextLine : BaselineDrawable {
     // spaces alone spans its whole width.
     private func getVisibleSpan() -> (Float, Float) {
         let scalars = Array(text!.unicodeScalars)
-        let width = font!.stringWidth(fallbackFont, fontSize, text!)
+        let width = widthOf(text!)
         var first = 0
         while first < scalars.count && scalars[first] == " " {
             first += 1
@@ -749,8 +801,8 @@ public class TextLine : BaselineDrawable {
         before.append(contentsOf: scalars[0..<first])
         var through = String.UnicodeScalarView()
         through.append(contentsOf: scalars[0..<last])
-        let start = font!.stringWidth(fallbackFont, fontSize, String(before))
-        let end = font!.stringWidth(fallbackFont, fontSize, String(through))
+        let start = widthOf(String(before))
+        let end = widthOf(String(through))
         return (start, end)
     }
 
@@ -760,11 +812,14 @@ public class TextLine : BaselineDrawable {
     // which left out the kerning between the space and the letter before it, so
     // the line stopped short of the word (the review of 28 October 2026).
     private func getDecorationLength() -> Float {
+        if shaped != nil {
+            return getWidth()
+        }
         var drawn = text!
         if isLastToken && drawn.unicodeScalars.last == " " {
             drawn = String(drawn.unicodeScalars.dropLast())
         }
-        return font!.stringWidth(fallbackFont, fontSize, drawn)
+        return widthOf(drawn)
     }
 
     // Returns the right end of the baseline, or its lower end when the text is rotated.
@@ -772,7 +827,7 @@ public class TextLine : BaselineDrawable {
         // The trigonometry is done in double precision, as in the other ports, and
         // turns counterclockwise, where the rotation turns clockwise.
         let radians = Double.pi * -Double(degrees) / 180.0
-        let len = Double(font!.stringWidth(fallbackFont, fontSize, text!))
+        let len = Double(getWidth())
         let xMax = max(Double(x), Double(x) + len*cos(radians))
         let yMax = max(Double(y + verticalOffset), Double(y + verticalOffset) - len*sin(radians))
         return [Float(xMax), Float(yMax)]
